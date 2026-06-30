@@ -28,7 +28,8 @@ import { makeTaskTool, DEFAULT_SUBAGENT_MAX_TURNS } from '../agent/subagent';
 import { loadAgentDefs, buildSubagentRegistry } from '../capability/agent/index';
 import { builtinSubagents } from '../capability/agent/builtin/index';
 import { resolveSubagentSystem } from '../agent/subagent-registry';
-import { AutoMemory } from '../capability/memory/auto';
+import { AutoMemory, type ForkRunner } from '../capability/memory/auto';
+import { runForkedAgent } from '../agent/forked-agent';
 import { resolveProvider } from '../provider/register';
 import type { LLMProvider, ProviderStreamEvent, Usage, ProviderRequest } from '../provider/types';
 import { EMPTY_USAGE } from '../provider/types';
@@ -431,8 +432,31 @@ export async function runCli(argv: string[], providerOverride?: LLMProvider): Pr
   }
 
   // auto-memory:一个 session 一个实例,跨 REPL 轮保留 surfaced/预算。
+  //  extract 走 cache-safe fork(host 层构造 forkRunner:复用本 agent 的 slots/tools/model/provider,
+  //  复用父缓存前缀 + 追加提取指令 + 写闸锁 memory 目录)。
+  const forkRunner: ForkRunner = (parentMessages, instruction, canUseTool, signal) =>
+    runForkedAgent(
+      {
+        parentMessages,
+        systemPromptSlots: context.config.systemPromptSlots,
+        leadingSystemText: context.config.leadingSystemText,
+        model: args.model,
+        tools: context.config.tools,
+        instruction,
+        canUseTool,
+      },
+      { provider, toolContext: context.toolContext, signal },
+    ).then((r) => r.writtenPaths);
   const autoMemory: AutoMemoryHook | undefined = args.memoryDir
-    ? new AutoMemory({ memoryDir: args.memoryDir, sandboxFs: context.toolContext.sandboxFs as NodeSandboxFs, provider, model: args.model })
+    ? new AutoMemory({
+        memoryDir: args.memoryDir,
+        sandboxFs: context.toolContext.sandboxFs as NodeSandboxFs,
+        provider,
+        model: args.model,
+        forkRunner,
+        // consolidation(cc /dream 等价):文件数到阈值后蒸馏合并,治碎片膨胀。
+        consolidateThreshold: 40,
+      })
     : undefined;
 
   const runOpts: RunTurnOpts = {

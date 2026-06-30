@@ -371,6 +371,7 @@ describe('memoryPack assembly', () => {
     expect(pack.name).toBe('memory');
     expect(pack.layer).toBe('builtin');
     expect(pack.tools!.map((t) => t.name).sort()).toEqual([MEMORY_SEARCH_TOOL, REMEMBER_TOOL].sort());
-    expect(pack.slots!.map((s) => s.name)).toEqual(['memory']);
+    // 行为提示 slot(怎么/何时写 + 召回信任)+ MEMORY.md 索引 slot,两者皆 static。
+    expect(pack.slots!.map((s) => s.name)).toEqual(['memory-behavior', 'memory']);
   });
 });

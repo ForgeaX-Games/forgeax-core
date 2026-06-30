@@ -16,14 +16,17 @@ import type { SandboxFs } from '../../inject/types';
 import type { MemorySelectFn } from './recall';
 import { makeMemorySearchTool, makeRememberTool } from './tools';
 import { makeMemorySlot } from './slot';
+import { makeMemoryBehaviorSlot } from './behavior-slot';
 
 export type { MemoryHeader } from './scan';
 export { scanMemoryFiles, formatManifest, MAX_MEMORY_FILES, FRONTMATTER_MAX_LINES, MEMORY_INDEX_FILE } from './scan';
 export type { MemorySelectFn, RelevantMemory } from './recall';
 export { findRelevantMemories } from './recall';
-export { makeMemorySearchTool, makeRememberTool, isAutoMemPath, freshness, type MemoryToolDeps } from './tools';
+export { makeMemorySearchTool, makeRememberTool, isAutoMemPath, freshness, memoryFreshnessText, type MemoryToolDeps } from './tools';
 export { makeMemorySlot, rebuildIndex, type MemorySlotDeps } from './slot';
-export { AutoMemory, makeProviderSelectFn, type AutoMemoryDeps } from './auto';
+export { makeMemoryBehaviorSlot, type MemoryBehaviorSlotDeps } from './behavior-slot';
+export { AutoMemory, makeProviderSelectFn, type AutoMemoryDeps, type ForkRunner } from './auto';
+export { buildExtractInstruction, buildConsolidateInstruction, makeMemoryDirCanUseTool } from './extract-prompt';
 export { listMemory, openMemory, type MemoryEntry, type MemoryListing } from './inspect';
 
 export interface MemoryPackDeps {
@@ -42,6 +45,10 @@ export function memoryPack(deps: MemoryPackDeps): CapabilityPack {
     name: 'memory',
     layer: 'builtin',
     tools: [makeMemorySearchTool(toolDeps), makeRememberTool(toolDeps)],
-    slots: [makeMemorySlot({ memoryDir: deps.memoryDir, sandboxFs: deps.sandboxFs })],
+    slots: [
+      // 行为提示(怎么/何时写记忆 + 召回信任)在前,MEMORY.md 索引内容在后。两者皆 static,进稳定缓存前缀。
+      makeMemoryBehaviorSlot({ memoryDir: deps.memoryDir }),
+      makeMemorySlot({ memoryDir: deps.memoryDir, sandboxFs: deps.sandboxFs }),
+    ],
   };
 }

@@ -19,8 +19,11 @@ import type {
   TurnHandle,
   TurnMessage,
   TurnRequest,
+  ForkExtractRequest,
+  ForkExtractResult,
 } from '@forgeax/agent-runtime/contract';
 import { CoreAgent } from '../agent/agent';
+import { runForkedAgent } from '../agent/forked-agent';
 import type { AgentContext, AgentEvent, TerminalReason } from '../agent/types';
 import type { AgentTool } from '../capability/types';
 import { buildTool } from '../capability/types';
@@ -190,6 +193,8 @@ const CAPS: KernelCapabilities = {
   toolCalls: true,
   // facade 走「轮间」语义(midTurnInject=false);原生 Agent API 经 steeringSource 支持回合中插话。
   midTurnInject: false,
+  // forkExtract 已实现(本类 forkExtract() 经 runForkedAgent 复用缓存前缀做后台提取)。
+  forkExtract: true,
 };
 
 /** terminal reason → 契约 TurnDoneReason。 */
@@ -393,8 +398,7 @@ export class ForgeaxCoreKernel implements AgentKernel {
     //   子 agent 跑在 forgeax-core 内(隔离上下文,自压缩),子工具 = host 工具(经同一桥),
     //   **不含 Task**(防递归):Task 是内核内建子 agent 工具,非 host 声明。
     //   ★ P0 registry 接缝:注入 subagentRegistry 时改走 registry + allTools(按类型过滤工具);
-    //   缺省维持今日的 resolveTools/resolveSystem 兜底(零行为变化)。
-    const registry = this.o.subagentRegistry;
+    //   缺省维持今日的 resolveTools/resolveSystem 兜底(零行为变化)。见 buildTaskTool。
     // 008:把 host 的 askQuestion 接缝挂到每轮 toolContext(AskUserQuestion 工具经 ctx 取用);
     //   缺省不挂 → 工具优雅降级。父/子 agent 共用同一 toolContext(子继承提问能力)。
     const toolContext: Record<string, unknown> = {
@@ -404,27 +408,8 @@ export class ForgeaxCoreKernel implements AgentKernel {
       //   工具经此建子 span(显式认 parent)/出带 traceId 的 log,不押 active-context。
       observability: { tracer: obs.tracer, logger: turnLogger } satisfies Observability,
     };
-    const taskTool = makeTaskTool({
-      provider: this.o.provider,
-      model,
-      ...(registry
-        ? { registry, allTools: hostTools }
-        : {
-            resolveTools: () => hostTools,
-            resolveSystem: (t) =>
-              `You are a ${t ?? 'general'} subagent. Do the task and report the result concisely.`,
-          }),
-      toolContext,
-      // ★ ISSUE-1:子 agent 自压缩走 Compaction V2(比例水位 + 有序闸 + 三层管线 + 重挂)。
-      compactionV2: { summarize: makeProviderCompactSummarize(this.o.provider, model) },
-      contextWindow: contextWindowForModel(model),
-      maxTurns: req.budget.maxTurns ?? 20,
-      // ★ L5:子生命周期回调 → KernelEvent → subQueue。缺省路径(无子派发)永不触发,零回归。
-      onSubagentEvent: (ev) => {
-        const k = subEventToKernel(ev);
-        if (k) subQueue.push(k);
-      },
-    });
+    // taskTool 构造抽成 buildTaskTool(SSOT):forkExtract 复用同一份 → 工具定义字节一致,缓存键匹配。
+    const taskTool = this.buildTaskTool(req, model, hostTools, toolContext, (k) => subQueue.push(k));
     // ★ peer 多 agent:每轮解析 handoff sink(工厂拿本轮 provider/model/host 工具,
     //   使被 spawn 的子 agent 用同源 host 工具)。注入了 sink 才把 Handoff 工具加进模型
     //   工具集 —— 否则模型无从触发,即便注了 sink 也维持单 agent(零行为变化)。
@@ -566,6 +551,75 @@ export class ForgeaxCoreKernel implements AgentKernel {
       });
       turnSpan.end();
     }
+  }
+
+  /** 原生 Task 工具构造(SSOT):runTurn 与 forkExtract 共用 → 工具定义字节一致,保 fork 缓存键匹配。 */
+  private buildTaskTool(
+    req: TurnRequest,
+    model: string,
+    hostTools: AgentTool[],
+    toolContext: Record<string, unknown>,
+    pushSub: (k: KernelEvent) => void,
+  ): AgentTool {
+    const registry = this.o.subagentRegistry;
+    return makeTaskTool({
+      provider: this.o.provider,
+      model,
+      ...(registry
+        ? { registry, allTools: hostTools }
+        : {
+            resolveTools: () => hostTools,
+            resolveSystem: (t) => `You are a ${t ?? 'general'} subagent. Do the task and report the result concisely.`,
+          }),
+      toolContext,
+      compactionV2: { summarize: makeProviderCompactSummarize(this.o.provider, model) },
+      contextWindow: contextWindowForModel(model),
+      maxTurns: req.budget.maxTurns ?? 20,
+      onSubagentEvent: (ev) => {
+        const k = subEventToKernel(ev);
+        if (k) pushSub(k);
+      },
+    });
+  }
+
+  /**
+   * cache-safe fork 提取(契约 forkExtract):复用上一轮的 charter/persona + tools + history
+   * (缓存键匹配 → 整段走 cache-read),尾部追加一条提取指令,工具执行门控到 `allowedTools`
+   * (记忆写工具),后台跑、不污染主对话。返回工具调用次数 + 写过的文件路径。
+   *
+   * tools 复用 wrapTools(req) + buildTaskTool(与 runTurn 同一份 → 字节一致);常见编排场景(无
+   * handoff/plan)即与上一轮 runTurn 的工具集逐字匹配,messages 命中缓存。
+   */
+  async forkExtract(req: ForkExtractRequest, signal: AbortSignal): Promise<ForkExtractResult> {
+    const model = this.currentModel ?? req.model ?? 'claude-opus-4-8';
+    const sp = req.systemPrompt;
+    // 把 ForkExtractRequest 适配成 wrapTools 需要的 TurnRequest 形(只用到 tools/hostSessionId/session)。
+    const wrapReq = {
+      tools: req.tools,
+      hostSessionId: req.hostSessionId,
+      session: req.session,
+      budget: {},
+    } as unknown as TurnRequest;
+    const hostTools = this.wrapTools(wrapReq);
+    const toolContext: Record<string, unknown> = { ...(this.o.toolContext ?? {}) };
+    const taskTool = this.buildTaskTool(wrapReq, model, hostTools, toolContext, () => {});
+    const tools = [...hostTools, taskTool];
+    const allowed = new Set(req.allowedTools);
+    const result = await runForkedAgent(
+      {
+        parentMessages: mapHistory(req.history),
+        systemPromptSlots: [
+          { name: 'charter', render: () => sp.charter, cacheScope: 'global' },
+          { name: 'persona', render: () => sp.persona, cacheScope: 'global' },
+        ],
+        model,
+        tools,
+        instruction: req.instruction,
+        canUseTool: (name) => allowed.has(name),
+      },
+      { provider: this.o.provider, toolContext, signal },
+    );
+    return { ok: result.terminalReason === 'completed', toolCalls: result.toolCalls, writtenPaths: result.writtenPaths };
   }
 
   /** AgentEvent → KernelEvent(累计 usage 副作用)。返回 null = 不映射(内部阶段事件)。 */

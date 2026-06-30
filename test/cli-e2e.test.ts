@@ -40,17 +40,28 @@ function textTurn(text: string): string {
 let server: ReturnType<typeof Bun.serve>;
 let baseUrl = '';
 let mainCalls = 0;
+let forkCalls = 0;
 
 beforeAll(() => {
   server = Bun.serve({
     port: 0,
     async fetch(req) {
-      const body = (await req.json()) as { system?: Array<{ text?: string }> };
+      const body = (await req.json()) as { system?: Array<{ text?: string }>; messages?: unknown };
       const sys = (body.system ?? []).map((b) => b.text ?? '').join('\n');
+      const msgsStr = JSON.stringify(body.messages ?? []);
       let payload: string;
-      if (sys.includes('extract durable')) {
-        // auto-extract sideQuery → 返回记忆 JSON
-        payload = textTurn(JSON.stringify({ memories: [{ type: 'user', name: 'E2E Pref', description: 'set in e2e', body: 'user validated forgeax-core via e2e' }] }));
+      if (msgsStr.includes('memory extraction subagent')) {
+        // cache-safe fork:复用父前缀 + 追加提取指令(在 user 消息里)。从指令解析 memDir,
+        // 第 1 轮用 write_file 工具写一条记忆,第 2 轮收尾。
+        const memDir = (msgsStr.match(/memory directory is `([^`]+)`/) || [])[1];
+        forkCalls++;
+        payload =
+          forkCalls === 1 && memDir
+            ? toolUseTurn('write_file', {
+                file_path: `${memDir}/e2e-pref.md`,
+                content: '---\nname: E2E Pref\ndescription: set in e2e\ntype: user\n---\nuser validated forgeax-core via e2e\n',
+              })
+            : textTurn('memories updated');
       } else if (sys.includes('select which stored memories')) {
         payload = textTurn(JSON.stringify({ selected: ['e2e-pref.md'] }));
       } else {
@@ -97,8 +108,9 @@ describe('CLI e2e — real binary against mock Anthropic', () => {
     }
   }, 30000);
 
-  test('auto-memory: end-of-turn extract writes a real .md + MEMORY.md index', async () => {
+  test('auto-memory: end-of-turn extract (cache-safe fork) writes a real .md + MEMORY.md index', async () => {
     mainCalls = 0;
+    forkCalls = 0;
     const cwd = mkdtempSync(join(tmpdir(), 'fxc-e2e-'));
     try {
       const { code } = await runCli(['-p', 'remember my preference'], cwd); // memory 默认开

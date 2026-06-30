@@ -36,6 +36,20 @@ export function freshness(mtimeMs: number, now: number = Date.now()): string {
   return `${d} days ago`;
 }
 
+/**
+ * 陈旧 caveat(对齐 cc `memoryFreshnessText`):**>1 天**才返回告警,today/yesterday 返回 ''
+ * (新鲜记忆告警=噪音)。动机:用户反馈过陈旧 file:line 记忆被当事实断言,citation 让错误
+ * 显得更权威。供召回 header 在记忆陈旧时附上「point-in-time、先核实再断言」。
+ */
+export function memoryFreshnessText(mtimeMs: number, now: number = Date.now()): string {
+  const d = Math.max(0, Math.floor((now - mtimeMs) / 86_400_000));
+  if (d <= 1) return '';
+  return (
+    `This memory is ${d} days old. Memories are point-in-time observations, not live state — ` +
+    `claims about code behavior or file:line citations may be outdated. Verify against current code before asserting as fact.`
+  );
+}
+
 // ─── 写闸：只允许写 memory 目录内（防越权写盘）──────────────────────────────────
 
 /** 规整路径:折叠 `//`、解析 `.`/`..`(纯字符串,不触盘),统一无尾斜杠。 */

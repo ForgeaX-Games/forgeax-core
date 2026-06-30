@@ -22,7 +22,7 @@ import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { RpcConnection } from '../src/cli/rpc';
-import type { TurnRequest, KernelEvent } from '@forgeax/agent-runtime/contract';
+import type { TurnRequest, KernelEvent, ForkExtractRequest } from '@forgeax/agent-runtime/contract';
 
 const MAIN = join(import.meta.dir, '..', 'src', 'cli', 'main.ts');
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
@@ -219,6 +219,47 @@ describe('serve sidecar e2e (real --serve subprocess, JSON-RPC over unix socket,
         code = (e as { code?: number }).code;
       }
       expect(code).toBe(-32601);
+    } finally {
+      s.close();
+    }
+  }, 30000);
+
+  function forkReq(allowedTools: string[]): ForkExtractRequest {
+    return {
+      session: { threadId: 'c-fork', agentId: 'forge' },
+      systemPrompt: { charter: 'You are a terse test agent.', persona: '' },
+      history: [
+        { role: 'user', content: 'make a snake game' },
+        { role: 'assistant', content: 'building it' },
+      ],
+      tools: [{ name: 'compute', description: 'Compute. Always succeeds.', inputSchema: { type: 'object', properties: { expr: { type: 'string' } } } }],
+      instruction: 'USE_TOOL extract durable memories now',
+      allowedTools,
+      hostSessionId: 'sid-serve-e2e',
+      model: 'claude-opus-4-8',
+    };
+  }
+
+  test('forkExtract (allowed tool) → cache-safe fork runs the tool via reverse hostTool bridge', async () => {
+    const s = await startServe();
+    try {
+      const res = (await s.conn.request('forkExtract', forkReq(['compute']))) as { ok?: boolean; toolCalls?: number };
+      expect(res?.ok).toBe(true);
+      expect((res?.toolCalls ?? 0)).toBeGreaterThanOrEqual(1);
+      // allowed → the fork's tool call routed back through the host bridge.
+      expect(s.hostToolCalls.map((c) => c.name)).toContain('compute');
+    } finally {
+      s.close();
+    }
+  }, 30000);
+
+  test('forkExtract (tool NOT in allowedTools) → gated, host bridge never invoked', async () => {
+    const s = await startServe();
+    try {
+      const res = (await s.conn.request('forkExtract', forkReq([]))) as { ok?: boolean };
+      expect(res?.ok).toBe(true);
+      // denied at the gate → never reached the host bridge.
+      expect(s.hostToolCalls.map((c) => c.name)).not.toContain('compute');
     } finally {
       s.close();
     }

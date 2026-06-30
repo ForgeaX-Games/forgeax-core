@@ -21,7 +21,7 @@
  */
 import { existsSync, unlinkSync } from 'node:fs';
 import type { Server } from 'node:net';
-import type { TurnRequest, KernelEvent } from '@forgeax/agent-runtime/contract';
+import type { TurnRequest, KernelEvent, ForkExtractRequest } from '@forgeax/agent-runtime/contract';
 import { ForgeaxCoreKernel, type ExecuteToolFn } from '../kernel-facade/forgeax-core-kernel';
 import { InProcessScheduler } from '../inject/in-process-scheduler';
 import { InProcessTeammateExecutor } from '../inject/in-process-teammate-executor';
@@ -189,6 +189,13 @@ export async function startServe(sockPath: string): Promise<Server> {
           const { callId, mode } = params as { callId: string; mode: 'gated' | 'autoEdits' | 'planning' | 'unrestricted' };
           await kernel.openHandle(callId).setPermissionMode(mode);
           return { ok: true };
+        }
+        case 'forkExtract': {
+          // cache-safe fork 提取(编排层 turnEnd 驱动):复用上一轮缓存前缀做后台记忆抽取。
+          if (!kernel.forkExtract) throw Object.assign(new Error('kernel has no forkExtract'), { code: -32601 });
+          const ac = new AbortController();
+          const res = await kernel.forkExtract(params as ForkExtractRequest, ac.signal);
+          return res;
         }
         default:
           throw Object.assign(new Error(`unknown method: ${method}`), { code: -32601 });
