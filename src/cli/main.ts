@@ -16,6 +16,7 @@
  */
 import { createInterface } from 'node:readline';
 import { readFileSync } from 'node:fs';
+import { pathToFileURL } from 'node:url';
 import { CoreAgent } from '../agent/agent';
 import type { AgentContext } from '../agent/types';
 import { builtinToolsPack } from '../capability/builtin-tools/index';
@@ -510,7 +511,12 @@ export async function runCli(argv: string[], providerOverride?: LLMProvider): Pr
   }
 }
 
-// 直接运行时执行(bun src/cli/main.ts ...)。import.meta.main 是 bun 的入口判定。
-if (import.meta.main) {
+// 直接运行时执行(bun / node `src/cli/main.ts ...`),被 import 为库时不执行。
+// Bun 有 `import.meta.main`;Node(< 24.2)没有 → 回退比对入口脚本路径。
+// (node-runnable 化漏网的 Bun 专属 API:node 下 `--serve` 子进程原本静默不启动。)
+const runAsEntry =
+  (import.meta as { main?: boolean }).main ??
+  (process.argv[1] ? import.meta.url === pathToFileURL(process.argv[1]).href : false);
+if (runAsEntry) {
   runCli(process.argv.slice(2)).then((code) => process.exit(code));
 }

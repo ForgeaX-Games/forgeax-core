@@ -1,13 +1,14 @@
 /**
  * CLI host bits — host 侧具体实现,喂给 core 的注入接缝:
- *   - makeSpawnSyncHookRunner:settings-hook 的**同步**命令执行器(Bun.spawnSync)。
+ *   - makeSpawnSyncHookRunner:settings-hook 的**同步**命令执行器(node:child_process.spawnSync)。
  *     约定:hook 进程 exit code 2 = block;stdout 若是 JSON {decision,reason,modify} 亦解析。
  *   - makeHttpSearchBackend:web_search 后端 —— POST {query} 到一个 HTTP 端点拿结果。
  *   - makeAskUser:交互式权限回路(--yes 全允许;否则非交互一律 deny,fail-closed)。
  *
  * 这些是 cli→core 方向的 host 实现,core/src 机制层不依赖本文件(干净律不破)。
- * Boundary: 仅 core 相对 + node:/Bun 全局。
+ * Boundary: 仅 core 相对 + node: 全局。
  */
+import { spawnSync } from 'node:child_process';
 import type { CoreEvent } from '../events/types';
 import type { HookDecision, HookCommandRunner } from '../capability/hooks/from-settings';
 import { parseHookOutput, eventToHookInput } from '../capability/hooks/protocol';
@@ -21,7 +22,7 @@ function hookTimeoutMs(): number {
 }
 
 /**
- * 用 Bun.spawnSync 同步跑 hook 命令。**全量** hook 协议:
+ * 用 node:child_process.spawnSync 同步跑 hook 命令。**全量** hook 协议:
  *  - stdin = wire JSON(eventToHookInput);
  *  - stdout JSON 经 `parseHookOutput` 解析:`decision/block` · `continue`(=false 停轮) ·
  *    `systemMessage` · `hookSpecificOutput.additionalContext` · `permissionDecision`(allow/deny/ask);
@@ -32,23 +33,21 @@ function hookTimeoutMs(): number {
 export function makeSpawnSyncHookRunner(): HookCommandRunner {
   return (command: string, event: CoreEvent): HookDecision | void => {
     const wireInput = JSON.stringify(eventToHookInput(event));
-    let res: ReturnType<typeof Bun.spawnSync>;
-    try {
-      res = Bun.spawnSync(['sh', '-c', command], {
-        env: { ...process.env, FORGEAX_HOOK_EVENT: JSON.stringify(event) },
-        stdin: new TextEncoder().encode(wireInput),
-        stdout: 'pipe',
-        stderr: 'pipe',
-        timeout: hookTimeoutMs(),
-      });
-    } catch {
-      return; // spawn 失败 → fail-open
-    }
-    // 超时:Bun 杀进程,exitCode 为 null / 带 signal → fail-open(不阻塞总线)。
-    if (res.exitCode == null && res.signalCode != null) return;
+    // node:child_process.spawnSync —— Node 与 Bun 同款语义(Bun 实现 node: 接口),
+    // 单代码路径双运行时。spawn 失败 / 超时不抛,落到 res.error → fail-open。
+    const res = spawnSync('sh', ['-c', command], {
+      env: { ...process.env, FORGEAX_HOOK_EVENT: JSON.stringify(event) },
+      input: wireInput,
+      encoding: 'utf8',
+      timeout: hookTimeoutMs(),
+    });
+    // spawn 失败 / 超时(Node 置 res.error，不抛)→ fail-open(不阻塞总线)。
+    if (res.error) return;
+    // 超时杀进程:status 为 null 且带 signal → fail-open。
+    if (res.status == null && res.signal != null) return;
 
-    const stdout = res.stdout ? new TextDecoder().decode(res.stdout).trim() : '';
-    const stderr = res.stderr ? new TextDecoder().decode(res.stderr).trim() : '';
+    const stdout = (res.stdout ?? '').trim();
+    const stderr = (res.stderr ?? '').trim();
 
     // stdout JSON 决议(advanced hook output)经全量解析器。
     const decision: HookDecision = parseHookOutput(stdout);
@@ -62,7 +61,7 @@ export function makeSpawnSyncHookRunner(): HookCommandRunner {
       }
     }
     // exit code 2 = block,reason 取 stderr(stdout 未显式 block 时)。
-    if (res.exitCode === 2 && !decision.block) {
+    if (res.status === 2 && !decision.block) {
       decision.block = true;
       if (decision.reason == null) decision.reason = stderr || `hook blocked (exit 2)`;
     }

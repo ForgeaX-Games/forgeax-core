@@ -56,7 +56,7 @@ export class DefaultSystemPromptAssembler implements SystemPromptAssembler {
     const staticScope = defaultStaticScope(globalCacheEnabled);
     for (const slot of staticSlots) {
       const text = await renderSlot(slot, ctx);
-      if (text === null || text.length === 0) continue;
+      if (!text) continue; // null / undefined(slot.render 可能返 undefined)/ 空串 → 跳过
       blocks.push({
         type: 'text',
         text,
@@ -73,7 +73,7 @@ export class DefaultSystemPromptAssembler implements SystemPromptAssembler {
     // 4. 动态 slots(boundary 之后)——每轮重算，永不缓存。
     for (const slot of dynamicSlots) {
       const text = await renderSlot(slot, ctx);
-      if (text === null || text.length === 0) continue;
+      if (!text) continue; // null / undefined(slot.render 可能返 undefined)/ 空串 → 跳过
       blocks.push({ type: 'text', text, cacheScope: null });
     }
 

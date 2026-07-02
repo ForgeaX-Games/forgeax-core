@@ -8,7 +8,7 @@
  *
  * 为何 runHook 必须同步:core EventBus.publish 是同步串行(§6.2),pre-tool 的 block
  * 闸在 publish 返回后立即读 `event.blocked`。故命令执行须同步完成(host 用
- * `Bun.spawnSync` 实现)——core 本身不 spawn(boundary)。
+ * `node:child_process.spawnSync` 实现)——core 本身不 spawn(boundary)。
  *
  * Boundary: 仅 import core-local 契约。
  */
@@ -50,7 +50,7 @@ export interface HookDecision {
   permissionDecision?: 'allow' | 'deny' | 'ask';
 }
 
-/** host 注入的同步命令执行器(用 Bun.spawnSync 等)。返回决议或 void(=放行)。 */
+/** host 注入的同步命令执行器(用 node:child_process.spawnSync 等)。返回决议或 void(=放行)。 */
 export type HookCommandRunner = (command: string, event: CoreEvent) => HookDecision | void;
 
 export interface HookMatcherEntry {
