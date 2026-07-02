@@ -14,6 +14,7 @@
 import React from 'react';
 import { Box, Text } from 'ink';
 import { registerMessage, type MessageView } from './registry';
+import { padToWidth, termWidth } from '../../text-width';
 
 export const UserView: MessageView = (p) => {
   const text = p.item.kind === 'user' ? p.item.text : '';
@@ -22,9 +23,11 @@ export const UserView: MessageView = (p) => {
     <Box flexDirection="column">
       {lines.map((line, i) => {
         // 前缀直接拼进字符串:首行 `› `,续行两空格缩进。整行=一个扁平 Text,无子节点。
-        const prefixed = (i === 0 ? '› ' : '  ') + line;
+        // cc-parity 满宽底条:补空格到终端列宽,让 backgroundColor 铺满整行(Ink 背景不自动铺满)。
+        // 仍守折行铁律——纯字符串、无嵌套 Text/并列 Box。
+        const prefixed = padToWidth((i === 0 ? '› ' : '  ') + line, termWidth());
         return (
-          <Text key={i} color={p.theme.text}>
+          <Text key={i} color={p.theme.text} backgroundColor={p.theme.userBg}>
             {prefixed}
           </Text>
         );

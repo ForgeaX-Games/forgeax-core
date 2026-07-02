@@ -33,6 +33,7 @@ import {
   readMcpDeferDefault,
   type ResolveMcpDeps,
   type MCPClient,
+  type MCPTool,
 } from '../capability/mcp/index';
 import { loadPlugins, pluginToCapabilityPack, type HookRunner, type PluginSource } from '../capability/plugin/index';
 import { loadHooksFromSettings, type HooksSettings, type HookCommandRunner } from '../capability/hooks/from-settings';
@@ -138,7 +139,7 @@ export async function assembleCapabilities(opts: AssembleCapabilitiesOptions): P
     // pass1:连接 + initialize + 拉工具数(client 留着给 pass2 复用,避免二次连接)。
     const serverConfigs: Record<string, { defer_loading?: boolean } | undefined> = {};
     const toolCounts: Record<string, number> = {};
-    const live: Array<{ name: string; client: MCPClient }> = [];
+    const live: Array<{ name: string; client: MCPClient; tools: MCPTool[] }> = [];
     for (const s of servers) {
       serverConfigs[s.name] = { defer_loading: s.config.defer_loading };
       try {
@@ -151,7 +152,8 @@ export async function assembleCapabilities(opts: AssembleCapabilitiesOptions): P
         }
         const tools = await client.listTools();
         toolCounts[s.name] = tools.length;
-        live.push({ name: s.name, client });
+        // 工具清单留给 pass2 复用(prefetchedTools),避免每 server 二次 tools/list。
+        live.push({ name: s.name, client, tools });
       } catch (e) {
         toolCounts[s.name] = 0;
         process.stderr.write(`[assemble] mcp "${s.name}": ${(e as Error).message}\n`);
@@ -167,9 +169,10 @@ export async function assembleCapabilities(opts: AssembleCapabilitiesOptions): P
     );
 
     // pass2:按 deferMode 打 pack。async server 的工具声明 shouldDefer(首轮不上线)。
-    for (const { name, client } of live) {
+    //   复用 pass1 的 tools(prefetchedTools)→ 每 server 仅一次 tools/list。
+    for (const { name, client, tools } of live) {
       try {
-        packs.push(await mcpPack(client, name, { deferMode: perServer[name] }));
+        packs.push(await mcpPack(client, name, { deferMode: perServer[name], prefetchedTools: tools }));
         const maybeClose = (client as { close?: () => unknown }).close;
         if (typeof maybeClose === 'function') {
           disposers.push(() => {

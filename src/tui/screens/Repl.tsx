@@ -58,6 +58,7 @@ import { useRemote } from '../providers/remote';
 import { appendAssistantText } from '../remote/reply';
 import type { RemoteOrigin, RemoteInboundMsg } from '../remote/controller';
 import { StatusLine } from '../components/StatusLine';
+import { ThinkingIndicator } from '../components/ThinkingIndicator';
 import { Queue } from '../components/Queue';
 
 /** 一条待跑的轮:本地输入(origin 省略)或远端来源(带回复定址)。 */
@@ -891,6 +892,7 @@ export function Repl(): React.ReactElement {
 
       {/* 状态栏(边框外,缩进对齐):只显示 token | 耗时 | 模型,其余提示一律不渲染(用户要求极简)。 */}
       <Box flexDirection="column" paddingX={1}>
+        <ThinkingIndicator busy={status.busy} />
         <StatusLine />
       </Box>
     </Box>

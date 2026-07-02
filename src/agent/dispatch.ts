@@ -7,7 +7,11 @@
  */
 import type { AgentTool, ToolContext, PermissionResult } from '../capability/types';
 import type { CoreEvent } from '../events/types';
-import { hasPermissionsToUseTool, type PermissionMode } from '../permission/engine';
+import {
+  hasPermissionsToUseTool,
+  checkRuleBasedPermissions,
+  type PermissionMode,
+} from '../permission/engine';
 import type { PermissionRuleSet } from '../permission/rules';
 import { validateAgainstSchema } from '../capability/validate';
 
@@ -158,9 +162,49 @@ async function runOne(use: ToolUse, deps: DispatchDeps): Promise<ToolDispatchRes
     };
   }
 
-  // 权限把闸（trust channel 绕过；K5）。hook 'allow' 亦旁路引擎(显式放行,免审批卡)。
+  // 权限把闸（trust channel 绕过；K5）。
   let callInput: unknown = parsed;
-  if (!deps.trusted && hookPerm !== 'allow') {
+  if (!deps.trusted && hookPerm === 'allow') {
+    // hook 'allow' 免「审批卡」,但**不越过** settings deny/ask 与受保护路径 safetyCheck
+    //（deny 是 K5 最强不变量,hook 不可削弱）。只跑规则子集 ①deny ②ask ⑤safetyCheck:
+    //   deny → 拒;ask → 转 askUser(无回调 fail-closed deny);null → 放行(跳过审批卡)。
+    const sub = await checkRuleBasedPermissions(
+      tool,
+      parsed,
+      ctx,
+      deps.rules,
+      deps.enableSafetyCheck,
+    );
+    if (sub?.behavior === 'deny') {
+      return {
+        toolUseId: use.id,
+        toolName: use.name,
+        result: errorEvent(use.id, sub.message ?? `permission denied for ${use.name}`, 'permission_denied'),
+        isError: true,
+        errorCategory: 'permission_denied',
+      };
+    }
+    if (sub?.behavior === 'ask') {
+      let granted = false;
+      if (deps.askUser) {
+        try {
+          granted = await deps.askUser(sub, use);
+        } catch {
+          granted = false; // 咨询抛错 → fail-closed
+        }
+      }
+      if (!granted) {
+        return {
+          toolUseId: use.id,
+          toolName: use.name,
+          result: errorEvent(use.id, sub.message ?? `permission ask for ${use.name}`, 'permission_denied'),
+          isError: true,
+          errorCategory: 'permission_denied',
+        };
+      }
+    }
+    callInput = sub?.updatedInput ?? parsed;
+  } else if (!deps.trusted) {
     const perm = await hasPermissionsToUseTool(tool, parsed, ctx, deps.rules, {
       mode: deps.mode,
       enableSafetyCheck: deps.enableSafetyCheck,

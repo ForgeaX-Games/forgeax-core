@@ -370,11 +370,12 @@ export function makeProviderSummarize(
   provider: LLMProvider,
   model: string,
   scenario: SummaryScenario = 'full',
+  customInstructions?: string,
 ): Summarize {
   return async (messages) => {
     const req: ProviderRequest = {
       model,
-      system: [{ type: 'text', text: getCompactPrompt(scenario) }],
+      system: [{ type: 'text', text: getCompactPrompt(scenario, customInstructions) }],
       tools: [], // self-limit:无工具 → 摘要不会再触发任何工具/递归压缩
       messages: [{ role: 'user', content: messages.map((m) => JSON.stringify(m)).join('\n') }],
       maxOutputTokens: 4096,
@@ -397,6 +398,7 @@ export function makeProviderSummarize(
 export function makeProviderCompactSummarize(
   provider: LLMProvider,
   model: string,
+  customInstructions?: string,
 ): CompactSummarize {
-  return (messages, scenario) => makeProviderSummarize(provider, model, scenario)(messages);
+  return (messages, scenario) => makeProviderSummarize(provider, model, scenario, customInstructions)(messages);
 }

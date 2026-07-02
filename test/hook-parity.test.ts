@@ -140,13 +140,25 @@ const baseDeps = (tools: AgentTool[], over: Partial<Parameters<typeof dispatchTo
 });
 
 describe('dispatch — preToolPermission 三态', () => {
-  test("hook 'allow' 旁路引擎拒绝 → 工具仍运行(免审批卡)", async () => {
+  test("hook 'allow' 免审批卡但不越过引擎 deny → 工具被拒", async () => {
     let ran = false;
     const tool = mkTool('writer', { deny: true, onRun: () => (ran = true) }); // 引擎显式 deny
     const r = await dispatchTools([{ id: 'a', name: 'writer', input: {} }], baseDeps([tool], {
       preToolPermission: () => 'allow',
     }));
-    expect(r[0].isError).toBe(false); // hook allow 旁路了引擎 deny
+    // deny 是 K5 最强不变量:hook allow 可免审批卡,但不可绕 deny(对齐 cc 安全模型)。
+    expect(r[0].isError).toBe(true);
+    expect(r[0].errorCategory).toBe('permission_denied');
+    expect(ran).toBe(false);
+  });
+
+  test("hook 'allow' + 引擎无反对 → 放行(免审批卡)", async () => {
+    let ran = false;
+    const tool = mkTool('reader3', { readOnly: true, onRun: () => (ran = true) }); // 引擎会 allow
+    const r = await dispatchTools([{ id: 'a2', name: 'reader3', input: {} }], baseDeps([tool], {
+      preToolPermission: () => 'allow',
+    }));
+    expect(r[0].isError).toBe(false);
     expect(ran).toBe(true);
   });
 
@@ -252,10 +264,10 @@ describe('CoreAgent e2e — PreToolUse permissionDecision 驱动 loop', () => {
     expect(ran).toBe(false);
   });
 
-  test("PreToolUse hook permissionDecision='allow' → 旁路引擎拒绝,工具运行", async () => {
+  test("PreToolUse hook permissionDecision='allow' 不越过引擎 deny → 工具被拒", async () => {
     let ran = false;
     const bus = new EventBus();
-    // act2 引擎显式 deny;hook allow 应旁路放行。
+    // act2 引擎显式 deny;hook allow 免审批卡但**不得**绕过 deny(K5 最强不变量)。
     bus.subscribe(CoreEventType.ToolCallRequested, (_e, ctl) =>
       ctl.modify({ permissionDecision: 'allow' } as never),
     );
@@ -266,9 +278,9 @@ describe('CoreAgent e2e — PreToolUse permissionDecision 驱动 loop', () => {
     ]);
     const agent = new CoreAgent({ context: ctx([tool], provider), bus });
     const evs = await runAgent(agent);
-    expect(ran).toBe(true);
+    expect(ran).toBe(false);
     const tr = evs.find((e) => e.type === 'tool_result');
-    expect(JSON.stringify(tr)).not.toContain('permission');
+    expect(JSON.stringify(tr)).toContain('permission');
   });
 
   test('PreCompact matcher 区分 manual/auto', () => {

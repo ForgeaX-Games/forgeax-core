@@ -84,6 +84,12 @@ export interface MapMcpToolOptions {
    *   - `'sync'` / 缺省：不设 `shouldDefer`，工具首轮就在 wire 上（原有行为）。
    */
   deferMode?: McpDeferMode;
+  /**
+   * 已预取的工具清单（装配期 pass1 的 `listTools` 结果）。传入时 {@link getMcpTools}
+   * 复用它而**不再**二次 `client.listTools()`，使装配期每个 server 恰好一次 tools/list。
+   * 缺省 → 现拉（原有行为，向后兼容）。
+   */
+  prefetchedTools?: MCPTool[];
 }
 
 /**
@@ -191,7 +197,8 @@ export async function getMcpTools(
   serverName: string,
   opts?: MapMcpToolOptions,
 ): Promise<AgentTool<Record<string, unknown>, unknown>[]> {
-  const mcpTools = await client.listTools();
+  // pass2 复用装配期 pass1 已拉的清单(避免每 server 二次 tools/list);缺省才现拉。
+  const mcpTools = opts?.prefetchedTools ?? (await client.listTools());
   const out: AgentTool<Record<string, unknown>, unknown>[] = [];
   for (const t of mcpTools) {
     try {

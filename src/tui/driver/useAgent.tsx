@@ -107,6 +107,9 @@ export function createAgentDriver(opts: DriverOptions, initial: HostContext): Ag
   /** 当前挂起态的「对话侧」快照(messages 由 Repl 持有传入,convo 由 driver 持有)。
    *  boundaryId 串联文件侧 manager.pending();null = 无挂起。 */
   let activeBoundary: { boundaryId: string; preMessages: UiMessage[]; preConvo: ProviderMessage[]; hasCode: boolean } | null = null;
+  // 启动/重启后从磁盘恢复挂起态:loadIndex 已重建 pendingRec,但 activeBoundary 是纯内存态。
+  // 对话侧 pre 快照(preMessages/preConvo)无法从磁盘恢复,置空;文件侧 Redo 仍可用。
+  { const _lp = checkpoints.pending(); if (_lp) activeBoundary = { boundaryId: _lp.boundaryId, preMessages: [], preConvo: [], hasCode: _lp.preManifestId !== null }; }
   // ── 会话续接(025):driver 维护对话历史并每轮 thread 给 CoreAgent(它本身不跨 run 持有)。
   //    文本级重建(user 文本 + assistant 文本轮;工具轮从略,与 Repl.toHistory / rewind 同口径)。
   let convo: ProviderMessage[] = [];
@@ -404,13 +407,13 @@ export function createAgentDriver(opts: DriverOptions, initial: HostContext): Ag
     },
 
     async triggerCompact(instructions?: string): Promise<{ compacted: boolean; usedLLM: boolean }> {
-      // 自定义指令透传待 makeProviderCompactSummarize 支持(014 A 层 note);本期先做基础压缩。
-      void instructions;
+      // `/compact <侧重指令>` 透传:instructions 经 makeProviderCompactSummarize →
+      // getCompactPrompt(scenario, instructions) 追加进压缩 prompt(不再静默丢弃)。
       const history = convo;
       if (!history.length) return { compacted: false, usedLLM: false };
       try {
         const marks = computeWatermarksFromModel(lookupModelContext(model));
-        const summarize = makeProviderCompactSummarize(host.provider, model);
+        const summarize = makeProviderCompactSummarize(host.provider, model, instructions);
         const res = await runManualCompact({ history, marks, summarize, now: Date.now() });
         const count = res.coveredTo - res.coveredFrom + 1;
         if (count > 0) {

@@ -43,6 +43,7 @@ const DEFAULT_MAX_OUTPUT_TOKENS = 8192;
 
 export function systemBlocksToInstructions(blocks: SystemBlock[]): string | undefined {
   const text = blocks
+    .filter((b) => !b.boundary) // 剔除内部 cache 分界哨兵,勿泄漏给模型(与 anthropic/text/gemini 四 flattener 同步)
     .map((b) => b.text)
     .filter((t) => t.length > 0)
     .join('\n\n');

@@ -701,6 +701,11 @@ export class CoreAgent implements Agent {
 
     // ─── 真实 token 账(reactive autocompact):用上一轮 API 回传 prompt token 判水位。
     let lastPromptTokens = 0;
+    const ctxRatio = (): number | undefined => {
+      if (lastPromptTokens <= 0) return undefined;
+      const cw = this.o.contextWindow ?? lookupModelContext(this.currentModel).contextWindow ?? 200_000;
+      return cw > 0 ? Math.min(1, lastPromptTokens / cw) : undefined;
+    };
     // ─── token 预算(taskBudget):累计本 run 已花 token(output 增量累加)。
     const taskBudget = this.o.context.config.taskBudget;
     let spentTokens = 0;
@@ -952,8 +957,8 @@ export class CoreAgent implements Agent {
         continuations++;
         messages.push(buildContinuationMessage());
         this.bus.publish(this.ev(CoreEventType.TurnAborted, { turn, reason: 'max_output_tokens_recovery' }));
-        yield { type: 'turn_end', turn };
-        this.bus.publish(this.ev(CoreEventType.TurnEnd, { turn }));
+        yield { type: 'turn_end', turn, usageContextRatio: ctxRatio() };
+        this.bus.publish(this.ev(CoreEventType.TurnEnd, { turn, usageContextRatio: ctxRatio() }));
         continue;
       }
 
@@ -979,8 +984,8 @@ export class CoreAgent implements Agent {
         // hook 在 Stop 上设 continue:false(回执 continueLoop===false)→ 视作优雅停:
         //   不再走 preventStop 续轮逻辑,直接正常收尾(continue:false 语义)。
         if (stopExtra.continueLoop === false) {
-          yield { type: 'turn_end', turn };
-          this.bus.publish(this.ev(CoreEventType.TurnEnd, { turn }));
+          yield { type: 'turn_end', turn, usageContextRatio: ctxRatio() };
+          this.bus.publish(this.ev(CoreEventType.TurnEnd, { turn, usageContextRatio: ctxRatio() }));
           if (this.o.autoMemory) {
             this.pendingExtract = this.o.autoMemory
               .extract(messages.map((m) => ({ role: m.role, content: m.content })), signal)
@@ -998,14 +1003,14 @@ export class CoreAgent implements Agent {
           continuations++;
           const reason = stopDecision.reason ?? 'A stop hook requested that you keep going.';
           messages.push({ role: 'user', content: `<system-reminder>${reason}</system-reminder>` });
-          yield { type: 'turn_end', turn };
-          this.bus.publish(this.ev(CoreEventType.TurnEnd, { turn }));
+          yield { type: 'turn_end', turn, usageContextRatio: ctxRatio() };
+          this.bus.publish(this.ev(CoreEventType.TurnEnd, { turn, usageContextRatio: ctxRatio() }));
           continue;
         }
         // hook 反复要求继续但已触上限 → 终止(TerminalReason stop_hook_prevented)。
         if (stopDecision.prevented) {
-          yield { type: 'turn_end', turn };
-          this.bus.publish(this.ev(CoreEventType.TurnEnd, { turn }));
+          yield { type: 'turn_end', turn, usageContextRatio: ctxRatio() };
+          this.bus.publish(this.ev(CoreEventType.TurnEnd, { turn, usageContextRatio: ctxRatio() }));
           yield done('stop_hook_prevented');
           return;
         }
@@ -1022,13 +1027,13 @@ export class CoreAgent implements Agent {
           continuations++;
           messages.push(buildContinuationMessage());
           this.bus.publish(this.ev(CoreEventType.TurnAborted, { turn, reason: 'token_budget_continuation' }));
-          yield { type: 'turn_end', turn };
-          this.bus.publish(this.ev(CoreEventType.TurnEnd, { turn }));
+          yield { type: 'turn_end', turn, usageContextRatio: ctxRatio() };
+          this.bus.publish(this.ev(CoreEventType.TurnEnd, { turn, usageContextRatio: ctxRatio() }));
           continue;
         }
 
-        yield { type: 'turn_end', turn };
-        this.bus.publish(this.ev(CoreEventType.TurnEnd, { turn }));
+        yield { type: 'turn_end', turn, usageContextRatio: ctxRatio() };
+        this.bus.publish(this.ev(CoreEventType.TurnEnd, { turn, usageContextRatio: ctxRatio() }));
         // ★ auto-memory 自动抽取:done 后台触发(fire-and-forget;CLI 经 drainAutoMemory 等落盘)。
         if (this.o.autoMemory) {
           this.pendingExtract = this.o.autoMemory
@@ -1042,8 +1047,8 @@ export class CoreAgent implements Agent {
       // budget 耗尽硬护栏:带 tool_use 但预算已耗尽 → 优雅收口(不再继续烧 token)。
       if (taskBudget && isBudgetExhausted(spentTokens, taskBudget)) {
         // 仍把已产出的 assistant 消息留在上下文;按 max_turns 语义收尾(turnCount 透出)。
-        yield { type: 'turn_end', turn };
-        this.bus.publish(this.ev(CoreEventType.TurnEnd, { turn }));
+        yield { type: 'turn_end', turn, usageContextRatio: ctxRatio() };
+        this.bus.publish(this.ev(CoreEventType.TurnEnd, { turn, usageContextRatio: ctxRatio() }));
         yield done('max_turns', { turnCount: turn + 1 });
         return;
       }
@@ -1202,8 +1207,8 @@ export class CoreAgent implements Agent {
 
       // stage6 turn end
       yield { type: 'stage', stage: 'turn_end', turn };
-      yield { type: 'turn_end', turn };
-      this.bus.publish(this.ev(CoreEventType.TurnEnd, { turn }));
+      yield { type: 'turn_end', turn, usageContextRatio: ctxRatio() };
+      this.bus.publish(this.ev(CoreEventType.TurnEnd, { turn, usageContextRatio: ctxRatio() }));
 
       if (signal.aborted) {
         yield { type: 'turn_aborted', turn };
