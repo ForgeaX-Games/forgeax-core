@@ -76,19 +76,28 @@ export type RewindOutcome =
   | { boundaryId: string; filesChanged: string[]; keptDirty: string[] }
   | { error: string };
 
+/** 一张随 user 轮提交的图片附件(粘贴/拖入)。data=base64(无 data: 前缀);
+ *  mediaType 形如 'image/png'。承载线:Repl.pendingImages → send/driveTurn →
+ *  buildUserContent 转 Anthropic 中立 content block(见 input/imagePaste.ts)。 */
+export interface ImageAttachment {
+  data: string;
+  mediaType: string;
+}
+
 // ── 本地 UI 消息模型(把 AgentEvent + 本地 user 输入统一成可渲染条目)──
 //   user 条目可带 msgId:回退点的文件快照锚点(submit 时由 driver.checkpointTurn 生成)。
 //   /resume 重建的历史无 msgId(walEventsToUiMessages 不产)→ 该会话文件回退按 ordinal
 //   best-effort,见 checkpoint-manager。
+//   images:该轮附带的图片(占位符 `[Image #n]` 进 text 供显示;真 base64 走 images 上模型)。
 export type UiMessage =
-  | { kind: 'user'; text: string; msgId?: string }
+  | { kind: 'user'; text: string; msgId?: string; images?: ImageAttachment[]; pastes?: string[] }
   | { kind: 'agent'; event: AgentEvent }; // 原生事件直接挂
 
 // ── Session 真相 = 有序事件日志(梁②;reduceTranscript 的输入)──
 /** session 的真相 = 有序条目日志:本地 user 输入 + 原生 AgentEvent。
  *  reduceTranscript(log) 把它折成可渲染的 TranscriptItem[]。 */
 export type SessionEntry =
-  | { kind: 'user'; text: string }
+  | { kind: 'user'; text: string; images?: ImageAttachment[]; pastes?: string[] }
   | { kind: 'event'; event: AgentEvent };
 
 // ── Transcript 模型(梁②;reduceTranscript 输出的可渲染条目)──
@@ -176,6 +185,9 @@ export interface Key {
     | 'ctrl-c'
     | 'ctrl-o'
     | 'paste'
+    // 空 bracketed paste(ESC[200~ESC[201~,中间无内容):Cmd+V 图片的唯一信号 →
+    // 触发主动读系统剪贴板(normalize 产,Repl 消费,见 input/imagePaste.ts §0 根因)。
+    | 'paste-image-probe'
     | 'tab';
   /** kind==='char'|'paste' 时的文本载荷。 */
   text?: string;
@@ -197,7 +209,8 @@ export interface PromptState {
  * Repl 在构造 ctx 时把它们委派到 driver;命令文件只调 ctx、各自格式化输出经 print 落地。
  */
 export interface CommandCtx {
-  send(text: string): void;
+  /** 提交一轮 user 输入;images 为可选图片附件(粘贴/拖入,走多模态 content block)。 */
+  send(text: string, images?: ImageAttachment[]): void;
   clear(): void;
   exit(): void;
   /** 注:forgeax-core 只有「模型」,无 kernel。 */
@@ -326,8 +339,9 @@ export interface QuestionQueue {
 
 // ── agent driver(embed CoreAgent;直构,不走 runTurn,见 PRD §0-A)──
 export interface AgentDriver {
-  /** 跑一轮:把 AgentEvent 逐个回调(driver 内部 reduce 进 session)。done 时 resolve。 */
-  driveTurn(prompt: string, onEvent: (e: AgentEvent) => void): Promise<void>;
+  /** 跑一轮:把 AgentEvent 逐个回调(driver 内部 reduce 进 session)。done 时 resolve。
+   *  images:该轮附带的图片附件(多模态);有则 payload 走 content block 数组,否则纯字符串。 */
+  driveTurn(prompt: string, onEvent: (e: AgentEvent) => void, images?: ImageAttachment[]): Promise<void>;
   /** 取消在飞轮:CoreAgent.abort() → turn_aborted + done。 */
   abort(reason?: string): void;
   /** 按模型发来的名(含 aliases)解析回真工具,产出视图元信息(梁①)。

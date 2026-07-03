@@ -12,9 +12,11 @@
  * Boundary：只 import C4 契约（types.ts）。重试由上层 withRetry 包（retry.ts）。
  */
 
+import { FORGEAX_USER_AGENT } from './user-agent';
 import {
   EMPTY_USAGE,
   mergeUsage,
+  StreamIdleError,
   type LLMProvider,
   type ProviderCallOpts,
   type ProviderFactory,
@@ -132,26 +134,35 @@ export function buildRequestBody(req: ProviderRequest): Record<string, unknown> 
 
 /** SSE 读空闲超时(ms):上游连续这么久不吐**任何字节**(含 ping)即判定卡死,abort 抛错。
  *  健康但慢的流靠 ping 持续重置计时器,不会误杀;真正 stall(代理 hold 住连接不发数据)
- *  才触发 —— 修「整轮无响应永久挂死」的根因。0/负 = 关闭(回退旧无超时行为)。
- *  缺省 90s(同一根因:请求超时只覆盖 fetch() 初次握手,不覆盖流式 body)。
- *  env `FORGEAX_PROVIDER_IDLE_MS` 可调。该看门狗默认**开**(实测被此 bug 命中)。 */
-function providerStreamIdleMs(): number {
+ *  才触发 —— 修「整轮无响应永久挂死」的根因。请求超时只覆盖 fetch() 初次握手,不覆盖流式 body。
+ *  **全后端通用**:SSE 系(anthropic/vertex/openai-compat/gemini/openai-response 经共享 parseSSE)+
+ *  Bedrock(经 decodeBedrockEventStream,import 本函数;正是这条经代理转 Bedrock 的链路催生本修复)。
+ *
+ *  数值对齐 claude-code(v2.1.175):cc `CLAUDE_STREAM_IDLE_TIMEOUT_MS` 默认 5min、byte 看门狗
+ *  clamp 到 [10s, 30min]。此前 forgeax 默认 90s 偏激进 —— 经代理转 Bedrock 的链路常不透传
+ *  Anthropic 的 SSE `ping`、且做缓冲,一次「长思考 + 慢代理」就能凑够 90s 零字节误杀。改默认 300s。
+ *  0/负 = 关闭(回退旧无超时行为);非 0 的 env 值 clamp 到 [10s, 30min]。
+ *  env `FORGEAX_PROVIDER_IDLE_MS` 可调。该看门狗默认**开**。命中后由 stream-retry 有界重发(对齐 cc)。 */
+const STREAM_IDLE_DEFAULT_MS = 300_000; // cc UL8=max(env,300000):整流空闲默认 5min
+const STREAM_IDLE_MIN_MS = 10_000; //     cc clamp 下界(Zm5=1e4)
+const STREAM_IDLE_MAX_MS = 1_800_000; //  cc clamp 上界(Gm5=1.8e6=30min)
+export function providerStreamIdleMs(): number {
   const v = Number(process.env.FORGEAX_PROVIDER_IDLE_MS);
-  return Number.isFinite(v) && v >= 0 ? v : 90_000;
+  if (!Number.isFinite(v) || v < 0) return STREAM_IDLE_DEFAULT_MS;
+  if (v === 0) return 0; // 显式关闭(escape hatch)
+  return Math.min(Math.max(v, STREAM_IDLE_MIN_MS), STREAM_IDLE_MAX_MS);
 }
 
-/** `reader.read()` 加空闲超时:超时则 cancel reader 并抛错(让上层把本轮干净 error 封口,
- *  而非无限 await)。任何到达的字节(含 ping)都会让下一次调用重置计时器。 */
-async function readWithIdleTimeout(
+/** `reader.read()` 加空闲超时:超时则 cancel reader 并抛 StreamIdleError(让上层把本轮干净 error
+ *  封口,而非无限 await)。任何到达的字节(含 ping)都会让下一次调用重置计时器。SSE 系经 parseSSE、
+ *  Bedrock 经 decodeBedrockEventStream 共用本函数(SSOT:idle 包裹只此一份)。 */
+export async function readWithIdleTimeout(
   reader: { read(): Promise<{ done: boolean; value?: Uint8Array }>; cancel(reason?: unknown): Promise<void> },
   idleMs: number,
 ): Promise<{ done: boolean; value?: Uint8Array }> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(
-      () => reject(new Error(`anthropic stream idle ${idleMs}ms with no data — aborting (likely upstream/proxy stall)`)),
-      idleMs,
-    );
+    timer = setTimeout(() => reject(new StreamIdleError(idleMs)), idleMs);
   });
   try {
     return await Promise.race([reader.read(), timeout]);
@@ -445,6 +456,7 @@ export const createAnthropicProvider: ProviderFactory = (
   const url = `${base}/v1/messages`;
   const headers: Record<string, string> = {
     'content-type': 'application/json',
+    'user-agent': FORGEAX_USER_AGENT,
     'anthropic-version': ANTHROPIC_VERSION,
     'x-api-key': opts.apiKey,
     ...(opts.headers ?? {}),

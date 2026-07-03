@@ -26,7 +26,9 @@
 import type { Key as InkKey } from 'ink';
 import type { Key } from '../contracts';
 
-/** 退格/删除字节:DEL(0x7f)与 BS(0x08)都按「删光标前一字符」处理。 */
+/** 退格/删除字节:DEL(0x7f)与 BS(0x08)都按「删光标前一字符」处理。
+ *  注:bracketed paste(ESC[200~…ESC[201~)拼装是**有状态**的(跨事件),已上移到
+ *  input/pasteAssembler.ts;normalizeKey 只管**非粘贴**的单次投递,保持纯函数。 */
 function isBackspaceByte(ch: string): boolean {
   const code = ch.charCodeAt(0);
   return code === 0x7f || code === 0x08;

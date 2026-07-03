@@ -9,8 +9,13 @@
  * Boundary: 仅 core 相对 import。
  */
 import type { LLMProvider, ProviderRequest, ProviderCallOpts, ProviderStreamEvent } from './types';
-import { FallbackTriggeredError } from './types';
+import { FallbackTriggeredError, StreamIdleError } from './types';
 import { getRetryDelay, shouldRetry, getDefaultMaxRetries } from './retry';
+
+/** 流式空闲(上游/代理 stall)mid-stream 重发上限。区别于通用 maxRetries(默认 10):idle 每次要等
+ *  满整个空闲阈值(默认 5min)才触发,若也重发 10 次最坏 ~50min,故单独有界。对齐 cc「idle → 丢弃
+ *  半截 partial + 重新发起」的有界重发(cc 也带 attemptNumber 计数)。 */
+const MID_STREAM_IDLE_MAX_RETRIES = 2;
 
 export interface StreamRetryConfig {
   maxRetries?: number;
@@ -37,6 +42,7 @@ export async function* streamWithRetry(
   const maxRetries = cfg.maxRetries ?? getDefaultMaxRetries();
   const sleep = cfg.sleep ?? defaultSleep;
   let model = req.model;
+  let idleRetries = 0;
 
   for (let attempt = 1; attempt <= maxRetries + 1; attempt++) {
     if (opts.signal.aborted) return;
@@ -52,6 +58,15 @@ export async function* streamWithRetry(
       if (err instanceof FallbackTriggeredError && opts.fallbackModel && !started) {
         opts.onStreamingFallback?.();
         model = opts.fallbackModel;
+        continue;
+      }
+      // 流式空闲(StreamIdleError):**即使已吐事件也重发**——loop 在最终 assistant 事件前不提交
+      //   任何状态,重发只丢弃临时 partial(等价 cc 的 idle→丢半截+re-issue)。单独有界(见常量),
+      //   不与通用 maxRetries 共用计数;走到这条即不再落通用分支。
+      if (err instanceof StreamIdleError) {
+        if (idleRetries >= MID_STREAM_IDLE_MAX_RETRIES || opts.signal.aborted) throw err;
+        idleRetries++;
+        await sleep(getRetryDelay(idleRetries));
         continue;
       }
       // 已吐事件 / 不可重试 / 次数耗尽 → 抛给上层。

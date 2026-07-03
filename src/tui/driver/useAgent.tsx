@@ -29,7 +29,8 @@ import { contextWindowForModel } from '../../context/model-window';
 import { buildHostContext, type HostContext, type HostContextArgs } from '../../cli/host-context';
 import { effectiveSkillDirs } from '../../cli/locations';
 import { updateUserSettings } from '../../cli/settings';
-import type { AgentDriver, UiMessage, PendingRewindView, RewindOutcome, DiffStats } from '../contracts';
+import type { AgentDriver, UiMessage, PendingRewindView, RewindOutcome, DiffStats, ImageAttachment } from '../contracts';
+import { buildUserContent } from '../input/imagePaste';
 import { CheckpointManager } from '../../cli/checkpoint-manager';
 import { defaultSessionsDir } from '../../cli/resume-fold';
 // ── 命令补齐批次(025)A 层能力 + 装配接缝 ──
@@ -172,7 +173,9 @@ export function createAgentDriver(opts: DriverOptions, initial: HostContext): Ag
       return opts.sessionId;
     },
 
-    async driveTurn(prompt: string, onEvent: (e: AgentEvent) => void): Promise<void> {
+    async driveTurn(prompt: string, onEvent: (e: AgentEvent) => void, images?: ImageAttachment[]): Promise<void> {
+      // 多模态:有图 → payload/convo 走 content block 数组([text?, image...]);无图 → 纯字符串(零变化)。
+      const userContent = buildUserContent(prompt, images);
       // 长活复用:同一进程内复用一个 agent。CoreAgent **不跨 run 持有历史**(每次 run 从
       //   input.history 重建),故续接由 driver 维护的 convo 每轮 thread 进去(§T2 硬化)。
       //   rules 引用不变是前提(§0-B),故复用安全。
@@ -185,7 +188,7 @@ export function createAgentDriver(opts: DriverOptions, initial: HostContext): Ag
       const seed = convo.slice();
       let assistantText = '';
       for await (const ev of agent.run({
-        input: { type: 'user', payload: prompt, ts: 0 },
+        input: { type: 'user', payload: userContent, ts: 0 },
         ...(seed.length ? { history: seed } : {}),
       })) {
         // 累计 usage:stream 透传的 provider assistant 事件带真 usage(types.ts:115)。
@@ -235,7 +238,7 @@ export function createAgentDriver(opts: DriverOptions, initial: HostContext): Ag
       }
       // turn 收尾:把本轮 user + assistant 文本并入 convo,供下一轮续接(本轮 user 此刻才入,
       //   避免与上面 input.payload 重复)。
-      convo.push({ role: 'user', content: prompt });
+      convo.push({ role: 'user', content: userContent });
       if (assistantText) convo.push({ role: 'assistant', content: assistantText });
       // ⚠️ 不在此 await drainAutoMemory:答案流式结束 = turn 在用户眼里就完成了,driveTurn
       //   立即 resolve → 上层 busy 立刻翻 false,不让后台记忆抽取(真模型下又一次数秒 LLM

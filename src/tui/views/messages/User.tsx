@@ -25,7 +25,9 @@ export const UserView: MessageView = (p) => {
         // 前缀直接拼进字符串:首行 `› `,续行两空格缩进。整行=一个扁平 Text,无子节点。
         // cc-parity 满宽底条:补空格到终端列宽,让 backgroundColor 铺满整行(Ink 背景不自动铺满)。
         // 仍守折行铁律——纯字符串、无嵌套 Text/并列 Box。
-        const prefixed = padToWidth((i === 0 ? '› ' : '  ') + line, termWidth());
+        // ⚠️ 留右侧 1 列余量(termWidth()-1):若正好填满最后一列,真 TTY 的 autowrap(DECAWM)
+        //   会在行尾插入软换行 → 背景条被拆断 / 末尾多出一行无底色空行,看起来像「背景没了」。
+        const prefixed = padToWidth((i === 0 ? '› ' : '  ') + line, termWidth() - 1);
         return (
           <Text key={i} color={p.theme.text} backgroundColor={p.theme.userBg}>
             {prefixed}

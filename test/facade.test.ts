@@ -148,6 +148,39 @@ describe('ForgeaxCoreKernel — runTurn maps a full turn', () => {
     const md = events.find((e) => e.kind === 'message.delta') as { text: string } | undefined;
     expect(md?.text).toBe('hi there');
   });
+
+  test('streams per-token message.delta from text_delta, no duplication from aggregated assistant', async () => {
+    // provider 流式路:逐 token content_block_delta + 收尾聚合 assistant(anthropic.ts 真实形状)。
+    const chunks = ['Hel', 'lo ', 'wor', 'ld'];
+    const full = chunks.join('');
+    const streamScript: ProviderStreamEvent[] = [
+      { type: 'content_block_start', index: 0, blockType: 'text' },
+      ...chunks.map((c): ProviderStreamEvent => ({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: c } })),
+      { type: 'content_block_stop', index: 0, block: { type: 'text', text: full } },
+      asstText(full),
+    ];
+    const k = new ForgeaxCoreKernel({ provider: scripted([streamScript]), executeTool: async () => null });
+    const events = await collect(k, req({ tools: [] }));
+    const deltas = events.filter((e): e is Extract<KernelEvent, { kind: 'message.delta' }> => e.kind === 'message.delta');
+    // 逐 token 流出(浏览器打字机的数据源),而非一轮一次性全文。
+    expect(deltas.length).toBe(chunks.length);
+    expect(deltas.map((d) => d.text)).toEqual(chunks);
+    // 聚合 assistant 不重发已流出文本 → join 恰好等于全文,零重复。
+    expect(deltas.map((d) => d.text).join('')).toBe(full);
+  });
+
+  test('aggregated assistant emits only the residual tail beyond streamed deltas', async () => {
+    // 聚合文本比增量多一截(结构上少见,防御路):只补余量,不双份。
+    const streamScript: ProviderStreamEvent[] = [
+      { type: 'content_block_start', index: 0, blockType: 'text' },
+      { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'partial' } },
+      asstText('partial+tail'),
+    ];
+    const k = new ForgeaxCoreKernel({ provider: scripted([streamScript]), executeTool: async () => null });
+    const events = await collect(k, req({ tools: [] }));
+    const deltas = events.filter((e): e is Extract<KernelEvent, { kind: 'message.delta' }> => e.kind === 'message.delta');
+    expect(deltas.map((d) => d.text)).toEqual(['partial', '+tail']);
+  });
 });
 
 describe('ForgeaxCoreKernel — consumes TurnRequest.history (native context ownership)', () => {

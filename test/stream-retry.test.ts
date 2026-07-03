@@ -1,9 +1,10 @@
 /**
- * T23 — streamWithRetry: retry-before-first-event, model fallback, no mid-stream retry.
+ * T23 — streamWithRetry: retry-before-first-event, model fallback, no mid-stream retry
+ *   (except StreamIdleError, which re-issues even mid-stream — cc 对齐,见下方 idle 用例)。
  */
 import { test, expect, describe } from 'bun:test';
 import { streamWithRetry } from '../src/provider/stream-retry';
-import { FallbackTriggeredError } from '../src/provider/types';
+import { FallbackTriggeredError, StreamIdleError } from '../src/provider/types';
 import type { LLMProvider, ProviderRequest, ProviderStreamEvent } from '../src/provider/types';
 
 const noSleep = async () => {};
@@ -66,6 +67,42 @@ describe('streamWithRetry', () => {
     expect(seen).toEqual(['m1', 'm2']);
     expect(fellBack).toBe(true);
     expect(out.length).toBe(1);
+  });
+
+  test('StreamIdleError re-issues even AFTER events started (cc 对齐:丢半截+重发)', async () => {
+    let n = 0;
+    const provider: LLMProvider = {
+      api: 'x',
+      async *stream() {
+        n++;
+        if (n === 1) {
+          yield evt('partial'); // 已 started,但 idle stall 仍可安全重发
+          throw new StreamIdleError(300_000);
+        }
+        yield evt('ok');
+      },
+    };
+    const out = await drain(streamWithRetry(provider, req, { signal: new AbortController().signal }, { sleep: noSleep }));
+    expect(n).toBe(2); // 重发一次
+    // 两次尝试的事件都会流出(attempt1 的 partial + attempt2 的 ok);状态提交方以终态 assistant 为准,
+    //   重发不重复提交(loop 只在 message_stop 的聚合 assistant 事件落定 messages/convo/transcript)。
+    expect(out.length).toBe(2);
+    expect(out.every((e) => e.type === 'assistant')).toBe(true);
+  });
+
+  test('StreamIdleError bounded at MID_STREAM_IDLE_MAX_RETRIES then propagates', async () => {
+    let n = 0;
+    const provider: LLMProvider = {
+      api: 'x',
+      async *stream() {
+        n++;
+        throw new StreamIdleError(300_000); // 每次都 idle,验证有界
+      },
+    };
+    await expect(
+      drain(streamWithRetry(provider, req, { signal: new AbortController().signal }, { sleep: noSleep, maxRetries: 10 })),
+    ).rejects.toThrow(StreamIdleError);
+    expect(n).toBe(3); // 首发 + 2 次有界重发(MID_STREAM_IDLE_MAX_RETRIES=2),不受 maxRetries=10 影响
   });
 
   test('non-retryable 400 propagates immediately', async () => {

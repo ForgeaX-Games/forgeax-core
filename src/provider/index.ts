@@ -1,4 +1,5 @@
 export * from './types';
+export * from './user-agent';
 export * from './anthropic';
 export * from './openai-compat';
 export * from './openai-response';

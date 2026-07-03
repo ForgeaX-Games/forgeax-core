@@ -9,7 +9,7 @@
  *
  * Boundary：只 import C4 契约（types.ts），不碰 @anthropic-ai/sdk / cli 内部。
  * 错误以 provider 抛出的「带 status / retryAfterMs 的普通对象」为输入——anthropic.ts
- * 的 throwHttpApiError 会打这些字段。
+ * 的 throwHttpError 会打这些字段。
  */
 
 import { CannotRetryError, FallbackTriggeredError } from './types';

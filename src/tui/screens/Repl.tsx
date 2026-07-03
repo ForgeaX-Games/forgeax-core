@@ -20,10 +20,11 @@
  * Boundary(HOST 层):react + ink + 相对 import。
  */
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Box, Text, useApp, useInput } from 'ink';
+import { Box, Text, useApp, useInput, useStdout } from 'ink';
 import type {
   AgentEvent,
   CommandCtx,
+  ImageAttachment,
   InputMode,
   Key,
   PromptState,
@@ -32,6 +33,14 @@ import type {
   SessionSummary,
   UiMessage,
 } from '../contracts';
+import {
+  buildUserContent,
+  imageB64Bytes,
+  isWithinImageLimit,
+  looksLikeImagePath,
+  readClipboardImage,
+  readImageFile,
+} from '../input/imagePaste';
 import { useTheme } from '../providers/theme';
 import { useSession } from '../providers/session';
 import { useStatusLine } from '../providers/status-line';
@@ -40,11 +49,13 @@ import { usePermissionQueue } from '../providers/permission';
 import { useQuestionQueue } from '../providers/question';
 import { useAgent } from '../driver/useAgent';
 import { resolveCommand } from '../commands/registry';
-import { normalizeKey } from '../input/normalize';
+import { createPasteAssembler } from '../input/pasteAssembler';
+import { shouldCollapsePaste, pastePlaceholder, expandPastes } from '../input/pasteText';
 import { routeKey, type RouterCtx } from '../input/router';
 import { cleanRedraw } from '../use-resize-redraw';
-import { deleteWordBefore } from '../input/promptReducer';
+import { deleteWordBefore, promptReducer } from '../input/promptReducer';
 import { Transcript } from '../transcript/Transcript';
+import { useStreamingText, extractStreamTextDelta, streamingEnabled } from '../transcript/useStreamingText';
 import { PromptInput } from '../input/PromptInput';
 import { CommandMenu, filterCommands } from '../overlays/CommandMenu';
 import { ModelPicker, modelList } from '../overlays/ModelPicker';
@@ -62,7 +73,7 @@ import { ThinkingIndicator } from '../components/ThinkingIndicator';
 import { Queue } from '../components/Queue';
 
 /** 一条待跑的轮:本地输入(origin 省略)或远端来源(带回复定址)。 */
-type QueuedTurn = { prompt: string; origin?: RemoteOrigin };
+type QueuedTurn = { prompt: string; origin?: RemoteOrigin; images?: ImageAttachment[] };
 
 // ─── UiMessage[] → SessionEntry[](梁② reduce 的输入,无损映射)─────────────────
 function toSessionLog(msgs: UiMessage[]): SessionEntry[] {
@@ -76,7 +87,9 @@ function toHistory(msgs: UiMessage[]): ProviderMessage[] {
   const out: ProviderMessage[] = [];
   for (const m of msgs) {
     if (m.kind === 'user') {
-      out.push({ role: 'user', content: m.text });
+      // 多模态:该轮带图 → content block 数组([text?, image...]);无图 → 纯字符串。
+      // 展开折叠粘贴占位回原文,再拼多模态(rewind/resume 重建历史时喂模型的是完整正文)。
+      out.push({ role: 'user', content: buildUserContent(expandPastes(m.text, m.pastes), m.images) });
       continue;
     }
     if (m.event.type === 'assistant') {
@@ -128,6 +141,12 @@ export function Repl(): React.ReactElement {
   const remote = useRemote();
   const { exit } = useApp();
 
+  // ── 流式在写文本(节流累积,不进 session 日志;见 useStreamingText)。turn 内边流边显,
+  //   `assistant` 事件收口、`done` 保留残留。开关 FORGEAX_NO_STREAM=1 → 回退整块渲染。
+  //   解构:displayText(streamingText)随流变化;feed/finalize/reset 稳定引用(免 callback 抖动)。 ──
+  const { displayText: streamingText, feed: streamFeed, finalize: streamFinalize, reset: streamReset } = useStreamingText();
+  const streamOn = streamingEnabled();
+
   // ── 输入框状态(单一真相:value + cursor;编辑全经 promptReducer 纯函数)──
   const [prompt, setPrompt] = useState<PromptState>({ value: '', cursor: 0 });
   const promptRef = useRef(prompt);
@@ -154,6 +173,14 @@ export function Repl(): React.ReactElement {
   const escArmedRef = useRef(false);
   const escTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const interruptedRef = useRef(false);
+  // ── 粘贴图片:待提交的图片附件 + 在飞的异步读取(submit 前须 await,防「粘图后立刻回车」丢图)。
+  const pendingImagesRef = useRef<ImageAttachment[]>([]);
+  const pendingReadsRef = useRef<Promise<void>[]>([]);
+  // ── 粘贴文本折叠:多行粘贴的正文另存(索引=占位 #N);提交时 expandPastes 展开回原文喂模型。
+  const pendingPastesRef = useRef<string[]>([]);
+  // ── bracketed paste 有状态拼装器(跨事件缓冲 ESC[200~…ESC[201~;整 TUI 唯一,随屏生命周期)。
+  const pasteAsmRef = useRef(createPasteAssembler());
+  const { stdout } = useStdout();
 
   // ── 当前 InputMode(从浮层 / 审批队列派生;router 据此分发)──
   const pending = permissions.pending[0];
@@ -258,18 +285,47 @@ export function Repl(): React.ReactElement {
   // 渲染/路由用的安全高亮:过滤收窄那一帧(effect 尚未跑)夹到合法区间,避免越界取项。
   const safeOverlayIndex = Math.min(overlayIndex, Math.max(0, overlayLength - 1));
 
+  // ── 开启 bracketed paste(DEC 2004):终端把粘贴内容包在 ESC[200~ … ESC[201~,使「粘贴」
+  //   能与「逐字键入」精确区分,且 Cmd+V 图片时发一个**空粘贴**(normalize 转 paste-image-probe)。
+  //   Ink 6.x 不自管 2004,须由输入 owner 自己进/退时 set/reset。
+  useEffect(() => {
+    stdout?.write('\x1b[?2004h');
+    return () => {
+      stdout?.write('\x1b[?2004l');
+    };
+  }, [stdout]);
+
   // ── 跑一轮:把 AgentEvent reduce 进 session(有序日志)+ 更新状态栏 ──
   const runTurn = useCallback(
-    async (text: string, origin?: RemoteOrigin) => {
+    async (text: string, origin?: RemoteOrigin, images?: ImageAttachment[]) => {
       busyRef.current = true;
       status.set({ busy: true, model: agent.model }); // 墙钟耗时由 StatusLineProvider 据 busy 自走(SSOT)
       tokenTickRef.current = 0;
+      streamReset(); // 新一轮:清掉上一轮可能残留的在写文本
       // 远端来源:边流边收集本轮 assistant 文本,turn 收尾后发回对端(双向中转出站半场)。
       let replyAcc = '';
       try {
         await agent.driveTurn(text, (e: AgentEvent) => {
-          session.push({ kind: 'agent', event: e });
           if (origin) replyAcc = appendAssistantText(replyAcc, e);
+          // 流式文本走 ephemeral 通道:delta 喂 stream(不入 session 日志,免 reduce 每帧
+          //   O(n²) 空扫);`assistant` 事件到达先 finalize(清空 → 由下面 push 的 durable
+          //   条目接管,视觉零跳变);`done`(含 abort)保留残留为一条 assistant 条目。
+          if (e.type === 'stream') {
+            if (streamOn) {
+              const d = extractStreamTextDelta(e);
+              if (d) streamFeed(d);
+            }
+            // stream 事件不入 session;但 token 节流仍需推进(见下)——落到统一节流块。
+          } else {
+            if (e.type === 'assistant') streamFinalize(); // 收口:清空 → 下面 push 的条目接管
+            if (e.type === 'done') {
+              // 打断保留:abort 时无 assistant 事件收口 → 残留半截文本先作条目留屏(不进 LLM
+              //   历史),再 push done(其 notice「已中断」排在残留之后)。正常完成 partial='' 无副作用。
+              const partial = streamFinalize();
+              if (partial) session.push(noticeMsg(partial));
+            }
+            session.push({ kind: 'agent', event: e });
+          }
           if (e.type === 'turn_end' && e.usageContextRatio != null) {
             status.set({ ctxPct: Math.round(e.usageContextRatio * 100) });
           }
@@ -281,7 +337,7 @@ export function Repl(): React.ReactElement {
             tokenTickRef.current = now;
             status.set({ tokens: agent.getContextTokens() });
           }
-        });
+        }, images);
       } finally {
         busyRef.current = false;
         status.set({ busy: false, tokens: agent.getContextTokens() }); // elapsedMs 由 provider 在 busy 收尾时定格
@@ -289,7 +345,7 @@ export function Repl(): React.ReactElement {
         if (origin && replyAcc.trim()) void remote.controller.send(origin, replyAcc);
       }
     },
-    [agent, session, status, remote],
+    [agent, session, status, remote, streamFeed, streamFinalize, streamReset, streamOn],
   );
 
   // ── transcript 整体替换/截短的唯一闸门(SSOT)──
@@ -299,9 +355,10 @@ export function Repl(): React.ReactElement {
   //   换 key 重挂载,按新的(更短的)log 重新 emit。漏掉任一步 → 旧条目残留在屏上(回退/清屏「没生效」)。
   const replaceTranscript = useCallback((mutate: () => void) => {
     cleanRedraw();
+    streamReset(); // 清空在写文本,避免整体替换/截短后残留漂在新 transcript 上
     mutate();
     setRedrawNonce((n) => n + 1);
-  }, []);
+  }, [streamReset]);
 
   // ── 恢复会话:agent.resumeSession(id) 既 reseed 下一轮 LLM 历史,又重建 transcript 回灌(替换当前)──
   const doResume = useCallback(
@@ -330,7 +387,7 @@ export function Repl(): React.ReactElement {
   // ── slash 命令上下文 ──
   const ctx = useMemo<CommandCtx>(
     () => ({
-      send: (t: string) => session.push({ kind: 'user', text: t }),
+      send: (t: string, images?: ImageAttachment[]) => session.push({ kind: 'user', text: t, images }),
       // /clear:既清显示(transcript)又清 driver 的 LLM 历史(convo)——只清前者会让
       //   下一轮仍把全部旧历史发给 provider(/clear「没生效」)。
       clear: () =>
@@ -435,23 +492,96 @@ export function Repl(): React.ReactElement {
         return;
       }
 
+      // 收拢本轮图片附件:先 await 在飞的剪贴板/文件读取(防「粘图后立刻回车」竞态丢图),
+      //   再取快照并清空 pending(下一轮从零)。
+      if (pendingReadsRef.current.length) {
+        await Promise.allSettled(pendingReadsRef.current);
+        pendingReadsRef.current = [];
+      }
+      const images = pendingImagesRef.current.length ? pendingImagesRef.current : undefined;
+      pendingImagesRef.current = [];
+      // 折叠粘贴正文:显示/历史留占位(text),喂模型用展开原文(modelText)。
+      const pastes = pendingPastesRef.current.length ? pendingPastesRef.current : undefined;
+      pendingPastesRef.current = [];
+      const modelText = expandPastes(text, pastes);
+
       // 新用户消息到达 → 定格上一个挂起的回退点(此后不可 Redo),并对 cwd 拍快照作本轮锚点。
       //   ⚠️ busy 排队路径下,快照时刻早于该消息真正入轮,锚点轻微偏早(可接受,见 plan 非目标)。
       agent.finalizeRewind();
       setPendingView(null);
       const msgId = agent.checkpointTurn() ?? undefined;
       history.add(text);
-      session.push({ kind: 'user', text, msgId });
+      session.push({ kind: 'user', text, msgId, images, pastes });
 
-      // turn 进行中 → 排队(turn 结束后顺序发)。本地输入 origin 省略。
+      // turn 进行中 → 排队(turn 结束后顺序发)。本地输入 origin 省略。喂模型用展开文本。
       if (busyRef.current) {
-        setQueued((q) => [...q, { prompt: text }]);
+        setQueued((q) => [...q, { prompt: modelText, images }]);
         return;
       }
-      await runTurn(text);
+      await runTurn(modelText, undefined, images);
     },
     [history, session, ctx, runTurn, agent],
   );
+
+  // ── 图片附件:把读到的图片入 pending + 在输入框插入占位符 `[Image #n]`。 ──
+  const ingestImage = useCallback((img: ImageAttachment) => {
+    // 5MB 硬闸:读取层已尽力缩放(macOS sips),仍超限则明确告知并跳过——绝不发注定被拒的请求。
+    if (!isWithinImageLimit(img)) {
+      const mb = (imageB64Bytes(img) / (1024 * 1024)).toFixed(1);
+      session.push(noticeMsg(`⚠️ Image too large (${mb}MB, limit 5MB) and could not be shrunk — skipped.`));
+      return;
+    }
+    pendingImagesRef.current = [...pendingImagesRef.current, img];
+    const n = pendingImagesRef.current.length;
+    const placeholder = `[Image #${n}]`;
+    setPrompt((p) => {
+      const arr = Array.from(p.value);
+      const needSpace = p.value.length > 0 && !/\s$/.test(p.value);
+      const insert = (needSpace ? ' ' : '') + placeholder + ' ';
+      const value = p.value + insert;
+      return { value, cursor: arr.length + Array.from(insert).length };
+    });
+  }, [session]);
+
+  // ── 空 bracketed paste(Cmd+V 图片)→ 异步读系统剪贴板;读到则入 pending + 占位。 ──
+  const handleImageProbe = useCallback(() => {
+    const p = readClipboardImage()
+      .then((img) => {
+        if (img) ingestImage(img);
+      })
+      .catch(() => {
+        /* best-effort:读失败静默(无图/无权限);不打断输入 */
+      });
+    pendingReadsRef.current = [...pendingReadsRef.current, p];
+  }, [ingestImage]);
+
+  // ── 拖入图片文件:粘贴文本整块是「若干存在的图片文件路径」→ 读为附件,消费该 paste。
+  //   返回 true=已作为图片处理(调用方吞掉该键);false=普通文本粘贴,照常编辑。 ──
+  const tryIngestImagePaths = useCallback(
+    (pastedText: string): boolean => {
+      const tokens = pastedText.trim().split(/\s+/).filter(Boolean);
+      if (tokens.length === 0 || !tokens.every(looksLikeImagePath)) return false;
+      const p = Promise.resolve().then(() => {
+        for (const t of tokens) {
+          const img = readImageFile(t);
+          if (img) ingestImage(img);
+        }
+      });
+      pendingReadsRef.current = [...pendingReadsRef.current, p];
+      return true;
+    },
+    [ingestImage],
+  );
+
+  // ── 大段/多行文本粘贴:另存正文 + 在光标处插折叠占位 `[Pasted text #N +L lines]`。
+  //   提交时由 expandPastes 展开回原文喂模型;transcript/输入框只见折叠占位。 ──
+  const ingestPastedText = useCallback((text: string) => {
+    pendingPastesRef.current = [...pendingPastesRef.current, text];
+    const n = pendingPastesRef.current.length;
+    const placeholder = pastePlaceholder(n, text);
+    // 在光标处插占位(复用 promptReducer 的 paste 插入语义,占位本身单行,不再触发折叠)。
+    setPrompt((p) => promptReducer(p, { kind: 'paste', text: placeholder }));
+  }, []);
 
   // ── 远端入站中转:微信消息 → 本地 transcript 标注 + 入轮/排队(带回复定址 origin)。
   //   sink 由 controller 持有(单一);用 ref 让它始终调到最新逻辑,避免 stale 闭包。
@@ -485,7 +615,7 @@ export function Repl(): React.ReactElement {
     if (queued.length === 0) return;
     const [next, ...rest] = queued;
     setQueued(rest);
-    void runTurn(next!.prompt, next!.origin);
+    void runTurn(next!.prompt, next!.origin, next!.images);
   }, [status.busy, queued, runTurn]);
 
   // turn 结束后复位 interrupt 标记,允许下一轮再 abort。
@@ -700,6 +830,17 @@ export function Repl(): React.ReactElement {
         return;
       }
 
+      // 拖入图片文件:prompt 模式下,若整块粘贴是「存在的图片文件路径」→ 作附件读入,吞掉该键
+      //   (不进 promptReducer,避免把长路径塞进输入框)。非图片路径 → 落回正常粘贴编辑。
+      if (key.kind === 'paste' && mode === 'prompt' && key.text && tryIngestImagePaths(key.text)) {
+        return;
+      }
+      // 大段/多行文本粘贴:折叠成占位 `[Pasted text #N +L lines]`,不把整段塞进输入框。
+      if (key.kind === 'paste' && mode === 'prompt' && key.text && shouldCollapsePaste(key.text)) {
+        ingestPastedText(key.text);
+        return;
+      }
+
       // question 自填行(末行)聚焦时,把「该题自填缓冲」喂给 router 当编辑目标(而非聊天草稿),
       //   故 edit 落到 questions.editOther、绝不污染 promptRef。其余模式仍编辑聊天草稿。
       const qOtherActive =
@@ -786,25 +927,30 @@ export function Repl(): React.ReactElement {
         case 'interrupt':
           interrupt();
           return;
+        case 'paste-image-probe':
+          // 空 bracketed paste(Cmd+V 图片)→ 异步读系统剪贴板(读到则入 pending + 占位)。
+          handleImageProbe();
+          return;
         case 'scroll':
         case 'none':
         default:
           return;
       }
     },
-    [mode, safeOverlayIndex, overlayLength, submit, history, interrupt, selectOverlay, completeOverlay, closeOverlay, questions, q],
+    [mode, safeOverlayIndex, overlayLength, submit, history, interrupt, selectOverlay, completeOverlay, closeOverlay, questions, q, tryIngestImagePaths, ingestPastedText, handleImageProbe],
   );
 
   // ── 唯一 useInput(梁③:整 TUI 单一输入 owner)────────────────────────────────
   useInput((input, raw) => {
-    // 删词:ctrl+w / (ctrl|meta)+backspace —— Ink raw key 直判,先于 normalize(仅 prompt 模式)。
-    if (mode === 'prompt') {
+    // 删词:ctrl+w / (ctrl|meta)+backspace —— Ink raw key 直判,先于拼装(仅 prompt 模式且非粘贴态)。
+    if (mode === 'prompt' && !pasteAsmRef.current.active) {
       if ((raw.ctrl && input === 'w') || ((raw.backspace || raw.delete) && (raw.ctrl || raw.meta))) {
         setPrompt(deleteWordBefore(promptRef.current));
         return;
       }
     }
-    for (const key of normalizeKey(input, raw)) dispatchKey(key);
+    // bracketed paste 有状态拼装(跨事件);非粘贴输入透传 normalizeKey。
+    for (const key of pasteAsmRef.current.feed(input, raw)) dispatchKey(key);
   });
 
   // ── 渲染 ───────────────────────────────────────────────────────────────────
@@ -817,6 +963,7 @@ export function Repl(): React.ReactElement {
         toolMeta={agent.toolMeta}
         expanded={expanded}
         redrawNonce={redrawNonce}
+        streamingText={streamingText}
       />
 
       {/* 审批卡(受控浮层;查表前已由本屏经 toolMeta 解析 canonical)。 */}

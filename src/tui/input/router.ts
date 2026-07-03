@@ -63,6 +63,8 @@ export type InputAction =
   // tab 补全:把输入框填成高亮命令(command-menu 专用;P6 据 index 取命令名回填 prompt)。
   | { kind: 'overlay-complete'; index: number }
   | { kind: 'overlay-close' }
+  // 空 bracketed paste(Cmd+V 图片信号):P6 去读系统剪贴板(异步),不进 promptReducer。
+  | { kind: 'paste-image-probe' }
   // 滚动视口(todo-001 插槽)。
   | { kind: 'scroll'; delta: number }
   // ctrl-c(P6:空则退出,非空则清空/打断)。
@@ -118,6 +120,9 @@ function routePrompt(ctx: RouterCtx, key: Key): InputAction {
       }
       return { kind: 'edit', next: promptReducer(prompt, key) };
     }
+    case 'paste-image-probe':
+      // 空粘贴 → 去读剪贴板图片(P6 异步处理);编辑框不动。
+      return { kind: 'paste-image-probe' };
     case 'paste':
     case 'backspace':
     case 'left':

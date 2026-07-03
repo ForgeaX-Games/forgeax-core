@@ -7,15 +7,36 @@
 import type { LLMProvider, ProviderStreamEvent, Usage } from '../provider/types';
 import { EMPTY_USAGE } from '../provider/types';
 
+/** 把文本切成 ~n 字符的小块(模拟 content_block_delta 分块下发)。 */
+function chunk(text: string, n: number): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < text.length; i += n) out.push(text.slice(i, i + n));
+  return out.length ? out : [''];
+}
+
 export function demoProvider(): LLMProvider {
   return {
     api: 'demo',
     async *stream(req): AsyncIterable<ProviderStreamEvent> {
       const last = req.messages.at(-1);
-      const text = typeof last?.content === 'string' ? last.content : JSON.stringify(last?.content);
+      const input = typeof last?.content === 'string' ? last.content : JSON.stringify(last?.content);
+      const text = `forgeax-core(demo) 收到: ${input}`;
+      // 逐块下发:让 TUI 走真流式路径(delta → assistant 收口)。
+      //   人眼观察节奏可选:FORGEAX_DEMO_STREAM_DELAY_MS 拉开每块间隔(默认 0 —— 不引入
+      //   人为延时,免拖慢时序敏感的 --demo e2e 测试)。视觉验证时设 40 即可看到"边写边出"。
+      const delayMs = Number(process.env.FORGEAX_DEMO_STREAM_DELAY_MS ?? '0') || 0;
+      yield { type: 'message_start', usage: EMPTY_USAGE as Usage };
+      yield { type: 'content_block_start', index: 0, blockType: 'text' };
+      for (const piece of chunk(text, 6)) {
+        yield { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: piece } };
+        if (delayMs > 0) await new Promise((r) => setTimeout(r, delayMs));
+      }
+      yield { type: 'content_block_stop', index: 0, block: { type: 'text', text } };
+      yield { type: 'message_delta', usage: EMPTY_USAGE as Usage, stopReason: 'end_turn' };
+      // 最终整块 assistant(收口契约不变:driver/reduce 据此落 durable 条目)。
       yield {
         type: 'assistant',
-        message: { role: 'assistant', content: [{ type: 'text', text: `forgeax-core(demo) 收到: ${text}` }] },
+        message: { role: 'assistant', content: [{ type: 'text', text }] },
         usage: EMPTY_USAGE as Usage,
         stopReason: 'end_turn',
       };

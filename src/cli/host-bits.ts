@@ -14,6 +14,7 @@ import type { HookDecision, HookCommandRunner } from '../capability/hooks/from-s
 import { parseHookOutput, eventToHookInput } from '../capability/hooks/protocol';
 import type { WebSearchBackend, WebSearchResult } from '../capability/builtin-tools/web-tools';
 import type { AskUserFn } from '../agent/dispatch';
+import { FORGEAX_USER_AGENT } from '../provider/user-agent';
 
 /** 默认 hook 命令超时(ms),60s;可经 `FORGEAX_HOOK_TIMEOUT_MS` 覆写(>0)。 */
 function hookTimeoutMs(): number {
@@ -75,7 +76,7 @@ export function makeHttpSearchBackend(url: string): WebSearchBackend {
   return async (query: string, signal?: AbortSignal): Promise<WebSearchResult[]> => {
     const res = await fetch(url, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', 'user-agent': FORGEAX_USER_AGENT },
       body: JSON.stringify({ query }),
       signal,
     });

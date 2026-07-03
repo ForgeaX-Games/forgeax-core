@@ -20,6 +20,7 @@
  */
 
 import { parseSSE } from './anthropic';
+import { FORGEAX_USER_AGENT } from './user-agent';
 import {
   EMPTY_USAGE,
   mergeUsage,
@@ -486,6 +487,7 @@ export const createOpenAIResponseProvider: ProviderFactory = (
   const url = `${base}/responses`;
   const headers: Record<string, string> = {
     'content-type': 'application/json',
+    'user-agent': FORGEAX_USER_AGENT,
     authorization: `Bearer ${opts.apiKey}`,
     accept: 'text/event-stream',
     ...(opts.headers ?? {}),

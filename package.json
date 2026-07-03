@@ -25,6 +25,7 @@
     "e2e:mcp": "bun test test/mcp",
     "e2e:plan": "bun test/plan-serve-e2e.ts",
     "e2e:subagent": "bun test/subagent-serve-e2e.ts",
+    "e2e:paste-image": "bun test/paste-image-e2e.ts",
     "e2e": "bun test/e2e-real.ts && bun test test/mcp && bun test/plan-serve-e2e.ts && bun test/subagent-serve-e2e.ts"
   },
   "dependencies": {

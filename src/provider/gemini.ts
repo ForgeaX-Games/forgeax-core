@@ -20,6 +20,7 @@
  */
 
 import { parseSSE } from './anthropic';
+import { FORGEAX_USER_AGENT } from './user-agent';
 import {
   EMPTY_USAGE,
   mergeUsage,
@@ -394,6 +395,7 @@ export const createGeminiProvider: ProviderFactory = (
   const base = normalizeGeminiBaseUrl(opts.baseUrl ?? DEFAULT_BASE_URL);
   const headers: Record<string, string> = {
     'content-type': 'application/json',
+    'user-agent': FORGEAX_USER_AGENT,
     'x-goog-api-key': opts.apiKey,
     ...(opts.headers ?? {}),
   };

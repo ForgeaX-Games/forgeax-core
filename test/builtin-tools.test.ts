@@ -520,12 +520,41 @@ describe('grep', () => {
     expect(data.matches?.[0].file).toBe('/p/only.txt');
   });
 
-  test('invalid regex throws', async () => {
+  test('invalid regex soft-fails (no throw) with degraded annotation', async () => {
     const fs = new MemFs({ '/p/a.txt': 'x' });
     const t = grepTool();
-    await expect(
-      t.call({ pattern: '(', path: '/p' }, ctxWith({ sandboxFs: fs })),
-    ).rejects.toThrow(/invalid pattern/);
+    const { data } = await t.call({ pattern: '(', path: '/p' }, ctxWith({ sandboxFs: fs }));
+    expect(data.files).toEqual([]);
+    expect(data.truncated).toBe(false);
+    expect(data.degraded?.reason).toMatch(/not a valid regular expression/);
+    expect(typeof data.degraded?.hint).toBe('string');
+    // 降级标注随 mapResult 回灌给模型。
+    const ev = t.mapResult(data, 'tu_bad');
+    expect((ev.payload as Record<string, unknown>).degraded).toBeDefined();
+    expect((ev.payload as Record<string, unknown>).count).toBe(0);
+  });
+
+  test('real-case over-escaped alternation soft-fails, no throw', async () => {
+    // 现网实证:模型过度转义 `\\[` (字面反斜杠 + 未闭合 `[`) → JS RegExp 抛
+    // "missing terminating ] for character class"。软失败:不 throw,返回空 + degraded。
+    const fs = new MemFs({ '/p/a.txt': 'isPasted here' });
+    const t = grepTool();
+    const pattern = 'isPasted|200~|bracketed|\\x1b\\\\[200|enableBracketedPaste|2004';
+    expect(() => new RegExp(pattern)).toThrow(); // 前置:该串确实非法
+    const { data } = await t.call(
+      { pattern, path: '/p', output_mode: 'content' },
+      ctxWith({ sandboxFs: fs }),
+    );
+    expect(data.matches).toEqual([]);
+    expect(data.degraded).toBeDefined();
+  });
+
+  test('degraded shape follows requested mode (count/content)', async () => {
+    const fs = new MemFs({ '/p/a.txt': 'x' });
+    const t = grepTool();
+    const c = await t.call({ pattern: '[', path: '/p', output_mode: 'count' }, ctxWith({ sandboxFs: fs }));
+    expect(c.data.counts).toEqual([]);
+    expect(c.data.degraded).toBeDefined();
   });
 
   test('mapResult shape per mode', async () => {

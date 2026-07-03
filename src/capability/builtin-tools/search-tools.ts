@@ -215,6 +215,11 @@ export interface GrepOutput {
   /** count 模式：file → 命中行数。 */
   counts?: Array<{ file: string; count: number }>;
   truncated: boolean;
+  /**
+   * 降级标注:pattern 非法正则时,工具**不 throw**(不当失败点),而是返回空结果并附此字段,
+   * 让模型看到「发生了降级 + 为什么 + 怎么自纠」。原则:工具本身不应成为失败点。
+   */
+  degraded?: { reason: string; hint: string };
 }
 
 export function grepTool(): AgentTool<GrepInput, GrepOutput> {
@@ -266,11 +271,21 @@ export function grepTool(): AgentTool<GrepInput, GrepOutput> {
       }
       const mode: GrepOutputMode = input.output_mode ?? 'files_with_matches';
       const flags = input['-i'] ? 'i' : '';
+      // 正则编译失败 → 软失败:不 throw,返回空结果 + degraded 标注(带自纠引导语)。
+      // 不做「字面子串兜底」——对 alternation(`a|b`)/字符类等最常见的非法输入,整串字面匹配
+      // 几乎必然零命中,反而更误导;显式空+引导语才真正避免把工具变成「不当失败点」。
       let re: RegExp;
       try {
         re = new RegExp(input.pattern, flags);
       } catch (err) {
-        throw new Error(`grep: invalid pattern — ${err instanceof Error ? err.message : String(err)}`);
+        const reason = `pattern is not a valid regular expression: ${err instanceof Error ? err.message : String(err)}`;
+        const hint =
+          '疑似正则过度转义(如 "\\\\[" 应为 "\\["),或特殊字符被 JSON 双重转义;修正 pattern 后重试。若只想按字面搜索,请转义正则元字符。';
+        const empty: GrepOutput = { mode, truncated: false, degraded: { reason, hint } };
+        if (mode === 'content') empty.matches = [];
+        else if (mode === 'count') empty.counts = [];
+        else empty.files = [];
+        return { data: empty };
       }
       const showLineNumbers = input['-n'] !== false;
 
@@ -350,6 +365,8 @@ export function grepTool(): AgentTool<GrepInput, GrepOutput> {
         payload.files = output.files ?? [];
         payload.count = output.files?.length ?? 0;
       }
+      // 降级标注随结果回灌给模型(toolResultContent 会整体 JSON 化 payload)。
+      if (output.degraded) payload.degraded = output.degraded;
       return { type: CoreEventType.ToolCallResult, payload, ts: Date.now() };
     },
     renderToolUseMessage: (input) => `Grepping ${input.pattern}`,

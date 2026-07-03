@@ -163,6 +163,17 @@ export class CannotRetryError extends Error {
   }
 }
 
+/** 流式响应体空闲超时:上游/代理连续 idleMs 无字节(含 ping)即判 stall。带独立 name 供重试层
+ *  识别——与 HTTP 层错误不同,mid-stream 命中它可**安全重发**:loop 在最终 `assistant` 事件前
+ *  不提交任何状态(messages/工具/transcript/usage 全以终态 assistant 为准),重发即等价 cc 的
+ *  「idle → 丢弃半截 partial + 重新发起请求」。 */
+export class StreamIdleError extends Error {
+  constructor(public readonly idleMs: number) {
+    super(`stream idle: no bytes for ${idleMs}ms — aborting (likely upstream/proxy stall)`);
+    this.name = 'StreamIdleError';
+  }
+}
+
 /** PROMPT_TOO_LONG：content 用固定串（UI 精确匹配），token 数进 errorDetails 供
  *  reactive compact 解析 gap。 */
 export const PROMPT_TOO_LONG_MESSAGE = 'Prompt is too long';

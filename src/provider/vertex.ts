@@ -21,6 +21,7 @@ import type {
   ProviderStreamEvent,
 } from './types';
 import { buildRequestBody, parseSSE, normalizeAnthropicStream } from './anthropic';
+import { FORGEAX_USER_AGENT } from './user-agent';
 
 const VERTEX_ANTHROPIC_VERSION = 'vertex-2023-10-16';
 
@@ -48,6 +49,7 @@ export const createVertexProvider: ProviderFactory = (opts: ProviderFactoryOpts)
   const baseUrl = opts.baseUrl;
   const headers: Record<string, string> = {
     'content-type': 'application/json',
+    'user-agent': FORGEAX_USER_AGENT,
     authorization: `Bearer ${opts.apiKey}`,
     ...(opts.headers ?? {}),
   };

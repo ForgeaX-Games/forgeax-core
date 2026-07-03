@@ -14,6 +14,7 @@ import {
 } from '../permission/engine';
 import type { PermissionRuleSet } from '../permission/rules';
 import { validateAgainstSchema } from '../capability/validate';
+import { coerceBySchema } from '../capability/coerce';
 
 /** 交互式权限回路:当把闸判定 'ask' 时,host 决定放行与否(REPL 提示 / 策略)。
  *  无此回调 → 'ask' 一律 fail-closed(deny)。 */
@@ -131,12 +132,15 @@ async function runOne(use: ToolUse, deps: DispatchDeps): Promise<ToolDispatchRes
   }
 
   const ctx: ToolContext = { ...deps.toolContext, signal: deps.signal, toolUseId: use.id };
-  const parsed = parseInput(tool, use.input);
+  let parsed = parseInput(tool, use.input);
 
   // JSON-schema 校验(移植 agentic_os 03.E.2):仅「有 inputJSONSchema 而无 zod parser」的
   //   passthrough 工具(MCP/外部声明式)在把闸前走一遍 schema walker;空/无约束 schema →
   //   permissive ok → 零回归(zod-validated / schema-less 工具行为逐字不变)。失配 → validation 错。
   if (!tool.inputSchema?.parse && tool.inputJSONSchema) {
+    // 校验前「隐形容错」:按声明类型把合法字面量字符串转真实类型("30"→30、"true"→true),
+    //   克制转换(见 coerce.ts),coerced 值同时喂给校验与工具 call。对外 schema 不变。
+    parsed = coerceBySchema(parsed, tool.inputJSONSchema);
     const v = validateAgainstSchema(parsed, tool.inputJSONSchema);
     if (!v.ok) {
       return {

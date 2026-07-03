@@ -358,6 +358,74 @@ describe('dispatch — abort short-circuits remaining batches', () => {
   });
 });
 
+// ─── JSON-schema coercion + validation (P1) ──────────────────────────────────
+
+describe('dispatch — schema-driven coercion before validation', () => {
+  function schemaTool(seen: { v?: unknown }) {
+    return buildTool({
+      name: 'params',
+      // 声明式工具(有 inputJSONSchema,无 zod parser)→ 走 coerce + walker。
+      inputJSONSchema: {
+        type: 'object',
+        properties: {
+          head_limit: { type: 'number' },
+          '-i': { type: 'boolean' },
+          pattern: { type: 'string' },
+        },
+        required: ['pattern'],
+        additionalProperties: false,
+      },
+      call: async (i: unknown) => {
+        seen.v = i;
+        return { data: i };
+      },
+      mapResult: okResult,
+      maxResultSizeChars: 100,
+    });
+  }
+
+  test('quoted number/boolean coerced → validation passes, call sees real types', async () => {
+    const seen: { v?: unknown } = {};
+    const results = await dispatchTools(
+      [{ id: 'p', name: 'params', input: { pattern: 'x', head_limit: '30', '-i': 'true' } }],
+      deps([schemaTool(seen)], { trusted: true }),
+    );
+    expect(results[0].isError).toBe(false);
+    expect(seen.v).toEqual({ pattern: 'x', head_limit: 30, '-i': true });
+  });
+
+  test('illegal literal still rejected by walker (not silently swallowed)', async () => {
+    const seen: { v?: unknown } = {};
+    const results = await dispatchTools(
+      [{ id: 'p', name: 'params', input: { pattern: 'x', head_limit: 'abc' } }],
+      deps([schemaTool(seen)], { trusted: true }),
+    );
+    expect(results[0].isError).toBe(true);
+    expect(results[0].errorCategory).toBe('validation');
+    expect(seen.v).toBeUndefined(); // call never ran
+  });
+
+  test('empty-string number rejected (cc restraint: no z.coerce swallow)', async () => {
+    const seen: { v?: unknown } = {};
+    const results = await dispatchTools(
+      [{ id: 'p', name: 'params', input: { pattern: 'x', head_limit: '' } }],
+      deps([schemaTool(seen)], { trusted: true }),
+    );
+    expect(results[0].isError).toBe(true);
+    expect(seen.v).toBeUndefined();
+  });
+
+  test('legit typed inputs pass through unchanged (no regression)', async () => {
+    const seen: { v?: unknown } = {};
+    const results = await dispatchTools(
+      [{ id: 'p', name: 'params', input: { pattern: 'x', head_limit: 5, '-i': false } }],
+      deps([schemaTool(seen)], { trusted: true }),
+    );
+    expect(results[0].isError).toBe(false);
+    expect(seen.v).toEqual({ pattern: 'x', head_limit: 5, '-i': false });
+  });
+});
+
 // ─── alias resolution ─────────────────────────────────────────────────────────
 
 describe('dispatch — alias resolution', () => {

@@ -22,7 +22,8 @@ import type {
   ProviderRequest,
   ProviderStreamEvent,
 } from './types';
-import { buildRequestBody, normalizeAnthropicStream } from './anthropic';
+import { buildRequestBody, normalizeAnthropicStream, readWithIdleTimeout, providerStreamIdleMs } from './anthropic';
+import { FORGEAX_USER_AGENT } from './user-agent';
 
 const BEDROCK_ANTHROPIC_VERSION = 'bedrock-2023-05-31';
 const SERVICE = 'bedrock';
@@ -147,6 +148,7 @@ export async function* decodeBedrockEventStream(
   body: ReadableStream<Uint8Array>,
 ): AsyncGenerator<{ event?: string; data: string }> {
   const reader = body.getReader();
+  const idleMs = providerStreamIdleMs(); // 空闲看门狗:Bedrock 二进制流与 SSE 系共用同一阈值/实现
   let buf = new Uint8Array(0);
   const td = new TextDecoder();
   const append = (a: Uint8Array, b: Uint8Array) => {
@@ -157,7 +159,7 @@ export async function* decodeBedrockEventStream(
   };
   try {
     while (true) {
-      const { done, value } = await reader.read();
+      const { done, value } = idleMs > 0 ? await readWithIdleTimeout(reader, idleMs) : await reader.read();
       if (value) buf = append(buf, value);
       while (buf.byteLength >= 12) {
         const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
@@ -225,6 +227,7 @@ export const createBedrockProvider: ProviderFactory = (opts: ProviderFactoryOpts
         url,
         headers: {
           'content-type': 'application/json',
+          'user-agent': FORGEAX_USER_AGENT,
           accept: 'application/vnd.amazon.eventstream',
           ...(opts.headers ?? {}),
         },

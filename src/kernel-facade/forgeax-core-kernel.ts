@@ -379,6 +379,9 @@ export class ForgeaxCoreKernel implements AgentKernel {
     let turnStatus: 'ok' | 'error' = 'ok';
     // 诊断维度(hoist 到外层 finally 可见):token 用量累计 + 本轮结束原因。
     const usage = { inputTokens: 0, outputTokens: 0, cacheRead: 0, cacheCreation: 0 };
+    // 本次 provider 调用已经以 message.delta 流出的 assistant 文本(translate 的去重账,
+    // 见 translate 内 'assistant' 分支;每次 provider_call 开始清零)。
+    const streamed = { text: '' };
     let lastReason: ReturnType<typeof mapReason> | undefined;
     try {
     // system: charter+persona 作稳定缓存前缀(static slots);dynamicSuffix 进 user 末尾,
@@ -481,7 +484,7 @@ export class ForgeaxCoreKernel implements AgentKernel {
         history: mapHistory(req.history),
         signal,
       })) {
-        const k = this.translate(ev, usage);
+        const k = this.translate(ev, usage, streamed);
         if (k) yield k;
         // ★ L5:逐轮 drain 子 agent 事件队列。子事件在父 Task 工具 await 期间同步推入
         //   (即两次 agent.run yield 之间),逐轮 drain 保 start→turn→tool→done 顺序排在
@@ -622,12 +625,34 @@ export class ForgeaxCoreKernel implements AgentKernel {
     return { ok: result.terminalReason === 'completed', toolCalls: result.toolCalls, writtenPaths: result.writtenPaths };
   }
 
-  /** AgentEvent → KernelEvent(累计 usage 副作用)。返回 null = 不映射(内部阶段事件)。 */
-  private translate(ev: AgentEvent, usage: { inputTokens: number; outputTokens: number; cacheRead: number; cacheCreation: number }): KernelEvent | null {
+  /** AgentEvent → KernelEvent(累计 usage / streamed 副作用)。返回 null = 不映射(内部阶段事件)。
+   *  流式文本:text_delta 逐条映射成 message.delta(浏览器 UI 打字机的数据源),`streamed`
+   *  记录本次 provider 调用已流出的文本;聚合 'assistant' 到达时只补「未流出的余量」——
+   *  provider 不吐 text_delta(如测试 stub / 非流式后端)则余量 = 全文,优雅降级为旧行为。 */
+  private translate(
+    ev: AgentEvent,
+    usage: { inputTokens: number; outputTokens: number; cacheRead: number; cacheCreation: number },
+    streamed: { text: string },
+  ): KernelEvent | null {
     switch (ev.type) {
+      case 'stage':
+        // PTL / 窗口溢出重试同一 turn 时会重发 provider_call → 清零,保证 streamed
+        // 精确等于「当前这一次模型调用」已流出的增量(重试前的残量不污染去重账)。
+        if (ev.stage === 'provider_call') streamed.text = '';
+        return null;
       case 'assistant': {
         const text = assistantText(ev.message);
-        return text ? { kind: 'message.delta', role: 'assistant', text } : null;
+        const already = streamed.text;
+        streamed.text = '';
+        if (!text) return null;
+        if (already) {
+          if (text === already) return null;
+          // 增量与聚合按同一 delta 流构造,聚合只可能多不可能改 → 前缀关系;补发余量。
+          if (text.startsWith(already)) return { kind: 'message.delta', role: 'assistant', text: text.slice(already.length) };
+          // 结构上不应发生的不一致:已流出的为准,不重发全文(避免 UI 双份文本)。
+          return null;
+        }
+        return { kind: 'message.delta', role: 'assistant', text };
       }
       case 'tool_call':
         return { kind: 'tool.call', callId: ev.toolUseId, name: ev.toolName, args: ev.input };
@@ -646,11 +671,16 @@ export class ForgeaxCoreKernel implements AgentKernel {
           usage.cacheRead = se.usage.cacheReadInputTokens ?? usage.cacheRead;
           usage.cacheCreation = se.usage.cacheCreationInputTokens ?? usage.cacheCreation;
         }
-        // 扩展思考增量 → thinking.delta(契约事件)。
         if (se.type === 'content_block_delta') {
-          const d = se.delta as { type?: string; thinking?: string } | undefined;
+          const d = se.delta as { type?: string; thinking?: string; text?: string } | undefined;
+          // 扩展思考增量 → thinking.delta(契约事件)。
           if (d && (d.type === 'thinking_delta' || typeof d.thinking === 'string') && d.thinking) {
             return { kind: 'thinking.delta', text: d.thinking };
+          }
+          // 正文增量 → message.delta(逐 token 流出;'assistant' 分支据 streamed 去重)。
+          if (d && d.type === 'text_delta' && typeof d.text === 'string' && d.text) {
+            streamed.text += d.text;
+            return { kind: 'message.delta', role: 'assistant', text: d.text };
           }
         }
         return null;

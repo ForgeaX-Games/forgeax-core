@@ -47,10 +47,26 @@ export interface TranscriptProps {
   /** /resume 整体替换 transcript 时由上层自增:并入 <Static key> 强制重挂载 → 重新 emit
    *  恢复会话的全量历史(否则 Ink <Static> 只追加新条目,旧 transcript 不会被替换)。 */
   redrawNonce?: number;
+  /** 本轮正在流式写入、尚未被 `assistant` 事件收口的文本(节流后)。空串=无在写文本。
+   *  渲染在 live 尾部,与最终 assistant 条目走同一渲染路径(视觉零跳变)。 */
+  streamingText?: string;
+}
+
+/** 把在写文本包成一条合成 assistant 条目,复用 renderItem → AssistantView → Markdown。
+ *  id 用 -1 哨兵(绝不与真实 log 下标 ≥0 冲突)。 */
+function streamingItem(text: string): TranscriptItem {
+  return {
+    kind: 'assistant',
+    id: -1,
+    event: {
+      type: 'assistant',
+      message: { type: 'message', ts: 0, payload: { content: [{ type: 'text', text }] } },
+    },
+  } as TranscriptItem;
 }
 
 export function Transcript(props: TranscriptProps): React.ReactElement {
-  const { log, busy, toolMeta, expanded, redrawNonce = 0 } = props;
+  const { log, busy, toolMeta, expanded, redrawNonce = 0, streamingText = '' } = props;
   const theme = useTheme();
 
   // resize 干净重绘:staticKey 随终端 resize 自增,用作 <Static key> 触发重挂载 +
@@ -106,6 +122,14 @@ export function Transcript(props: TranscriptProps): React.ReactElement {
           {renderItem(item, theme, toolMeta, expanded)}
         </Box>
       ))}
+
+      {/* 在写文本(流式,节流后):live 尾部渲染合成 assistant 条目;`assistant` 事件到达即
+          清空(streamingText 归 '') → 由上面 live 里的 durable 条目接管,视觉零跳变。 */}
+      {streamingText ? (
+        <Box key="streaming" flexDirection="column" marginTop={1}>
+          {renderItem(streamingItem(streamingText), theme, toolMeta, expanded)}
+        </Box>
+      ) : null}
     </Box>
   );
 }
