@@ -3,7 +3,7 @@
  * 只测纯逻辑(节流判定 + delta 抽取);hook 的 timer 编排由真实 TUI e2e 覆盖。
  */
 import { test, expect, describe } from 'bun:test';
-import { extractStreamTextDelta, shouldCommitStream, DEFAULT_STREAM_THROTTLE_MS } from '../../src/tui/transcript/useStreamingText';
+import { extractStreamTextDelta, extractStreamThinkingDelta, shouldCommitStream, DEFAULT_STREAM_THROTTLE_MS } from '../../src/tui/transcript/useStreamingText';
 import type { AgentEvent } from '../../src/tui/contracts';
 
 const streamEv = (delta: unknown): AgentEvent =>
@@ -25,6 +25,26 @@ describe('extractStreamTextDelta', () => {
   test('malformed delta → "" (no throw)', () => {
     expect(extractStreamTextDelta(streamEv(null))).toBe('');
     expect(extractStreamTextDelta(streamEv({ type: 'text_delta' }))).toBe(''); // no .text
+  });
+});
+
+describe('extractStreamThinkingDelta (F2:与 text 对称)', () => {
+  test('thinking_delta → returns thinking', () => {
+    expect(extractStreamThinkingDelta(streamEv({ type: 'thinking_delta', thinking: 'reasoning' }))).toBe('reasoning');
+  });
+  test('text_delta / partial_json / signature_delta → ""', () => {
+    expect(extractStreamThinkingDelta(streamEv({ type: 'text_delta', text: 'hi' }))).toBe('');
+    expect(extractStreamThinkingDelta(streamEv({ type: 'input_json_delta', partial_json: '{' }))).toBe('');
+    expect(extractStreamThinkingDelta(streamEv({ type: 'signature_delta', signature: 'sig' }))).toBe('');
+  });
+  test('non-stream / non-content_block_delta events → ""', () => {
+    expect(extractStreamThinkingDelta({ type: 'assistant', message: {} } as unknown as AgentEvent)).toBe('');
+    expect(extractStreamThinkingDelta({ type: 'stream', event: { type: 'message_start' } } as unknown as AgentEvent)).toBe('');
+    expect(extractStreamThinkingDelta({ type: 'turn_end' } as unknown as AgentEvent)).toBe('');
+  });
+  test('malformed delta → "" (no throw)', () => {
+    expect(extractStreamThinkingDelta(streamEv(null))).toBe('');
+    expect(extractStreamThinkingDelta(streamEv({ type: 'thinking_delta' }))).toBe(''); // no .thinking
   });
 });
 

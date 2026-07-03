@@ -6,3 +6,4 @@
 export * from './rules';
 export * from './engine';
 export * from './inspect';
+export * from './persist';

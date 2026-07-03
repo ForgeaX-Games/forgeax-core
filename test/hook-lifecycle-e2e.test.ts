@@ -238,4 +238,53 @@ describe('hook lifecycle e2e', () => {
     expect(order.indexOf('pre(auto)')).toBeLessThan(order.indexOf('applied'));
     expect(order.indexOf('applied')).toBeLessThan(order.indexOf('post'));
   });
+
+  // (f) preventStop 续轮后,下一次 Stop 事件带 stop_hook_active 重入标记 ────────────
+  test('preventStop 续轮后:下一次 Stop 事件带 stop_hook_active(continuations>0)', async () => {
+    const bus = new EventBus();
+    const activeFlags: Array<boolean | undefined> = [];
+    let fired = 0;
+    bus.subscribe(CoreEventType.Stop, (e, ctl) => {
+      fired++;
+      activeFlags.push((e.payload as { stopHookActive?: boolean }).stopHookActive);
+      if (fired === 1) return ctl.modify({ preventStop: true, reason: 'again' } as never);
+      return undefined;
+    });
+    const { provider } = mkProvider([
+      () => [asst(txt('a'), 'end_turn')],
+      () => [asst(txt('b'), 'end_turn')],
+    ]);
+    const agent = new CoreAgent({ context: ctx([], provider), bus });
+    const evs = await run(agent);
+    expect(lastDone(evs)).toBe('completed');
+    expect(fired).toBeGreaterThanOrEqual(2);
+    expect(activeFlags[0]).toBeFalsy(); // 首次 Stop:continuations=0 → 非重入
+    expect(activeFlags[1]).toBe(true); // 续轮后的 Stop:continuations>0 → 重入标记
+  });
+
+  // (g) additionalContext 多源累加:UserPromptSubmit + PostToolUse + Stop 全进上下文 ──
+  test('additionalContext 多源(UPS + PostToolUse + Stop)累加进后续请求上下文', async () => {
+    const bus = new EventBus();
+    bus.subscribe(CoreEventType.UserPromptSubmit, (_e, ctl) => ctl.modify({ additionalContext: 'CTX-UPS-A' } as never));
+    bus.subscribe(CoreEventType.ToolCallResult, (_e, ctl) => ctl.modify({ additionalContext: 'CTX-POST-B' } as never));
+    let stopFired = 0;
+    bus.subscribe(CoreEventType.Stop, (_e, ctl) => {
+      stopFired++;
+      if (stopFired === 1) return ctl.modify({ preventStop: true, additionalContext: 'CTX-STOP-C' } as never);
+      return undefined;
+    });
+    const { provider, reqSystems } = mkProvider([
+      () => [asst(tu('t1', 'echo', { x: 'go' }), 'tool_use')], // turn0 → PostToolUse(B)
+      () => [asst(txt('done1'), 'end_turn')], // turn1 → Stop 首次(C)→ 续轮
+      () => [asst(txt('done2'), 'end_turn')], // turn2 → Stop 二次 → 完成
+    ]);
+    const agent = new CoreAgent({ context: ctx([echoTool()], provider), bus });
+    const evs = await run(agent);
+    expect(lastDone(evs)).toBe('completed');
+    // 最后一轮请求的 system 里三源 additionalContext 全在(hookContextReminders 只 push 不清)。
+    const lastSystem = JSON.stringify(reqSystems.at(-1));
+    expect(lastSystem).toContain('CTX-UPS-A');
+    expect(lastSystem).toContain('CTX-POST-B');
+    expect(lastSystem).toContain('CTX-STOP-C');
+  });
 });

@@ -66,6 +66,7 @@ function makeCtx(over: Partial<CommandCtx> = {}): {
     runDoctor: async () => ({ checks: [{ category: 'provider', id: 'provider', label: 'Provider 连通', status: 'ok' }], healthy: true }),
     triggerCompact: async () => ({ compacted: true, usedLLM: true }),
     runInit: async () => ({
+      ok: true as const,
       subagent: { text: '', terminalReason: 'completed', turns: 1, toolCalls: 0 } as never,
       targetPath: '/w/AGENTS.md',
       fileName: 'AGENTS.md',

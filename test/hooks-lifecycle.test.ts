@@ -177,4 +177,77 @@ describe('hooks lifecycle — fail-soft & matcher', () => {
     bus.publish(ev(CoreEventType.SessionStart));
     expect(hits2).toEqual(['fired']);
   });
+
+  test('非法正则 matcher → 退化为子串 includes 匹配(不抛)', () => {
+    const bus = new EventBus();
+    const hits: string[] = [];
+    // '[' 是非法正则 → new RegExp 抛 → catch 退化为 key.includes('[')。
+    loadHooksFromSettings(bus, { PreToolUse: [{ matcher: '[', command: 'c' }] }, (_c, e) => {
+      hits.push((e.payload as { toolName?: string }).toolName ?? '<none>');
+    });
+    bus.publish(ev(CoreEventType.ToolCallRequested, { toolName: 'a[b' })); // 含 '[' 子串 → 命中
+    bus.publish(ev(CoreEventType.ToolCallRequested, { toolName: 'plain' })); // 无 '[' → 不命中
+    expect(hits).toEqual(['a[b']);
+  });
+
+  test('同事件多 hook:首条 block → 后续 entry 不再跑', () => {
+    const bus = new EventBus();
+    const ran: string[] = [];
+    loadHooksFromSettings(
+      bus,
+      { PreToolUse: [{ command: 'first' }, { command: 'second' }] },
+      (cmd) => {
+        ran.push(cmd);
+        if (cmd === 'first') return { block: true, reason: 'stop here' };
+        return undefined;
+      },
+    );
+    const out = bus.publish(ev(CoreEventType.ToolCallRequested, { toolName: 'x' }));
+    expect(out.blocked).toBe(true);
+    expect(ran).toEqual(['first']); // second 不跑
+  });
+
+  test('unsubscribe(dispose)后 hook 不再触发', () => {
+    const bus = new EventBus();
+    let fires = 0;
+    const dispose = loadHooksFromSettings(bus, { Notification: [{ command: 'c' }] }, () => {
+      fires++;
+    });
+    bus.publish(ev(CoreEventType.Notification));
+    expect(fires).toBe(1);
+    dispose();
+    bus.publish(ev(CoreEventType.Notification));
+    expect(fires).toBe(1); // 解订阅后不再增
+  });
+
+  test('空数组 / 非数组 entries 跳过,不订阅、不抛', () => {
+    const bus = new EventBus();
+    let fired = false;
+    expect(() =>
+      loadHooksFromSettings(
+        bus,
+        { PreToolUse: [], Stop: null as never, Notification: [{ command: 'c' }] },
+        () => {
+          fired = true;
+        },
+      ),
+    ).not.toThrow();
+    bus.publish(ev(CoreEventType.ToolCallRequested, { toolName: 'x' })); // PreToolUse 空数组 → 无订阅
+    bus.publish(ev(CoreEventType.Stop)); // Stop 非数组 → 无订阅
+    expect(fired).toBe(false);
+    bus.publish(ev(CoreEventType.Notification)); // 有效 entry → 触发
+    expect(fired).toBe(true);
+  });
+
+  test('无 command 的 entry 被跳过', () => {
+    const bus = new EventBus();
+    const ran: string[] = [];
+    loadHooksFromSettings(
+      bus,
+      { Notification: [{ matcher: 'x' } as never, { command: 'real' }] },
+      (cmd) => void ran.push(cmd),
+    );
+    bus.publish(ev(CoreEventType.Notification));
+    expect(ran).toEqual(['real']); // 无 command 的那条不跑
+  });
 });

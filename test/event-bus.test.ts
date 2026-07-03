@@ -30,6 +30,25 @@ describe('EventBus', () => {
     expect(hits).toEqual(['all']);
   });
 
+  test('subscribe/unsubscribe during dispatch is safe (snapshot); no infinite loop, no skip', () => {
+    const bus = new EventBus();
+    const order: string[] = [];
+    // 首个订阅者在 dispatch 内部再 subscribe(新增者本轮不应跑)+ 移除自己(本轮仍跑)。
+    const off = bus.subscribe('*', () => {
+      order.push('first');
+      bus.subscribe('*', () => void order.push('added-during-dispatch'));
+      off(); // 移除自身
+    });
+    bus.subscribe('*', () => void order.push('second'));
+    bus.publish(ev('x'));
+    // 本轮用 [...subs] 快照:只有注册时已在册的 first + second 跑;新增者不跑。
+    expect(order).toEqual(['first', 'second']);
+    // 下一轮:first 已被移除,added-during-dispatch 现在在册。
+    order.length = 0;
+    bus.publish(ev('x'));
+    expect(order).toEqual(['second', 'added-during-dispatch']);
+  });
+
   test('modify chains: later subscribers see the patched event', () => {
     const bus = new EventBus();
     let seen: unknown;

@@ -116,7 +116,7 @@ export function resolveHostProvider(args: { model: string; demo?: boolean }, pro
 }
 
 /** 读 hooks 配置文件:支持顶层即 settings,或 `{hooks:{...}}` 包裹。 */
-function readHooksSettings(path: string): Record<string, Array<{ matcher?: string; command: string }>> {
+export function readHooksSettings(path: string): Record<string, Array<{ matcher?: string; command: string }>> {
   const j = JSON.parse(readFileSync(path, 'utf8')) as { hooks?: Record<string, unknown> } & Record<string, unknown>;
   return (j.hooks ?? j) as Record<string, Array<{ matcher?: string; command: string }>>;
 }

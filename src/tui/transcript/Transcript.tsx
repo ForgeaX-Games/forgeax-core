@@ -30,6 +30,7 @@ import type { ThemeTokens } from '../contracts';
 import { resolveToolByMeta } from '../views/tools/registry';
 import { resolveMessageByItem, type MessageViewProps } from '../views/messages/registry';
 import { ThinkingView, thinkingText } from '../views/messages/Thinking';
+import { LiveThinking } from '../components/LiveThinking';
 import { useResizeRedraw } from '../use-resize-redraw';
 
 /** driver.toolMeta 的最小形状(查工具卡只需 canonical;别名在此被吃掉)。 */
@@ -50,6 +51,10 @@ export interface TranscriptProps {
   /** 本轮正在流式写入、尚未被 `assistant` 事件收口的文本(节流后)。空串=无在写文本。
    *  渲染在 live 尾部,与最终 assistant 条目走同一渲染路径(视觉零跳变)。 */
   streamingText?: string;
+  /** 本轮正在流式写入的 thinking(节流后,F2)。空串=无在写 thinking。渲染在流式文本**之上**
+   *  (thinking 先于答案),dim 呈现;`assistant` 事件到达即清空 → 由 durable 条目的折叠
+   *  ThinkingView 接管(「先显示 → 折叠」)。 */
+  streamingThinking?: string;
 }
 
 /** 把在写文本包成一条合成 assistant 条目,复用 renderItem → AssistantView → Markdown。
@@ -66,7 +71,7 @@ function streamingItem(text: string): TranscriptItem {
 }
 
 export function Transcript(props: TranscriptProps): React.ReactElement {
-  const { log, busy, toolMeta, expanded, redrawNonce = 0, streamingText = '' } = props;
+  const { log, busy, toolMeta, expanded, redrawNonce = 0, streamingText = '', streamingThinking = '' } = props;
   const theme = useTheme();
 
   // resize 干净重绘:staticKey 随终端 resize 自增,用作 <Static key> 触发重挂载 +
@@ -122,6 +127,14 @@ export function Transcript(props: TranscriptProps): React.ReactElement {
           {renderItem(item, theme, toolMeta, expanded)}
         </Box>
       ))}
+
+      {/* 在写 thinking(流式,节流后,F2):渲染在流式文本**之上**(thinking 先于答案),dim;
+          `assistant` 事件到达即清空 → 由 durable 条目的折叠 ThinkingView 接管(先显示→折叠)。 */}
+      {streamingThinking ? (
+        <Box key="streaming-thinking" flexDirection="column" marginTop={1}>
+          <LiveThinking text={streamingThinking} />
+        </Box>
+      ) : null}
 
       {/* 在写文本(流式,节流后):live 尾部渲染合成 assistant 条目;`assistant` 事件到达即
           清空(streamingText 归 '') → 由上面 live 里的 durable 条目接管,视觉零跳变。 */}

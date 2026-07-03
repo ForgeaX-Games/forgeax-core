@@ -110,6 +110,37 @@ describe('makeSpawnSyncHookRunner — 全量 stdout 解析', () => {
     expect(run(`true`, preToolEvent())).toBeUndefined();
     expect(run(`echo "hello not json"`, preToolEvent())).toBeUndefined();
   });
+
+  test('command 不可执行 → fail-open(不抛,放行)', () => {
+    let d: ReturnType<typeof run> = undefined;
+    expect(() => {
+      d = run(`/nonexistent/definitely-not-a-binary`, preToolEvent());
+    }).not.toThrow();
+    expect(d).toBeUndefined();
+  });
+
+  test('FORGEAX_HOOK_EVENT env 注入完整 core event JSON(stdin 之外的兜底通道)', () => {
+    // hook 从 $FORGEAX_HOOK_EVENT 读回 core 事件的 .type,回吐进 additionalContext。
+    const d = run(
+      `node -e "const e=JSON.parse(process.env.FORGEAX_HOOK_EVENT);process.stdout.write(JSON.stringify({hookSpecificOutput:{additionalContext:e.type}}))"`,
+      preToolEvent(),
+    ) as { additionalContext?: string } | void;
+    expect(d && d.additionalContext).toBe(CoreEventType.ToolCallRequested);
+  });
+
+  test('FORGEAX_HOOK_TIMEOUT_MS 非正/NaN → 回退默认 60s(慢 hook 不被误杀)', () => {
+    const prev = process.env.FORGEAX_HOOK_TIMEOUT_MS;
+    process.env.FORGEAX_HOOK_TIMEOUT_MS = '0'; // 非正 → hookTimeoutMs 回退 60_000
+    try {
+      // 睡 0.3s 的 hook:若误用 0ms 阈值会被杀(→ undefined);回退 60s 则应正常返回决议。
+      const d = run(`sleep 0.3; echo '{"decision":"block","reason":"slow-ok"}'`, preToolEvent());
+      expect(d && d.block).toBe(true);
+      expect(d && d.reason).toBe('slow-ok');
+    } finally {
+      if (prev == null) delete process.env.FORGEAX_HOOK_TIMEOUT_MS;
+      else process.env.FORGEAX_HOOK_TIMEOUT_MS = prev;
+    }
+  });
 });
 
 // ════════════════════════════════ (B) dispatch preToolPermission ════════════════════════════════

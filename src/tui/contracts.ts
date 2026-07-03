@@ -60,6 +60,17 @@ export type {
   CheckpointEntry,
 };
 
+/**
+ * /init 结果(F1 batch F3):成功携 InitProjectResult;失败(离线 / 模型不可达 / 超时)
+ * 走降级分支——driver 保证 runInit **绝不卡死、绝不抛**,而是回一个可读的 `ok:false`,
+ * 由命令层渲染友好提示(graceful degradation §9)。
+ *   - `timeout`:超过内置时限仍未完成(疑似离线 / 代理挂起),已中断子流程。
+ *   - `error`:子流程抛错或终态非 completed(如 model_error);detail 带原因串。
+ */
+export type InitOutcome =
+  | ({ ok: true } & InitProjectResult)
+  | { ok: false; reason: 'timeout' | 'error'; detail?: string };
+
 /** 挂起态回退的 UI 视图(driver 由内存 boundary + manager.pending 派生)。 */
 export interface PendingRewindView {
   boundaryId: string;
@@ -242,7 +253,7 @@ export interface CommandCtx {
   runDoctor(): Promise<DoctorReport>;
   // —— 压缩(014)/ init(019)——
   triggerCompact(instructions?: string): Promise<{ compacted: boolean; usedLLM: boolean }>;
-  runInit(force?: boolean): Promise<InitProjectResult>;
+  runInit(force?: boolean): Promise<InitOutcome>;
 }
 export interface SlashCommand {
   name: string;
@@ -402,8 +413,8 @@ export interface AgentDriver {
   runDoctor(): Promise<DoctorReport>;
   /** 手动压缩当前会话历史:压缩成功则就地替换 driver 历史并 reseed。 */
   triggerCompact(instructions?: string): Promise<{ compacted: boolean; usedLLM: boolean }>;
-  /** 跑 init 子流程:产 AGENTS.md。 */
-  runInit(force?: boolean): Promise<InitProjectResult>;
+  /** 跑 init 子流程:产 AGENTS.md。失败/超时回 `ok:false`(绝不卡死/抛),由命令层降级提示。 */
+  runInit(force?: boolean): Promise<InitOutcome>;
   /** 回退点(双击 esc 面板选中):重置 agent 并以给定历史重新播种,下一轮从该点续接。
    *  history 由 Repl 从保留的会话条目重建(user/assistant 文本轮)。 */
   rewindHistory(history: ProviderMessage[]): void;

@@ -55,7 +55,7 @@ import { routeKey, type RouterCtx } from '../input/router';
 import { cleanRedraw } from '../use-resize-redraw';
 import { deleteWordBefore, promptReducer } from '../input/promptReducer';
 import { Transcript } from '../transcript/Transcript';
-import { useStreamingText, extractStreamTextDelta, streamingEnabled } from '../transcript/useStreamingText';
+import { useStreamingText, extractStreamTextDelta, extractStreamThinkingDelta, streamingEnabled } from '../transcript/useStreamingText';
 import { PromptInput } from '../input/PromptInput';
 import { CommandMenu, filterCommands } from '../overlays/CommandMenu';
 import { ModelPicker, modelList } from '../overlays/ModelPicker';
@@ -145,6 +145,9 @@ export function Repl(): React.ReactElement {
   //   `assistant` 事件收口、`done` 保留残留。开关 FORGEAX_NO_STREAM=1 → 回退整块渲染。
   //   解构:displayText(streamingText)随流变化;feed/finalize/reset 稳定引用(免 callback 抖动)。 ──
   const { displayText: streamingText, feed: streamFeed, finalize: streamFinalize, reset: streamReset } = useStreamingText();
+  // F2:thinking 走同一节流通道的第二个实例(与 streamingText 对称)。turn 内边流边显(dim,
+  //   渲染在流式文本之上),`assistant` 事件收口 → 由折叠 ThinkingView 接管(「先显示 → 折叠」)。
+  const { displayText: streamingThinking, feed: thinkFeed, finalize: thinkFinalize, reset: thinkReset } = useStreamingText();
   const streamOn = streamingEnabled();
 
   // ── 输入框状态(单一真相:value + cursor;编辑全经 promptReducer 纯函数)──
@@ -302,6 +305,7 @@ export function Repl(): React.ReactElement {
       status.set({ busy: true, model: agent.model }); // 墙钟耗时由 StatusLineProvider 据 busy 自走(SSOT)
       tokenTickRef.current = 0;
       streamReset(); // 新一轮:清掉上一轮可能残留的在写文本
+      thinkReset(); // F2:同上,清在写 thinking
       // 远端来源:边流边收集本轮 assistant 文本,turn 收尾后发回对端(双向中转出站半场)。
       let replyAcc = '';
       try {
@@ -314,15 +318,21 @@ export function Repl(): React.ReactElement {
             if (streamOn) {
               const d = extractStreamTextDelta(e);
               if (d) streamFeed(d);
+              const td = extractStreamThinkingDelta(e); // F2:thinking delta 喂第二个流式通道
+              if (td) thinkFeed(td);
             }
             // stream 事件不入 session;但 token 节流仍需推进(见下)——落到统一节流块。
           } else {
-            if (e.type === 'assistant') streamFinalize(); // 收口:清空 → 下面 push 的条目接管
+            if (e.type === 'assistant') {
+              streamFinalize(); // 收口:清空 → 下面 push 的条目接管
+              thinkFinalize(); // F2:thinking 收口 → 由 durable 条目的折叠 ThinkingView 接管
+            }
             if (e.type === 'done') {
               // 打断保留:abort 时无 assistant 事件收口 → 残留半截文本先作条目留屏(不进 LLM
               //   历史),再 push done(其 notice「已中断」排在残留之后)。正常完成 partial='' 无副作用。
               const partial = streamFinalize();
               if (partial) session.push(noticeMsg(partial));
+              thinkFinalize(); // F2:abort 时清在写 thinking(无 assistant 收口则丢弃残留,不留悬空)
             }
             session.push({ kind: 'agent', event: e });
           }
@@ -345,7 +355,7 @@ export function Repl(): React.ReactElement {
         if (origin && replyAcc.trim()) void remote.controller.send(origin, replyAcc);
       }
     },
-    [agent, session, status, remote, streamFeed, streamFinalize, streamReset, streamOn],
+    [agent, session, status, remote, streamFeed, streamFinalize, streamReset, thinkFeed, thinkFinalize, thinkReset, streamOn],
   );
 
   // ── transcript 整体替换/截短的唯一闸门(SSOT)──
@@ -356,9 +366,10 @@ export function Repl(): React.ReactElement {
   const replaceTranscript = useCallback((mutate: () => void) => {
     cleanRedraw();
     streamReset(); // 清空在写文本,避免整体替换/截短后残留漂在新 transcript 上
+    thinkReset(); // F2:同上,清在写 thinking
     mutate();
     setRedrawNonce((n) => n + 1);
-  }, [streamReset]);
+  }, [streamReset, thinkReset]);
 
   // ── 恢复会话:agent.resumeSession(id) 既 reseed 下一轮 LLM 历史,又重建 transcript 回灌(替换当前)──
   const doResume = useCallback(
@@ -964,6 +975,7 @@ export function Repl(): React.ReactElement {
         expanded={expanded}
         redrawNonce={redrawNonce}
         streamingText={streamingText}
+        streamingThinking={streamingThinking}
       />
 
       {/* 审批卡(受控浮层;查表前已由本屏经 toolMeta 解析 canonical)。 */}

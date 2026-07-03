@@ -21,7 +21,9 @@ import type { AgentContext, AgentEvent } from '../../agent/types';
 import type { AskUserFn } from '../../agent/dispatch';
 import { findTool } from '../../agent/dispatch';
 import type { PermissionRuleSet } from '../../permission/rules';
+import { loadAllowRules, saveAllowRules } from '../../permission/persist';
 import type { PermissionMode } from '../../permission/engine';
+import { CoreEventType } from '../../events/events';
 import type { LLMProvider, ProviderMessage } from '../../provider/types';
 import { makeProviderCompactSummarize } from '../../context/compaction-llm';
 import { microCompact } from '../../context/micro-compaction';
@@ -77,7 +79,8 @@ export interface DriverOptions extends HostContextArgs {
  */
 export function createAgentDriver(opts: DriverOptions, initial: HostContext): AgentDriver {
   // 进程级可变 rules(§0-B):同一引用传给每一个 CoreAgent,allowAlways 就地 push。
-  const rules: PermissionRuleSet = { deny: [], ask: [], allow: [] };
+  //   allow 桶启动时从项目文件 <cwd>/.forgeax/permissions.json 读回(跨会话记住「总是允许」)。
+  const rules: PermissionRuleSet = { deny: [], ask: [], allow: loadAllowRules(process.cwd()) };
   let mode: PermissionMode = 'default';
   let askUser: AskUserFn | undefined;
   // 008 结构化提问:host 注入的回调。区别于 askUser(布尔闸),AskUserQuestion 工具经
@@ -95,6 +98,10 @@ export function createAgentDriver(opts: DriverOptions, initial: HostContext): Ag
   let host = initial;
   installAskQuestion(host);
   let model = opts.model;
+  // 会话身份(sessionId):可变——/clear 视作「开一条新会话」时换新 id(F1)。getter / getStatus /
+  //   setModel 重建都读这份,故换新后全链一致。CheckpointManager 构造时快照旧 id(见下),不随
+  //   /clear 重键:旧 checkpoints 已随历史清空而失效,重建 manager 反而丢进程内索引,得不偿失。
+  let sessionId = opts.sessionId;
   let agent: CoreAgent | null = null;
   /** 回退点 reseed:下一轮 driveTurn 用这份历史播种一次,然后清空。 */
   let pendingHistory: ProviderMessage[] | null = null;
@@ -170,7 +177,7 @@ export function createAgentDriver(opts: DriverOptions, initial: HostContext): Ag
     },
 
     get sessionId() {
-      return opts.sessionId;
+      return sessionId;
     },
 
     async driveTurn(prompt: string, onEvent: (e: AgentEvent) => void, images?: ImageAttachment[]): Promise<void> {
@@ -282,7 +289,7 @@ export function createAgentDriver(opts: DriverOptions, initial: HostContext): Ag
       // 落盘持久化:写 .forgeax/settings.json 的 model 键,下次启动读回。
       //   best-effort、绝不抛——失败也不影响本次切换。
       updateUserSettings({ model: id });
-      void buildHostContext({ ...toHostArgs(opts, id) }, opts.providerOverride).then(async (next) => {
+      void buildHostContext({ ...toHostArgs(opts, id, sessionId) }, opts.providerOverride).then(async (next) => {
         host = next;
         installAskQuestion(host); // 新 toolContext 须重挂提问接缝(否则切模型后 AskUserQuestion 失联)
         agent = null; // 下一轮 driveTurn 用新 context 重建
@@ -306,9 +313,21 @@ export function createAgentDriver(opts: DriverOptions, initial: HostContext): Ag
     },
 
     allowAlways(toolName: string): void {
+      // 修①别名 bug:传入的可能是模型发来的别名(如 `Bash`/`Write`),但引擎 ⑦ 按
+      //   canonical 真名(`bash`/`write_file`)匹配规则,且 matchRule 不吃别名。故这里
+      //   先经 findTool 解析回真名再存,否则规则永远命不中 → 每次仍弹卡。
+      const tool = findTool(host.context.config.tools, toolName);
+      const canonical = tool?.name ?? toolName;
       // 就地 push(§0-B):同一 rules 引用,下一次派发引擎 ⑦ 判 allow。整工具规则
       //   (content===undefined)匹配该工具全部输入。
-      rules.allow.push({ toolName, behavior: 'allow', source: 'tui-allow-always' });
+      rules.allow.push({ toolName: canonical, behavior: 'allow', source: 'tui-allow-always' });
+      // 修②持久化:落项目文件 <cwd>/.forgeax/permissions.json,重启/新会话读回。
+      //   只落用户来源的授予(tui「总是允许」+ 上次读回的项目规则),强制 persist.ts
+      //   头注声明的「仅用户授予」契约——即便将来有内置/策略规则混进 rules.allow 也不外泄。
+      saveAllowRules(
+        process.cwd(),
+        rules.allow.filter((r) => r.source === 'tui-allow-always' || r.source === 'project-permissions'),
+      );
     },
 
     setMode(m: PermissionMode): void {
@@ -399,7 +418,7 @@ export function createAgentDriver(opts: DriverOptions, initial: HostContext): Ag
       return getStatus({
         model,
         cwd: String(host.context.toolContext.cwd ?? process.cwd()),
-        sessionId: opts.sessionId,
+        sessionId,
         permissionMode: mode,
         usage: usageAcc,
       });
@@ -432,13 +451,49 @@ export function createAgentDriver(opts: DriverOptions, initial: HostContext): Ag
     },
 
     async runInit(force?: boolean) {
-      return runInitProject({
-        provider: host.provider,
-        model,
-        tools: host.context.config.tools,
-        toolContext: host.context.toolContext,
-        force,
+      // F3:/init 走 LLM 子流程(runInitProject → runSubagent),离线 / 代理挂起 / 模型错误时
+      //   过去要么假成功(终态非 completed 也照报「已生成」)、要么卡死 UI。这里加两道兜底:
+      //   ① 超时闸(AbortController + Promise.race)——超时即中断子流程并回 timeout,UI 绝不卡死;
+      //   ② 终态/异常判定——子流程抛错或终态非 completed → 回 error(带原因),命令层降级提示。
+      // 多轮扫盘可能耗时一两分钟;仅用于兜底真「挂起」,不误伤正常跑。可经 FORGEAX_INIT_TIMEOUT_MS
+      //   覆盖(ops 逃生阀 + 测试注入短时限)。
+      const envTimeout = Number(process.env.FORGEAX_INIT_TIMEOUT_MS);
+      const INIT_TIMEOUT_MS = envTimeout > 0 ? envTimeout : 120_000;
+      const ac = new AbortController();
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const timeout = new Promise<'timeout'>((resolveTimeout) => {
+        timer = setTimeout(() => {
+          try {
+            ac.abort('init-timeout');
+          } catch {
+            /* ignore */
+          }
+          resolveTimeout('timeout');
+        }, INIT_TIMEOUT_MS);
+        (timer as { unref?: () => void }).unref?.(); // 不因该定时器拖住进程退出
       });
+      try {
+        const initP = runInitProject({
+          provider: host.provider,
+          model,
+          tools: host.context.config.tools,
+          toolContext: host.context.toolContext,
+          force,
+          signal: ac.signal,
+        });
+        initP.catch(() => {}); // race 输方(超时先返)不产生 unhandledRejection;赢方仍由下面 await 观测
+        const res = await Promise.race([initP, timeout]);
+        if (res === 'timeout') return { ok: false as const, reason: 'timeout' as const };
+        // 子流程跑完但终态非 completed(model_error / max_turns 等)= 未真正生成 → 降级。
+        if (res.subagent.terminalReason !== 'completed') {
+          return { ok: false as const, reason: 'error' as const, detail: res.subagent.terminalReason };
+        }
+        return { ok: true as const, ...res };
+      } catch (err) {
+        return { ok: false as const, reason: 'error' as const, detail: err instanceof Error ? err.message : String(err) };
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
     },
 
     rewindHistory(history: ProviderMessage[]): void {
@@ -454,9 +509,28 @@ export function createAgentDriver(opts: DriverOptions, initial: HostContext): Ag
       convo = [];
       pendingHistory = null;
       agent = null;
-      // 上下文占用归零(/context + 状态栏据此显示空窗口);usageAcc 是会话累计计费,跨 /clear 保留。
+      // 上下文占用归零(/context + 状态栏据此显示空窗口)。
       ctxPromptTokens = 0;
       liveOutChars = 0;
+      // ── F1:/clear 语义 = 「开一条新会话」(对齐 cc regenerateSessionId + executeSessionEndHooks('clear'))──
+      //   ① 先对**旧**会话发 SessionEnd(reason='clear'):经 host.bus 同步跑用户配置的 SessionEnd hook,
+      //      与 cc 一致(agent 每轮收尾也发 SessionEnd,这里补上「/clear 关旧会话」这一路)。fail-soft:
+      //      坏 hook 不该阻断 /clear。
+      const endingSession = sessionId ?? 'default';
+      try {
+        host.bus.publish({
+          type: CoreEventType.SessionEnd,
+          payload: { sessionId: endingSession, reason: 'clear' },
+          ts: 0,
+          source: 'tui-clear',
+        });
+      } catch {
+        /* ignore：hook 执行异常不冒泡,/clear 必须成功 */
+      }
+      //   ② 换新 sessionId(getter / getStatus / 后续 setModel 重建即反映新身份)。
+      sessionId = randomUUID();
+      //   ③ 清累计计费 usageAcc(视作新会话,成本归零;连带解 D6——/clear 不再保留旧成本)。
+      usageAcc = EMPTY_USAGE;
     },
 
     // ── 回退点 · 文件 + 对话双回退状态机 ──
@@ -573,8 +647,10 @@ export function createAgentDriver(opts: DriverOptions, initial: HostContext): Ag
   return driver;
 }
 
-/** DriverOptions(+ 覆盖 model)→ HostContextArgs。 */
-function toHostArgs(opts: DriverOptions, model: string): HostContextArgs {
+/** DriverOptions(+ 覆盖 model / 当前 sessionId)→ HostContextArgs。
+ *  sessionId 显式透传当前可变值(而非 opts.sessionId 快照),使 /clear 换新 id 后再 setModel
+ *  重建的 host(含 per-session WAL)也绑到新会话身份(F1)。 */
+function toHostArgs(opts: DriverOptions, model: string, sessionId: string | undefined): HostContextArgs {
   return {
     model,
     demo: opts.demo,
@@ -585,7 +661,7 @@ function toHostArgs(opts: DriverOptions, model: string): HostContextArgs {
     pluginDirs: opts.pluginDirs,
     hooksConfigPath: opts.hooksConfigPath,
     searchUrl: opts.searchUrl,
-    sessionId: opts.sessionId,
+    sessionId,
     sessionsDir: opts.sessionsDir,
   };
 }

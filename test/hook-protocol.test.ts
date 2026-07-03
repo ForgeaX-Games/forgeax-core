@@ -88,6 +88,22 @@ describe('eventToHookInput', () => {
     const off = eventToHookInput({ type: CoreEventType.Stop, payload: { turn: 2 }, ts: 10 });
     expect(off.stop_hook_active).toBeUndefined();
   });
+
+  test('选择性填充:payload 缺 toolName/input/result 时不抛、不填 undefined 键', () => {
+    // payload 为空对象:只应有 hook_event_name,工具类键全缺(不得填 undefined 值)。
+    const input = eventToHookInput({ type: CoreEventType.ToolCallRequested, payload: {}, ts: 11 });
+    expect(input.hook_event_name).toBe('PreToolUse');
+    expect('tool_name' in input).toBe(false);
+    expect('tool_input' in input).toBe(false);
+    expect('tool_response' in input).toBe(false);
+    expect('prompt' in input).toBe(false);
+    // payload 缺失(undefined)也不抛。
+    expect(() => eventToHookInput({ type: CoreEventType.Stop, payload: undefined as never, ts: 12 })).not.toThrow();
+    // 部分存在:给了 input 但没给 toolName → 只填 tool_input。
+    const partial = eventToHookInput({ type: CoreEventType.ToolCallRequested, payload: { input: { a: 1 } }, ts: 13 });
+    expect(partial.tool_input).toEqual({ a: 1 });
+    expect('tool_name' in partial).toBe(false);
+  });
 });
 
 describe('parseHookOutput', () => {

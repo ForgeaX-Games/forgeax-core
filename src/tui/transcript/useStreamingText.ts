@@ -54,6 +54,23 @@ export function extractStreamTextDelta(e: AgentEvent): string {
   return d.text;
 }
 
+/**
+ * 从一个 AgentEvent 抽「thinking delta」。只认 `stream` → `content_block_delta` →
+ * `thinking_delta`(delta.thinking);text / signature / partial_json / 其它一律 ''。
+ * 与 `extractStreamTextDelta` 对称(F2:thinking 也走同一 useStreamingText 节流通道,
+ * 「先流式显示 → 轮末由折叠 ThinkingView 接管」)。delta 形状见 provider/anthropic.ts。
+ */
+export function extractStreamThinkingDelta(e: AgentEvent): string {
+  if (!e || e.type !== 'stream') return '';
+  const sev = (e as { event?: unknown }).event as
+    | { type?: string; delta?: { type?: string; thinking?: string } }
+    | undefined;
+  if (!sev || sev.type !== 'content_block_delta') return '';
+  const d = sev.delta;
+  if (!d || d.type !== 'thinking_delta' || typeof d.thinking !== 'string') return '';
+  return d.thinking;
+}
+
 /** 段落数(按空行分段);用于「新段落出现 → 立即刷」判定。 */
 function paragraphCount(s: string): number {
   if (s === '') return 0;
