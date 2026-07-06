@@ -29,12 +29,9 @@ import type { AgentTool } from '../capability/types';
 import { buildTool } from '../capability/types';
 import type { LLMProvider, ProviderMessage, ProviderRequest, ProviderStreamEvent } from '../provider/types';
 import { makeProviderCompactSummarize } from '../context/compaction-llm';
+import { makeRehydrateInjection } from '../context/post-compact-rehydrate';
 import { microCompact } from '../context/micro-compaction';
 import { contextWindowForModel } from '../context/model-window';
-import { RecentReads } from '../capability/read-tracker';
-import { EventBus } from '../events/event-bus';
-import { CoreEventType } from '../events/events';
-import type { SandboxFs } from '../inject/types';
 import { makeTaskTool } from '../agent/subagent';
 import type { SubagentRegistry } from '../agent/subagent-registry';
 import { handoffTool } from '../capability/builtin-tools/message-tools';
@@ -91,7 +88,7 @@ export type HandoffProvider = HandoffSink | ((ctx: TurnHandoffCtx) => HandoffSin
 /** host-tool 执行缝(K11):facade 不自己执行工具,委托 host(对齐合订方案 §5 方案 A
  *  的 `POST /:sid/kernel-tool` 桥)。`agentId` = 本轮真实 agent(委派轮里即被委派方,
  *  如 mochi),供 host 桥按真实身份求 trustTier / 弹权限卡 / 选执行 context;缺省回落主 agent。 */
-export type ExecuteToolFn = (name: string, args: unknown, sid?: string, agentId?: string) => Promise<unknown>;
+export type ExecuteToolFn = (name: string, args: unknown, sid?: string, agentId?: string, callId?: string) => Promise<unknown>;
 
 export interface ForgeaxCoreKernelOptions {
   /** 注入 provider(per-session baseUrl+token 经 ConfigSource;支持 M4)。 */
@@ -222,11 +219,9 @@ function mapReason(r: TerminalReason): TurnDoneReason {
     case 'unrecoverable_tool_error':
     case 'prompt_too_long':
     case 'blocking_limit':
-    case 'image_error':
       return 'error';
-    // stop-hook / hook 收尾:模型本欲停,被 hook 拦下后达上限而终止——非错误,作正常停。
+    // stop-hook 收尾:模型本欲停,被 hook 拦下后达上限而终止——非错误,作正常停。
     case 'stop_hook_prevented':
-    case 'hook_stopped':
       return 'stop';
     default:
       return 'stop';
@@ -317,11 +312,6 @@ export class ForgeaxCoreKernel implements AgentKernel {
    *  权威模型源(与 currentMode 同语义:控制面 override 持久,直到再次 setModel)。 */
   private currentModel: string | undefined;
 
-  /** CORE-CTX-004:压后重挂用的读事件总线 + 最近读文件缓冲(kernel 级,跨轮保留)。
-   *  每轮 CoreAgent 以 `bus: this.readBus` 构造 → ToolCallRequested 汇到这里记录 file_path。 */
-  private readonly readBus = new EventBus();
-  private readonly recentReads = new RecentReads();
-
   /**
    * MCP server→client 反向请求 handler(M4 存储接缝;facade 不自调用)。host 在外部
    * 装配 MCP client 时取回传给 `InProcessMCPClient(server, transport, deps)`。
@@ -341,12 +331,6 @@ export class ForgeaxCoreKernel implements AgentKernel {
   constructor(opts: ForgeaxCoreKernelOptions) {
     this.o = opts;
     this.currentMode = opts.initialMode ?? 'default';
-    // CORE-CTX-004:订阅读事件,记录最近读的文件路径(供压后 rehydrate)。
-    this.readBus.subscribe(CoreEventType.ToolCallRequested, (e) => {
-      const p = (e as { payload?: { input?: { file_path?: unknown } } }).payload?.input?.file_path;
-      if (typeof p === 'string' && p) this.recentReads.record(p);
-      return undefined;
-    });
   }
 
   /** ToolSpec → AgentTool,call 委托 host-tool 桥(K11)。 */
@@ -370,7 +354,10 @@ export class ForgeaxCoreKernel implements AgentKernel {
         // 必须透传到 AgentTool,否则 wire tools[] 没 description,模型只能靠名字猜。
         ...(spec.description ? { description: spec.description } : {}),
         inputJSONSchema: spec.inputSchema ?? {},
-        call: async (input: unknown) => ({ data: await this.o.executeTool(spec.name, input, sid, agentId) }),
+        // ctx.toolUseId = 本轮工具调用 id(= tool.call/tool.result 的 callId)。透传给 host
+        // 桥,让宿主(studio remoteAgentRuntime)能把前端 HITL 卡片的 pending 表 key 钉在
+        // 同一 id 上——否则 host 侧只能随机造 id,前端回填对不上 → ask_user_question 卡死。
+        call: async (input: unknown, ctx) => ({ data: await this.o.executeTool(spec.name, input, sid, agentId, ctx?.toolUseId) }),
         mapResult: (data, id) => ({ type: 'tool.result', payload: { callId: id, ok: true, result: data }, ts: 0 }),
         maxResultSizeChars: Infinity,
       });
@@ -462,12 +449,8 @@ export class ForgeaxCoreKernel implements AgentKernel {
       toolContext,
     };
 
-    // CORE-CTX-004:压后重挂只在 toolContext 带 sandboxFs 时接(否则无处读文件,优雅跳过)。
-    const rehydrateFs = context.toolContext.sandboxFs as SandboxFs | undefined;
     const agent = new CoreAgent({
       context,
-      // CORE-CTX-004:用 kernel 级 readBus,让读事件汇入 recentReads(压后重挂)。
-      bus: this.readBus,
       globalCacheEnabled: true,
       // ★ WS-C:把权限模式 / 规则 / askUser 透传给每轮 CoreAgent,使 facade 驱动的轮也
       //   honor 注入规则、并让 setPermissionMode 改活 agent 真生效(dispatch 读 currentMode)。
@@ -476,17 +459,10 @@ export class ForgeaxCoreKernel implements AgentKernel {
       ...(this.o.askUser ? { askUser: this.o.askUser } : {}),
       // F6 生产路径也开压缩(auto + micro);长会话不至于撑爆上下文。
       // ★ ISSUE-1:主轮自压缩走 Compaction V2(替换 legacy makeProviderCompaction)。
-      //   CORE-CTX-004:注入 rehydrate,压后重挂最近读的文件。
+      //   D-01:压后重挂最近读文件(recentReadPaths 由 loop 自取内部 read-tracker)。
       compactionV2: {
         summarize: makeProviderCompactSummarize(this.o.provider, context.config.model),
-        ...(rehydrateFs
-          ? {
-              rehydrate: {
-                recentReadPaths: () => this.recentReads.list(),
-                readFile: async (p: string) => rehydrateFs.readText(p),
-              },
-            }
-          : {}),
+        rehydrate: makeRehydrateInjection(context.toolContext),
       },
       microCompact: (msgs) => microCompact(msgs, { now: Date.now() }),
       // CORE-CTX-005:大结果落盘钩子(HOST 层经 options 注入;缺省不落盘=旧行为)。
@@ -614,7 +590,8 @@ export class ForgeaxCoreKernel implements AgentKernel {
             resolveSystem: (t) => `You are a ${t ?? 'general'} subagent. Do the task and report the result concisely.`,
           }),
       toolContext,
-      compactionV2: { summarize: makeProviderCompactSummarize(this.o.provider, model) },
+      // subagent 自压缩(V2)+ 压后重挂(D-01)。
+      compactionV2: { summarize: makeProviderCompactSummarize(this.o.provider, model), rehydrate: makeRehydrateInjection(toolContext) },
       contextWindow: contextWindowForModel(model),
       maxTurns: req.budget.maxTurns ?? 20,
       onSubagentEvent: (ev) => {

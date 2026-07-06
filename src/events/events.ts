@@ -30,6 +30,9 @@ export const CoreEventType = {
   // compaction (ledger fold consumes these)
   CompactionApplied: 'compaction.applied',
   CompactionRevoked: 'compaction.revoked',
+  // rewind (ledger fold consumes these; 遮蔽区间、无 replacement,区别于 compaction 的替换)
+  RewindApplied: 'rewind.applied',
+  RewindRevoked: 'rewind.revoked',
   // capability hot-reload
   CapabilityReloaded: 'capability.reloaded',
   // ★ hook 生命周期事件（session/prompt/compaction/notification/stop）。
@@ -83,14 +86,24 @@ export interface CoreEventPayloads {
   };
   [CoreEventType.CompactionApplied]: { coveredFrom: number; coveredTo: number; replacement: unknown };
   [CoreEventType.CompactionRevoked]: { appliedId: string };
+  /**
+   * 对话回退 boundary(append-only,事件流是真相 §6.1)。语义 = **遮蔽**从第
+   * `keepUserTurns` 个用户轮(0-based)起、直到本事件之前的全部会话事件——无 replacement
+   * (区别于 compaction 的替换)。本事件之后 append 的新轮次不受影响,故一次 rewind→续聊→
+   * 再 rewind 天然叠加。`rewindId` 供 RewindRevoked(Redo/cancel)按 id 撤销。 */
+  [CoreEventType.RewindApplied]: { rewindId: string; keepUserTurns: number };
+  /** 撤销一次 rewind(Redo/cancel):按 `rewindId` 寻址,被遮蔽轮次恢复。原事件不删。 */
+  [CoreEventType.RewindRevoked]: { rewindId: string };
   [CoreEventType.CapabilityReloaded]: { packName: string };
   // ★ hook 生命周期事件的 payload。
   /** 会话开始：哪个 session、工作目录、触发来源。 */
   [CoreEventType.SessionStart]: { sessionId?: string; cwd?: string; source?: string };
   /** 会话结束：哪个 session、结束原因。 */
   [CoreEventType.SessionEnd]: { sessionId?: string; reason?: string };
-  /** 用户提交 prompt：本轮 prompt 文本 + 第几轮。 */
-  [CoreEventType.UserPromptSubmit]: { prompt: string; turn: number };
+  /** 用户提交 prompt：本轮 prompt 文本 + 第几轮 + 回退锚点 msgId(H-02:host 在 checkpointTurn
+   *  生成,写进 WAL 与 checkpoints.jsonl 同一个 id;rehydrate 据此让 /resume 后历史轮的文件回退
+   *  可用。旧 WAL 无此字段 → rehydrate 走 ordinal fallback)。 */
+  [CoreEventType.UserPromptSubmit]: { prompt: string; turn: number; msgId?: string };
   /** 压缩前：触发方式(auto/manual) + 当前 token 数。 */
   [CoreEventType.PreCompact]: { trigger?: 'auto' | 'manual'; tokenCount?: number };
   /** 压缩后:被压缩覆盖的消息区间。 */

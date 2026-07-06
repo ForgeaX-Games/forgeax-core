@@ -167,11 +167,12 @@ describe('builtinToolsPack', () => {
 // ─── read_file ───────────────────────────────────────────────────────────────
 
 describe('read_file', () => {
-  test('predicates: read-only + concurrency-safe + maxResultSizeChars=Infinity', () => {
+  test('predicates: read-only + concurrency-safe + maxResultSizeChars bounded (C-01)', () => {
     const t = readFileTool();
     expect(t.isReadOnly({ file_path: '/a' })).toBe(true);
     expect(t.isConcurrencySafe({ file_path: '/a' })).toBe(true);
-    expect(t.maxResultSizeChars).toBe(Infinity);
+    // C-01:read_file 结果预算改为有界(非 Infinity),让 LOOP 全局兜底对 read 生效。
+    expect(Number.isFinite(t.maxResultSizeChars)).toBe(true);
   });
 
   test('reads full file with line numbers', async () => {

@@ -7,13 +7,20 @@
  * server 级 `mcp__server` / `mcp__server__*` 前缀);content 为空 = 整工具匹配,
  * 否则对从 input 抽出的「命令串」做 glob。
  *
- * Boundary: 只 import C2 契约(`../capability/types`)+ node:。不引第三方 glob,
- * 自带一个最小 glob(支持 `*` / `?`,`*` 不跨「空格分词」语义按
- * `Bash(prefix:*)` 习惯——这里用平铺 `*` 匹配任意字符,够覆盖 `git *` / `npm
- * publish:*` 这类前缀规则)。fail-closed:解析失败/形状非法 → 规则不成立(不
- * 授予),由 engine 走更严路径。
+ * Boundary: 只 import C2 契约(`../capability/types`)+ 同层 `./shell-split` + node:。
+ * 不引第三方 glob,自带一个最小 glob(支持 `*` / `?`)。
+ *
+ * shell 结构感知(E-01):对 **shell 类工具**(bash/sh/shell)的**内容级规则**,
+ * 不再对整命令串平铺匹配,而是先经 `./shell-split` 拆成子命令 + 侦测 unsafe 结构,
+ * 再做**不对称匹配**——allow 需所有子命令命中、deny/ask 任一子命令命中即触发,
+ * 含 `$()`/子 shell 时 allow 不成立(→ 由 engine 落 ask)。杜绝 `Bash(git *)`
+ * 放行 `git status && rm -rf /` 这类复合命令走私。
+ *
+ * fail-closed:解析失败/形状非法/含不可静态判定结构 → 规则不成立(不授予),
+ * 由 engine 走更严路径。
  */
 import type { PermissionBehavior } from '../capability/types';
+import { isShellToolName, splitShellCommand, stripEnvAssignments } from './shell-split';
 
 /** 一条权限规则。`content` 缺省 = 匹配整个工具;否则对 tool input
  *  抽出的命令串做 glob。 */
@@ -141,23 +148,80 @@ export function extractRuleContent(input: unknown): string {
   return '';
 }
 
+/** 规则名是否命中工具名(整工具或 MCP server 级前缀)。 */
+function ruleNameMatches(rule: PermissionRule, toolName: string): boolean {
+  return rule.toolName === toolName || mcpServerLevelMatch(rule.toolName, toolName);
+}
+
 /** 单条规则是否命中 (toolName, input)。整工具规则(无 content)只比 name;
- *  content 规则对抽出的命令串做 glob。 */
+ *  content 规则对抽出的命令串做 glob。(非 shell 工具 / 整工具规则用此路径。) */
 export function ruleApplies(rule: PermissionRule, toolName: string, input: unknown): boolean {
-  const nameMatch =
-    rule.toolName === toolName || mcpServerLevelMatch(rule.toolName, toolName);
-  if (!nameMatch) return false;
+  if (!ruleNameMatches(rule, toolName)) return false;
   if (rule.content === undefined) return true;
   return matchGlob(rule.content, extractRuleContent(input));
 }
 
+/**
+ * shell 类工具的**结构感知**桶级匹配(E-01)。桶内 behavior 同质(engine 按
+ * deny/ask/allow 分桶传入),据此选不对称语义:
+ *   - allow:整工具 allow(无 content)覆盖一切;否则命令须 `!unsafe` 且**每个**子命令
+ *     被某条 content allow 规则命中(env 前缀**不剥离**,更保守)。
+ *   - deny/ask:整工具规则或**任一**子命令命中某 content 规则即触发;匹配前**剥离** env 前缀。
+ * 命中返回代表规则(engine 只用其 `source`),否则 undefined。
+ */
+function matchShellRules(
+  rules: ReadonlyArray<PermissionRule>,
+  toolName: string,
+  input: unknown,
+): PermissionRule | undefined {
+  const applicable = rules.filter((r) => ruleNameMatches(r, toolName));
+  if (applicable.length === 0) return undefined;
+  const wholeTool = applicable.filter((r) => r.content === undefined);
+  const contentRules = applicable.filter((r) => r.content !== undefined);
+  const isAllow = applicable.some((r) => r.behavior === 'allow');
+  const { segments, unsafe } = splitShellCommand(extractRuleContent(input));
+
+  if (isAllow) {
+    // 整工具 allow(用户放行了整个 bash)→ 覆盖一切,含 unsafe。
+    if (wholeTool.length > 0) return wholeTool[0];
+    if (contentRules.length === 0 || segments.length === 0) return undefined;
+    // content allow:含命令替换/子 shell → 无法确认安全 → 不成立(engine 落 ask)。
+    if (unsafe) return undefined;
+    const allCovered = segments.every((seg) =>
+      contentRules.some((r) => matchGlob(r.content as string, seg)),
+    );
+    return allCovered ? contentRules[0] : undefined;
+  }
+
+  // deny / ask:整工具规则先命中;否则任一子命令(剥 env 前缀,或原样)命中 content 规则。
+  if (wholeTool.length > 0) return wholeTool[0];
+  for (const r of contentRules) {
+    for (const seg of segments) {
+      const stripped = stripEnvAssignments(seg);
+      if (matchGlob(r.content as string, stripped) || matchGlob(r.content as string, seg)) return r;
+    }
+  }
+  return undefined;
+}
+
 /** 在一组规则里找第一条命中的(顺序敏感:调用方按 deny→ask→allow 分桶传入)。
- *  返回命中的规则或 undefined。fail-closed:任何条目异常被跳过。 */
+ *  返回命中的规则或 undefined。shell 类工具 + 存在内容级规则 → 走结构感知不对称匹配
+ *  (`matchShellRules`);否则逐条 `ruleApplies`。fail-closed:任何条目异常被跳过。 */
 export function matchRule(
   rules: ReadonlyArray<PermissionRule>,
   toolName: string,
   input: unknown,
 ): PermissionRule | undefined {
+  // shell 工具 + 有内容级规则 → 结构感知匹配是**权威**路径:即使返回 undefined 也不能
+  //   回落通用平铺 glob(否则 `Bash(git *)` 的 `^git .*$` 会重新命中 `git ... && rm -rf /`,
+  //   走私复现)。仅当拆分/匹配抛异常才 fail-closed 到通用路径兜底。
+  if (isShellToolName(toolName) && rules.some((r) => r.content !== undefined)) {
+    try {
+      return matchShellRules(rules, toolName, input);
+    } catch {
+      return undefined; // fail-closed:异常不授予、不误触发
+    }
+  }
   for (const rule of rules) {
     try {
       if (ruleApplies(rule, toolName, input)) return rule;

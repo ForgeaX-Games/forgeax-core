@@ -82,7 +82,7 @@ interface Serve {
   proc: ReturnType<typeof Bun.spawn>;
   conn: RpcConnection;
   events: KernelEvent[];
-  hostToolCalls: Array<{ name: string; args: unknown }>;
+  hostToolCalls: Array<{ name: string; args: unknown; callId?: string }>;
   close(): void;
 }
 
@@ -123,12 +123,12 @@ async function startServe(): Promise<Serve> {
   });
   const conn = await connectRetry(sock);
   const events: KernelEvent[] = [];
-  const hostToolCalls: Array<{ name: string; args: unknown }> = [];
+  const hostToolCalls: Array<{ name: string; args: unknown; callId?: string }> = [];
   // 反向 hostTool 桥:serve 的工具执行回调宿主,这里复跑并回结果(compute 恒成功)。
   conn.setRequestHandler(async (method, params) => {
     if (method === 'hostTool') {
-      const p = params as { name: string; args: unknown };
-      hostToolCalls.push({ name: p.name, args: p.args });
+      const p = params as { name: string; args: unknown; callId?: string };
+      hostToolCalls.push({ name: p.name, args: p.args, callId: p.callId });
       return { result: 'compute-done: 42' };
     }
     throw Object.assign(new Error(`unknown ${method}`), { code: -32601 });
@@ -201,6 +201,14 @@ describe('serve sidecar e2e (real --serve subprocess, JSON-RPC over unix socket,
       // 模型发了工具调用,serve 把它经反向桥回调了宿主。
       expect(kinds).toContain('tool.call');
       expect(s.hostToolCalls.map((c) => c.name)).toContain('compute');
+      // Regression (os2 remote HITL id 对齐):反向 hostTool RPC 必须携带 callId,且与
+      // tool.call 事件的 callId 一致——studio 据此把前端 HITL 卡片 pending key 钉在同一 id 上。
+      const computeCall = s.hostToolCalls.find((c) => c.name === 'compute');
+      expect(computeCall?.callId).toBeTruthy();
+      const toolCallEv = s.events.find(
+        (e): e is Extract<KernelEvent, { kind: 'tool.call' }> => e.kind === 'tool.call' && e.name === 'compute',
+      );
+      expect(computeCall?.callId).toBe(toolCallEv?.callId);
       // 宿主回的结果流回成 tool.result,随后续轮收口。
       expect(kinds).toContain('tool.result');
       expect(kinds).toContain('turn.done');

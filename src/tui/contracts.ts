@@ -351,8 +351,9 @@ export interface QuestionQueue {
 // ── agent driver(embed CoreAgent;直构,不走 runTurn,见 PRD §0-A)──
 export interface AgentDriver {
   /** 跑一轮:把 AgentEvent 逐个回调(driver 内部 reduce 进 session)。done 时 resolve。
-   *  images:该轮附带的图片附件(多模态);有则 payload 走 content block 数组,否则纯字符串。 */
-  driveTurn(prompt: string, onEvent: (e: AgentEvent) => void, images?: ImageAttachment[]): Promise<void>;
+   *  images:该轮附带的图片附件(多模态);有则 payload 走 content block 数组,否则纯字符串。
+   *  msgId:本轮回退锚点(checkpointTurn 生成),透传进 WAL 的 user_prompt.submit(H-02)。 */
+  driveTurn(prompt: string, onEvent: (e: AgentEvent) => void, images?: ImageAttachment[], msgId?: string): Promise<void>;
   /** 取消在飞轮:CoreAgent.abort() → turn_aborted + done。 */
   abort(reason?: string): void;
   /** 按模型发来的名(含 aliases)解析回真工具,产出视图元信息(梁①)。
@@ -433,12 +434,17 @@ export interface AgentDriver {
   /** 确认面板的 diff 预览(盘上现状 vs 目标 checkpoint);无文件快照 → 空 DiffStats。 */
   previewRewind(msgId: string): DiffStats | null;
   /** 完整回退:存 pre-rewind 对话快照(messages+convo)+ 文件 pre-rewind 快照 → restore
-   *  文件到目标 → reseed convo 到 targetHistory → 进挂起态。messages 截断由 Repl 负责。 */
+   *  文件到目标 → 进挂起态。messages 截断由 Repl 负责。
+   *  H-01:向 WAL append 一条 append-only `rewind.applied`(遮蔽被回退轮次),使 /resume
+   *  (同进程/跨进程)重建的历史不复活这些轮次。keepUserTurns = 保留的用户轮数(回退点之前
+   *  的 user 轮计数),作 WAL 遮蔽 boundary 的锚点。
+   *  H-03:下一轮 reseed 的历史不再由调用方传入有损重建,而是 driver 从 WAL fold(与 resume
+   *  同一路径,含完整工具轮 + 吃上面的遮蔽)——故无 targetHistory 入参。 */
   rewind(input: {
     msgId: string;
     hasCode: boolean;
+    keepUserTurns: number;
     currentMessages: UiMessage[];
-    targetHistory: ProviderMessage[];
   }): Promise<RewindOutcome>;
   /** 恢复(Redo):还原 pre-rewind 对话(返回 messages 交回 Repl 重灌)+ 文件。 */
   cancelRewind(): Promise<{ messages: UiMessage[]; keptDirty: string[] } | { error: string }>;

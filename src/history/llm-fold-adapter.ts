@@ -22,6 +22,7 @@ import type { CoreEvent } from '../events/types';
 import { CoreEventType } from '../events/events';
 import type { ProviderMessage } from '../provider/types';
 import { foldEvents, type FoldAdapter, type EventRange } from './ledger';
+import { computeRewindShadow } from './rewind-mask';
 
 /** loop 自吐的 assistant 会话事件类型(非 CoreEventType 成员,见 agent.ts:520)。 */
 const ASSISTANT_MESSAGE_TYPE = 'assistant.message';
@@ -58,6 +59,8 @@ function eventIdOf(e: CoreEvent): string {
     if (typeof p.id === 'string') return p.id;
     if (typeof p.toolUseId === 'string') return p.toolUseId;
     if (typeof p.appliedId === 'string') return p.appliedId;
+    // RewindApplied 的稳定 id = rewindId(RewindRevoked 据此撤销)。
+    if (typeof p.rewindId === 'string') return p.rewindId;
   }
   return `${e.type}@${e.ts}`;
 }
@@ -70,6 +73,14 @@ interface CompactionAppliedPayload {
   replacement: unknown;
   /** foldFromStore() 预处理时改写上的 byEventId 区间(坐标系对齐,见下)。 */
   range?: EventRange;
+}
+
+/** RewindApplied payload(events.ts);`rewindRange` 由 foldFromStore() 预置成 byEventId
+ *  (遮蔽区间内会话消息事件的合成 id),裸事件无 rewindRange 则遮蔽空集(fail-soft)。 */
+interface RewindAppliedPayload {
+  rewindId: string;
+  keepUserTurns: number;
+  rewindRange?: EventRange;
 }
 
 /**
@@ -137,6 +148,24 @@ export const llmFoldAdapter: FoldAdapter<ProviderMessage> = {
     const p = e.payload as { appliedId?: string };
     return typeof p.appliedId === 'string' ? p.appliedId : '';
   },
+
+  isRewindApplied(e: CoreEvent): boolean {
+    return e.type === CoreEventType.RewindApplied;
+  },
+
+  isRewindRevoked(e: CoreEvent): boolean {
+    return e.type === CoreEventType.RewindRevoked;
+  },
+
+  rewindRange(e: CoreEvent): EventRange {
+    const p = e.payload as RewindAppliedPayload;
+    return p.rewindRange ?? { kind: 'byEventId', ids: [] };
+  },
+
+  revokedRewindId(e: CoreEvent): string {
+    const p = e.payload as { rewindId?: string };
+    return typeof p.rewindId === 'string' ? p.rewindId : '';
+  },
 };
 
 /**
@@ -163,8 +192,22 @@ export function foldFromStore(events: CoreEvent[]): ProviderMessage[] {
     return withId;
   });
 
+  // H-01 rewind:算出被遮蔽的流下标(单一真相 rewind-mask),把每个 RewindApplied 的遮蔽
+  //   区间改写成 byEventId(区间内**会话消息事件**的合成 id)——与 compaction 同套坐标对齐。
+  //   非会话事件被遮蔽无所谓(foldEvents 只对 message 事件判 range),故只收消息事件的 id。
+  const shadow = computeRewindShadow(tagged);
+  const shadowedMsgIds: string[] = [];
+  tagged.forEach((e, idx) => {
+    if (shadow[idx] && llmFoldAdapter.isMessage(e)) shadowedMsgIds.push(llmFoldAdapter.eventId(e));
+  });
+
   // 改写 CompactionApplied:会话消息下标区间 → byEventId(覆盖区间内会话事件的合成 id)。
+  //   RewindApplied:预置 rewindRange = 全部被遮蔽消息事件的合成 id(mask 语义)。
   const rewritten: CoreEvent[] = tagged.map((e) => {
+    if (e.type === CoreEventType.RewindApplied) {
+      const p = e.payload as RewindAppliedPayload;
+      return { ...e, payload: { ...p, rewindRange: { kind: 'byEventId', ids: shadowedMsgIds } as EventRange } };
+    }
     if (e.type !== CoreEventType.CompactionApplied) return e;
     const p = e.payload as CompactionAppliedPayload;
     const ids: string[] = [];

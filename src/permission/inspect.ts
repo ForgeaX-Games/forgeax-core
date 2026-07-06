@@ -69,6 +69,12 @@ function viewBucket(rules: ReadonlyArray<PermissionRule>): PermissionRuleView[] 
   return rules.map((rule) => ({ rule, display: formatRule(rule) }));
 }
 
+/** 渲染一条规则视图为「展示串 + 来源标注」(E-02 #4:/permissions 显示规则来源,
+ *  如 `Bash(rm *)  [settings.permissions.deny]`)。无 source → 仅展示串。 */
+export function formatRuleView(view: PermissionRuleView): string {
+  return view.rule.source ? `${view.display}  [${view.rule.source}]` : view.display;
+}
+
 /**
  * 整理当前权限规则集 + 模式为可渲染视图。**纯函数**:由 host 注入 rules / mode。
  *

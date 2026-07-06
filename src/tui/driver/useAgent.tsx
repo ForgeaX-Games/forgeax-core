@@ -26,6 +26,7 @@ import type { PermissionMode } from '../../permission/engine';
 import { CoreEventType } from '../../events/events';
 import type { LLMProvider, ProviderMessage } from '../../provider/types';
 import { makeProviderCompactSummarize } from '../../context/compaction-llm';
+import { makeRehydrateInjection } from '../../context/post-compact-rehydrate';
 import { microCompact } from '../../context/micro-compaction';
 import { contextWindowForModel } from '../../context/model-window';
 import { buildHostContext, type HostContext, type HostContextArgs } from '../../cli/host-context';
@@ -40,9 +41,9 @@ import { type Usage, EMPTY_USAGE } from '../../provider/types';
 import { summarizeUsage, contextStats } from '../../context/usage-stats';
 import { inspectMcpServers, type InspectMcpOptions } from '../../capability/mcp/inspect';
 import { getPermissionRules } from '../../permission/inspect';
-import { listSessions, foldSessionById, readSessionEvents } from '../../cli/resume-fold';
+import { listSessions, foldSessionById, readSessionEvents, foldSessionHistory } from '../../cli/resume-fold';
 import { foldFromStore } from '../../history/llm-fold-adapter';
-import { walEventsToUiMessages } from '../transcript/rehydrate';
+import { walEventsToUiMessages, relinkMsgIds } from '../transcript/rehydrate';
 import { inspectAgents } from '../../capability/agent/inspect';
 import { listMemory } from '../../capability/memory/inspect';
 import { listSkills, listPlugins, listHooks } from '../../capability/extensions-inspect';
@@ -59,7 +60,6 @@ import { loadAgentDefs } from '../../capability/agent/index';
 import type { SandboxFs, AskQuestionFn } from '../../inject/types';
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { resolve as resolvePath } from 'node:path';
-import { RecentReads } from '../../capability/read-tracker';
 import { describeWindowOverride } from '../../context/watermarks';
 import { randomUUID } from 'node:crypto';
 
@@ -141,11 +141,6 @@ export function createAgentDriver(opts: DriverOptions, initial: HostContext): Ag
   //   assistant 收尾各重置一次,故静默时只剩纯 input+cache(对齐 cc 状态栏的「上下文占用」)。
   let liveOutChars = 0;
 
-  // ── CORE-CTX-004 压后重挂:最近读文件的有序缓冲(driver 级,跨 setModel 重建保留)。
-  //   makeAgent 订阅当前 bus 的 ToolCallRequested,把 read 类工具的 file_path 喂进来;
-  //   压缩后 rehydrate 取最前 1 个重挂,让模型不忘刚读的文件。
-  const recentReads = new RecentReads();
-  let unsubReads: (() => void) | undefined;
   // ── CORE-CTX-005 大结果落盘:截断超限 tool 结果时把全量写 <sessionsDir>/<sid>/tool-results/<id>.txt,
   //   返回路径供 marker 追加「full result at <path>」,模型可 read 回捞中段。best-effort,失败返回 undefined。
   const toolResultsDir = (): string =>
@@ -175,13 +170,6 @@ export function createAgentDriver(opts: DriverOptions, initial: HostContext): Ag
   }
 
   function makeAgent(context: AgentContext, bus: HostContext['bus']): CoreAgent {
-    // 重订阅当前 bus 的读事件(setModel 重建换 bus 时先退订旧的,防泄漏)。
-    unsubReads?.();
-    unsubReads = bus.subscribe(CoreEventType.ToolCallRequested, (e) => {
-      const p = (e as { payload?: { input?: { file_path?: unknown } } }).payload?.input?.file_path;
-      if (typeof p === 'string' && p) recentReads.record(p);
-      return undefined;
-    });
     return new CoreAgent({
       context,
       bus,
@@ -196,13 +184,10 @@ export function createAgentDriver(opts: DriverOptions, initial: HostContext): Ag
       //   非 team → undefined,零变化)。每轮顶部 drain（agent.ts:758），peer 回报作合成 user 轮入上下文。
       ...(host.coordinatorInbox ? { inbox: host.coordinatorInbox } : {}),
       // ★ ISSUE-1:统一走 Compaction V2(替换 legacy makeProviderCompaction)。
-      //   CORE-CTX-004:注入 rehydrate,压后把最近读的文件重挂回上下文。
+      //   D-01:压后重挂最近读文件(recentReadPaths 由 loop 自取内部 read-tracker)。
       compactionV2: {
         summarize: makeProviderCompactSummarize(context.provider, context.config.model),
-        rehydrate: {
-          recentReadPaths: () => recentReads.list(),
-          readFile: async (p: string) => (context.toolContext.sandboxFs as SandboxFs).readText(p),
-        },
+        rehydrate: makeRehydrateInjection(context.toolContext),
       },
       microCompact: (msgs: ProviderMessage[]) => microCompact(msgs, { now: Date.now() }),
       // CORE-CTX-005:大结果落盘钩子(host/sessionDir 领地)。
@@ -237,7 +222,7 @@ export function createAgentDriver(opts: DriverOptions, initial: HostContext): Ag
       return sessionId;
     },
 
-    async driveTurn(prompt: string, onEvent: (e: AgentEvent) => void, images?: ImageAttachment[]): Promise<void> {
+    async driveTurn(prompt: string, onEvent: (e: AgentEvent) => void, images?: ImageAttachment[], msgId?: string): Promise<void> {
       // 多模态:有图 → payload/convo 走 content block 数组([text?, image...]);无图 → 纯字符串(零变化)。
       const userContent = buildUserContent(prompt, images);
       // 长活复用:同一进程内复用一个 agent。CoreAgent **不跨 run 持有历史**(每次 run 从
@@ -254,6 +239,9 @@ export function createAgentDriver(opts: DriverOptions, initial: HostContext): Ag
       for await (const ev of agent.run({
         input: { type: 'user', payload: userContent, ts: 0 },
         ...(seed.length ? { history: seed } : {}),
+        // H-02:把回退锚点 msgId 透传进 loop → 写入 WAL 的 user_prompt.submit,
+        //   使 /resume 重建历史时能还原 msgId 供文件回退。
+        ...(msgId ? { msgId } : {}),
       })) {
         // 累计 usage:stream 透传的 provider assistant 事件带真 usage(types.ts:115)。
         //   ⚠️ 用「逐项相加」而非 mergeUsage——后者语义是同一消息内 input/cache **覆盖**取最新
@@ -444,7 +432,9 @@ export function createAgentDriver(opts: DriverOptions, initial: HostContext): Ag
         pendingHistory = hist.slice();
         agent = null; // 下一轮 driveTurn 用恢复历史 reseed
       }
-      return walEventsToUiMessages(events);
+      // H-02:新 WAL 的 user 轮已带 msgId;旧 WAL 无 → 用 checkpoints.jsonl 按 ordinal fallback
+      //   回填(数量不一致则保守放弃),使历史轮的文件回退在 RewindPanel 里可用(hasCode)。
+      return relinkMsgIds(walEventsToUiMessages(events), checkpoints.list());
     },
 
     listAgents() {
@@ -647,7 +637,29 @@ export function createAgentDriver(opts: DriverOptions, initial: HostContext): Ag
         hasCode: input.hasCode,
       };
       agent = null;
-      pendingHistory = input.targetHistory.length ? input.targetHistory.slice() : null;
+      // H-01:先向 WAL append 一条 append-only rewind.applied(遮蔽被回退轮次)。经 host.bus →
+      //   connectStore 落 events.jsonl(sessionId 恒有 → store 恒连),故 /resume 与 --resume 的
+      //   fold 都排除这些轮次。rewindId 复用 boundaryId,cancel/Redo 时按它写 revoke。fail-soft:
+      //   发事件异常绝不阻断回退本身(对话/文件回退已生效)。
+      try {
+        host.bus.publish({
+          type: CoreEventType.RewindApplied,
+          payload: { rewindId: boundaryId, keepUserTurns: input.keepUserTurns },
+          ts: Date.now(),
+          source: 'tui-rewind',
+        });
+      } catch {
+        /* ignore:WAL 遮蔽是加固,失败不该冒泡断回退 */
+      }
+      // H-03:reseed 历史复用**与 resume 同一条 fold 路径**(foldSessionHistory→foldFromStore),
+      //   吃上面刚写的 rewind.applied 遮蔽 → 产出「保留前缀」的**完整含工具轮** ProviderMessage[]
+      //   (不再走 Repl.toHistory 的有损文本重建)。一举消灭双实现(SSOT)。fail-soft:读 store
+      //   失败 → 空历史(下一轮从该点续,不误链)。多模态:把保留 user 轮的 images 覆盖回。
+      const folded = (await safeFold(host.store)) ?? [];
+      // reattachImages 按序只消费前 keepUserTurns 个 user 轮(fold 恰好 keep 个),传全量安全。
+      const reseed = reattachImages(folded, input.currentMessages);
+      convo = reseed.slice();
+      pendingHistory = reseed.length ? reseed.slice() : null;
       return { boundaryId, filesChanged, keptDirty };
     },
 
@@ -660,10 +672,26 @@ export function createAgentDriver(opts: DriverOptions, initial: HostContext): Ag
         if ('error' in r) return { error: r.error };
         keptDirty = r.keptDirty;
       }
-      // 还原对话:convo 复位 + 下一轮重播种。
+      // H-01:Redo(cancel)→ 向 WAL append rewind.revoked(按 rewindId=boundaryId 撤销遮蔽),
+      //   被回退轮次在后续 resume 中恢复。append-only(原 rewind.applied 不删)。fail-soft。
+      try {
+        host.bus.publish({
+          type: CoreEventType.RewindRevoked,
+          payload: { rewindId: b.boundaryId },
+          ts: Date.now(),
+          source: 'tui-rewind',
+        });
+      } catch {
+        /* ignore */
+      }
+      // 还原对话:agent 重置 + 下一轮重播种。H-03:reseed 复用 fold 路径——RewindRevoked 已写入
+      //   → WAL 遮蔽解除 → fold 出**含工具轮**的完整 pre-rewind 历史(定格前不可能有新轮,故等价
+      //   pre-rewind 全量)。读失败 → 退回内存 preConvo(文本级,graceful degradation)。
       agent = null;
-      convo = b.preConvo.slice();
-      pendingHistory = b.preConvo.length ? b.preConvo.slice() : null;
+      const restoredFold = await safeFold(host.store);
+      const restored = restoredFold ? reattachImages(restoredFold, b.preMessages) : b.preConvo.slice();
+      convo = restored.slice();
+      pendingHistory = restored.length ? restored.slice() : null;
       const messages = b.preMessages.slice();
       activeBoundary = null;
       return { messages, keptDirty };
@@ -702,6 +730,35 @@ export function createAgentDriver(opts: DriverOptions, initial: HostContext): Ag
     },
   };
   return driver;
+}
+
+/** 从会话 WAL fold 出完整历史(与 resume 同一路径,含工具轮 + 吃 rewind 遮蔽);读失败 → 空。
+ *  H-03:rewind/Redo 的历史 reseed 复用它,不再各自有损重建。 */
+async function safeFold(store: HostContext['store']): Promise<ProviderMessage[] | undefined> {
+  try {
+    return await foldSessionHistory(store);
+  } catch {
+    return undefined;
+  }
+}
+
+/** 多模态不回归:WAL 的 user_prompt.submit 只存**文本** prompt(images 从不入 WAL,resume
+ *  同样丢),故 fold 出的 user 文本轮无图。这里按序把保留 UiMessage 里的 images 覆盖回对应的
+ *  fold user 文本轮,使回退后模型仍看到此前发过的图(与旧 toHistory 口径一致)。pastes 已在
+ *  WAL 中展开,无需处理。fold 与 UiMessage 的 user 轮同序且数量相等(遮蔽后 fold 恰好 keep 个)。 */
+function reattachImages(folded: ProviderMessage[], keptUserMessages: UiMessage[]): ProviderMessage[] {
+  const imgs = keptUserMessages
+    .filter((m): m is Extract<UiMessage, { kind: 'user' }> => m.kind === 'user')
+    .map((m) => m.images);
+  let i = 0;
+  return folded.map((m) => {
+    // fold 出的 user **文本**轮:content 为 string(tool_result 轮 content 是数组,不配对)。
+    if (m.role === 'user' && typeof m.content === 'string') {
+      const im = imgs[i++];
+      if (im && im.length) return { role: 'user', content: buildUserContent(m.content, im) };
+    }
+    return m;
+  });
 }
 
 /** DriverOptions(+ 覆盖 model / 当前 sessionId)→ HostContextArgs。

@@ -49,6 +49,8 @@ import {
   CompactType,
   compactTrigger,
   DEFAULT_GATE_CONFIG,
+  DEFAULT_REHYDRATE_TOKEN_BUDGET,
+  DEFAULT_REHYDRATE_MAX_FILES,
   type CompactionGateState,
   type CompactionGateConfig,
   type ModelContextInfo,
@@ -97,9 +99,11 @@ export interface CompactionV2Options {
   querySource?: string;
   /** 启用 pre-message 预压(turn 顶部按 preCompactThreshold 静默预压),默认 true。 */
   preMessage?: boolean;
-  /** 压后重挂(简化版):取最近读过的文件重挂。 */
+  /** 压后重挂(简化版):取最近读过的文件重挂。
+   *  D-01:`recentReadPaths` 可选——host 拿不到 loop 内部 read-tracker,缺省时 loop **自取**
+   *  自己的 read-tracker(`recentPaths()`),host 只需给 `readFile` + 预算即可开启重挂。 */
   rehydrate?: {
-    recentReadPaths: () => readonly string[];
+    recentReadPaths?: () => readonly string[];
     readFile: (path: string) => Promise<string>;
     tokenBudget?: number;
     maxFiles?: number;
@@ -431,6 +435,9 @@ export class CoreAgent implements Agent {
   private pendingExtract: Promise<void> = Promise.resolve();
   /** Compaction V2 触发闸状态(冷却戳 / 熔断计数 / 压缩中标记;跨 turn 持有)。 */
   private gateState: CompactionGateState = initialGateState();
+  /** 同一文件重复读计数 + 最近读顺序(per-run;run() 起始重置)。D-01:压后重挂自取它的
+   *  `recentPaths()` 作数据源(host 拿不到 loop 内部 tracker → loop 自取)。 */
+  private readTracker = new ReadTracker();
   /** 当前权限模式(可被 facade `setMode` 在运行中切换;ExitPlanMode 命中后翻回 default)。
    *  初值取 options.mode(缺省 'default'),从此**取代** o.mode 作为 dispatch 的权威模式源。 */
   private currentMode: PermissionMode;
@@ -561,11 +568,12 @@ export class CoreAgent implements Agent {
 
       // 压后重挂(#13):取最近文件附在 replacement 之后(replacement 现位于 coveredFrom)。
       if (v2.rehydrate) {
+        // D-01:host 未提供 recentReadPaths → loop 自取自己的 read-tracker(host 拿不到内部 tracker)。
         const reh = await rehydrate({
-          recentReadPaths: v2.rehydrate.recentReadPaths(),
+          recentReadPaths: v2.rehydrate.recentReadPaths ? v2.rehydrate.recentReadPaths() : this.readTracker.recentPaths(),
           readFile: v2.rehydrate.readFile,
-          tokenBudget: v2.rehydrate.tokenBudget ?? 10_000,
-          maxFiles: v2.rehydrate.maxFiles ?? 1,
+          tokenBudget: v2.rehydrate.tokenBudget ?? DEFAULT_REHYDRATE_TOKEN_BUDGET,
+          maxFiles: v2.rehydrate.maxFiles ?? DEFAULT_REHYDRATE_MAX_FILES,
         });
         if (reh.attachments.length > 0) {
           messages.splice(result.coveredFrom + 1, 0, ...reh.attachments);
@@ -690,7 +698,9 @@ export class CoreAgent implements Agent {
 
     // ★ UserPromptSubmit hook:turn 0 开跑前发一次。若回执(或合并其上的 hook
     //   决议)携带 additionalContext,注成下一轮可见的 system-reminder。
-    const ups = this.bus.publish(this.ev(CoreEventType.UserPromptSubmit, { prompt: userQuery, turn: 0 }));
+    const ups = this.bus.publish(
+      this.ev(CoreEventType.UserPromptSubmit, { prompt: userQuery, turn: 0, ...(input.msgId ? { msgId: input.msgId } : {}) }),
+    );
     const upsExtra = readHookExtra(ups);
     if (upsExtra.additionalContext) hookContextReminders.push(`<system-reminder>${upsExtra.additionalContext}</system-reminder>`);
 
@@ -725,7 +735,9 @@ export class CoreAgent implements Agent {
     const maxContinuations = this.o.maxContinuations ?? 4;
     let continuations = 0;
     // ─── 同一文件重复读计数(移植 same_file_read_limit);越线注入 system-reminder(下一轮)。
-    const readTracker = new ReadTracker();
+    //   per-run 重置实例字段(供 runCompactionV2 压后重挂自取 recentPaths);本地别名沿用旧引用。
+    this.readTracker.reset();
+    const readTracker = this.readTracker;
     const readLimit = this.o.sameFileReadLimit ?? undefined;
     const readReminders: string[] = [];
     const readReminderSlots = (): Slot[] =>
@@ -1020,6 +1032,10 @@ export class CoreAgent implements Agent {
           messages.push({ role: 'user', content: `<system-reminder>${reason}</system-reminder>` });
           yield { type: 'turn_end', turn, usageContextRatio: ctxRatio() };
           this.bus.publish(this.ev(CoreEventType.TurnEnd, { turn, usageContextRatio: ctxRatio() }));
+          // ContinueReason stop_hook_blocking:stop hook 要求「别停、继续跑」→ 续轮。
+          //   发 TurnAborted 事件,与 reactive_compact_retry / token_budget_continuation 同机制,
+          //   让续轮可观测(此前 stop-hook 续轮在事件流里不可见)。
+          this.bus.publish(this.ev(CoreEventType.TurnAborted, { turn, reason: 'stop_hook_blocking' }));
           continue;
         }
         // hook 反复要求继续但已触上限 → 终止(TerminalReason stop_hook_prevented)。

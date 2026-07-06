@@ -6,7 +6,7 @@
  * 其余生命周期事件(turn/stop/session/stage)被跳过。
  */
 import { test, expect, describe } from 'bun:test';
-import { walEventsToUiMessages } from '../../src/tui/transcript/rehydrate';
+import { walEventsToUiMessages, relinkMsgIds, type CheckpointRef } from '../../src/tui/transcript/rehydrate';
 import { reduceTranscript } from '../../src/tui/transcript/reduce';
 import type { SessionEntry, UiMessage } from '../../src/tui/contracts';
 import type { CoreEvent } from '../../src/events/types';
@@ -25,6 +25,12 @@ describe('walEventsToUiMessages', () => {
   test('user_prompt.submit → user 条目', () => {
     const out = walEventsToUiMessages([ev('user_prompt.submit', { prompt: 'hello', turn: 0 })]);
     expect(out).toEqual([{ kind: 'user', text: 'hello' }]);
+  });
+
+  // H-02:新 WAL 的 user_prompt.submit 携带 msgId → rehydrate 直接还原(历史轮文件回退可用)。
+  test('user_prompt.submit 带 msgId → user 条目还原 msgId', () => {
+    const out = walEventsToUiMessages([ev('user_prompt.submit', { prompt: 'hi', turn: 0, msgId: 'abc' })]);
+    expect(out).toEqual([{ kind: 'user', text: 'hi', msgId: 'abc' }]);
   });
 
   test('assistant.message → assistant 事件(message 持原 CoreEvent,payload.content 可读)', () => {
@@ -90,5 +96,40 @@ describe('walEventsToUiMessages', () => {
 
   test('空事件流 → 空', () => {
     expect(walEventsToUiMessages([])).toEqual([]);
+  });
+});
+
+// ─── H-02: relinkMsgIds(旧 WAL ordinal fallback,fail-soft)─────────────────────
+describe('relinkMsgIds', () => {
+  const cp = (msgId: string, hasCode = true): CheckpointRef => ({ msgId, hasCode });
+
+  test('成对:缺 msgId 的 user 轮数 == checkpoints 条数 → 按序回填', () => {
+    const msgs: UiMessage[] = [
+      { kind: 'user', text: 'q1' },
+      { kind: 'agent', event: { type: 'assistant', message: ev('assistant.message', { content: [] }) } as never },
+      { kind: 'user', text: 'q2' },
+    ];
+    const out = relinkMsgIds(msgs, [cp('m1'), cp('m2')]);
+    expect(out.filter((m) => m.kind === 'user').map((m) => (m as { msgId?: string }).msgId)).toEqual(['m1', 'm2']);
+  });
+
+  test('错位:数量不一致 → 原样返回(不误链)', () => {
+    const msgs: UiMessage[] = [
+      { kind: 'user', text: 'q1' },
+      { kind: 'user', text: 'q2' },
+    ];
+    const out = relinkMsgIds(msgs, [cp('m1')]); // 2 user 轮 vs 1 checkpoint
+    expect(out).toEqual(msgs); // 不动
+    expect(out.every((m) => m.kind !== 'user' || !(m as { msgId?: string }).msgId)).toBe(true);
+  });
+
+  test('空索引:有缺 msgId 的 user 轮但无 checkpoints → 原样返回', () => {
+    const msgs: UiMessage[] = [{ kind: 'user', text: 'q1' }];
+    expect(relinkMsgIds(msgs, [])).toEqual(msgs);
+  });
+
+  test('幂等:已带 msgId(新 WAL)→ 不改', () => {
+    const msgs: UiMessage[] = [{ kind: 'user', text: 'q1', msgId: 'already' }];
+    expect(relinkMsgIds(msgs, [cp('other')])).toEqual(msgs);
   });
 });

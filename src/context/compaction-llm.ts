@@ -165,11 +165,6 @@ const NO_TOOLS_TRAILER =
   'an <analysis> block followed by a <summary> block. ' +
   'Tool calls will be rejected and you will fail the task.';
 
-/** Partial-compaction preamble (#2):仅压最近一段,更早的保留不动。 */
-const PARTIAL_COMPACT_PREAMBLE = `Your task is to summarize ONLY the RECENT portion of the conversation shown below. Earlier messages are being kept intact and do NOT need summarizing — focus solely on what was discussed, learned and accomplished in these recent messages. Use the same 9-section structure below.
-
-`;
-
 /** Pre-message-compaction preamble (#2/#11):压完后紧接一条新的用户消息,摘要要让模型无缝接上。 */
 const PRE_MESSAGE_COMPACT_PREAMBLE = `Your task is to summarize the conversation so far. This summary will be placed at the start of a continuing session and a NEW user message will follow right after it (you do not see it here). Summarize thoroughly using the 9-section structure below so the work can continue seamlessly once the new message arrives.
 
@@ -178,16 +173,10 @@ const PRE_MESSAGE_COMPACT_PREAMBLE = `Your task is to summarize the conversation
 /** Build the compaction summary prompt (`getCompactPrompt`).
  *  按 scenario 选模板(#2):
  *   - 'full'        —— 全量 9 段(默认,行为同旧)。
- *   - 'partial'     —— 仅压最近段(保旧)。
  *   - 'pre-message' —— 压后紧跟新用户消息的预压场景。
  *  统一裹 no-tools preamble/trailer;可选 customInstructions 追加。 */
 export function getCompactPrompt(scenario: SummaryScenario = 'full', customInstructions?: string): string {
-  const scenarioPreamble =
-    scenario === 'partial'
-      ? PARTIAL_COMPACT_PREAMBLE
-      : scenario === 'pre-message'
-        ? PRE_MESSAGE_COMPACT_PREAMBLE
-        : '';
+  const scenarioPreamble = scenario === 'pre-message' ? PRE_MESSAGE_COMPACT_PREAMBLE : '';
   let prompt = NO_TOOLS_PREAMBLE + scenarioPreamble + BASE_COMPACT_PROMPT;
   if (customInstructions && customInstructions.trim() !== '') {
     prompt += `\n\nAdditional Instructions:\n${customInstructions}`;

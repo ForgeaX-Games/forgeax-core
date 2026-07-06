@@ -98,8 +98,9 @@ export type GateDecision = { compact: true } | { compact: false; reason: GateRej
 
 // ─── 压缩管线(#5/#12/#4/#2/#3)──────────────────────────────────────────────
 
-/** 摘要场景(决策 #2)。 */
-export type SummaryScenario = 'full' | 'partial' | 'pre-message';
+/** 摘要场景(决策 #2)。'full' = 全量;'pre-message' = 压后紧跟新用户消息的预压。
+ *  (曾有 'partial' 但管线从无调用方 → D-01 按闭合 union 删除;未来做 partial compact 再加回。) */
+export type SummaryScenario = 'full' | 'pre-message';
 
 /** host 注入的摘要器(管线版,带 scenario):一段消息 → 摘要文本。core 绝不自调 LLM。
  *  抛 message 以 PROMPT_TOO_LONG 前缀的 Error → 管线 head-truncate 重试;
@@ -136,9 +137,15 @@ export interface CompactPipelineResult {
 
 // ─── 压后重挂(#13)──────────────────────────────────────────────────────────
 
-/** 默认重挂预算(决策 #13:简化版)。 */
+/** 默认重挂预算(决策 #13:简化版)——core 无值时的保守兜底(1 文件 / 10k token)。 */
 export const DEFAULT_REHYDRATE_TOKEN_BUDGET = 10_000;
 export const DEFAULT_REHYDRATE_MAX_FILES = 1;
+
+/** host 推荐重挂档(D-01):3 文件 / 25k token。依据:出厂默认 1/10k 明显保守,CC 为 5/50k;
+ *  取其间(3/25k)兼顾「压后连续性」与「不过度回灌吃 token」。三 host 统一引用此常量(SSOT),
+ *  单个 host 仍可按需覆写 tokenBudget/maxFiles。 */
+export const RECOMMENDED_REHYDRATE_TOKEN_BUDGET = 25_000;
+export const RECOMMENDED_REHYDRATE_MAX_FILES = 3;
 
 /** 压后重挂输入(纯逻辑 + 注入 readFile)。 */
 export interface RehydrateInput {

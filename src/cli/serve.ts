@@ -100,8 +100,8 @@ export async function startServe(sockPath: string): Promise<Server> {
 
   const server = await listenRpc(sockPath, (conn: RpcConnection, sock) => {
     // 反向 host-tool 桥:serve 的所有工具执行都回调宿主(adapter 复跑 checkKernelTool)。
-    const executeTool: ExecuteToolFn = async (name, args, sid, agentId) =>
-      conn.request('hostTool', { name, args, sid, agentId });
+    const executeTool: ExecuteToolFn = async (name, args, sid, agentId, callId) =>
+      conn.request('hostTool', { name, args, sid, agentId, callId });
 
     // ★ 可观测性(v3/B 档):exporter `send` → 独立 `telemetry` RPC 通知回流 server(与 turn 解耦,
     //   不开自己的 WS、不落盘——落盘+广播在 host/server 端)。FORGEAX_OTEL=off 时 makeNodeObservability

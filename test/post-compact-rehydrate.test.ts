@@ -3,8 +3,12 @@
  * 见 docs/features/compaction-overhaul-verification.md §6。
  */
 import { describe, test, expect } from 'bun:test';
-import { rehydrate } from '../src/context/post-compact-rehydrate';
-import { DEFAULT_REHYDRATE_TOKEN_BUDGET } from '../src/context/compaction-types';
+import { rehydrate, makeRehydrateInjection } from '../src/context/post-compact-rehydrate';
+import {
+  DEFAULT_REHYDRATE_TOKEN_BUDGET,
+  RECOMMENDED_REHYDRATE_TOKEN_BUDGET,
+  RECOMMENDED_REHYDRATE_MAX_FILES,
+} from '../src/context/compaction-types';
 
 describe('Stream F — post-compact rehydrate (#13)', () => {
   test('F-U1 重挂最近文件', async () => {
@@ -74,5 +78,21 @@ describe('Stream F — post-compact rehydrate (#13)', () => {
     });
     expect((r.attachments[0] as any)._rehydrated).toBe(true);
     expect((r.attachments[0] as any)._rehydratedPath).toBe('/a.ts');
+  });
+
+  // ─── D-01: makeRehydrateInjection(三 host 统一入口)──────────────────────────
+  describe('D-01 makeRehydrateInjection', () => {
+    test('推荐预算(3 文件 / 25k)+ readFile 走 sandboxFs.readText', async () => {
+      const inj = makeRehydrateInjection({ sandboxFs: { readText: async (p: string) => `body:${p}` } });
+      expect(inj.tokenBudget).toBe(RECOMMENDED_REHYDRATE_TOKEN_BUDGET);
+      expect(inj.maxFiles).toBe(RECOMMENDED_REHYDRATE_MAX_FILES);
+      expect(await inj.readFile('/x.ts')).toBe('body:/x.ts');
+    });
+
+    test('sandboxFs 缺失 → readFile reject,经 rehydrate() 逐文件降级(fail-open)', async () => {
+      const inj = makeRehydrateInjection({}); // 无 sandboxFs
+      const r = await rehydrate({ recentReadPaths: ['/a.ts'], ...inj });
+      expect(r.attachments).toEqual([]); // 读失败被 rehydrate() catch → 不重挂,不抛
+    });
   });
 });

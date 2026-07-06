@@ -20,6 +20,7 @@
  * Boundary(HOST 层):仅 core 类型 + 相对 import,无 react/ink。纯函数,可单测。
  */
 import type { CoreEvent } from '../../events/types';
+import { computeRewindShadow } from '../../history/rewind-mask';
 import type { AgentEvent, UiMessage } from '../contracts';
 
 /** loop 自吐的 assistant 会话事件类型(非 CoreEventType 成员;与 llm-fold-adapter 同源)。 */
@@ -30,11 +31,17 @@ const TOOL_RESULT = 'tool.result';
 
 export function walEventsToUiMessages(events: CoreEvent[]): UiMessage[] {
   const out: UiMessage[] = [];
-  for (const e of events) {
+  // H-01:被回退遮蔽的事件不进重建 transcript(与 foldFromStore 共用同一份 mask 逻辑)。
+  const shadow = computeRewindShadow(events);
+  for (let i = 0; i < events.length; i++) {
+    if (shadow[i]) continue;
+    const e = events[i];
     switch (e.type) {
       case USER_PROMPT: {
-        const prompt = (e.payload as { prompt?: unknown }).prompt;
-        out.push({ kind: 'user', text: typeof prompt === 'string' ? prompt : String(prompt ?? '') });
+        const p = e.payload as { prompt?: unknown; msgId?: unknown };
+        const text = typeof p.prompt === 'string' ? p.prompt : String(p.prompt ?? '');
+        // H-02:WAL 携带的回退锚点 msgId 直接还原 → 历史轮文件回退可用。旧 WAL 无 → 走 relinkMsgIds ordinal fallback。
+        out.push(typeof p.msgId === 'string' ? { kind: 'user', text, msgId: p.msgId } : { kind: 'user', text });
         break;
       }
       case ASSISTANT_MESSAGE: {
@@ -69,4 +76,33 @@ export function walEventsToUiMessages(events: CoreEvent[]): UiMessage[] {
     }
   }
   return out;
+}
+
+/** 回退锚点 id + 是否有代码快照(= CheckpointManager.list() 的子集形状)。 */
+export interface CheckpointRef {
+  msgId: string;
+  hasCode: boolean;
+}
+
+/**
+ * H-02 ordinal fallback —— 给**旧 WAL**(user_prompt.submit 无 msgId 载荷)的历史轮次按序
+ * 回填 msgId,使 /resume 后文件回退仍可用。新 WAL 已由 rehydrate 直接还原 msgId,本函数对已
+ * 带 msgId 的 user 轮不改(幂等)。
+ *
+ * fail-soft(不误链):仅当**缺 msgId 的 user 轮数 == checkpoints 条数**时才按序配对回填;
+ * 数量不一致(WAL 被截断 / 部分轮无锚点)→ 原样返回(降级纯对话回退),绝不错配。
+ * 空 checkpoints 且有缺 msgId 的 user 轮 → 数量不等 → 不动。
+ */
+export function relinkMsgIds(messages: UiMessage[], checkpoints: CheckpointRef[]): UiMessage[] {
+  const missing = messages.filter((m) => m.kind === 'user' && !m.msgId);
+  if (missing.length === 0) return messages; // 新 WAL:全带 msgId,无需回填
+  if (missing.length !== checkpoints.length) return messages; // 数量不一致 → 保守放弃
+  let i = 0;
+  return messages.map((m) => {
+    if (m.kind === 'user' && !m.msgId) {
+      const ref = checkpoints[i++];
+      return { ...m, msgId: ref.msgId };
+    }
+    return m;
+  });
 }

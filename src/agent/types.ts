@@ -32,25 +32,23 @@ export type LoopStage =
 
 // ─── 终态 / 续轮 reason（§1.7，必须产出同集合）─────────────────────
 
+// 闭合 union(B-01):每个成员在 src/agent/ 内至少有一个产生位点(done(...) / publish reason);
+// 幽灵成员会被 test/terminal-reason-closed-union.test.ts 守卫拦下。
 export type TerminalReason =
   | 'completed'
   | 'aborted_streaming'
   | 'aborted_tools'
   | 'prompt_too_long'
-  | 'image_error'
   | 'model_error'
   | 'blocking_limit'
   | 'stop_hook_prevented'
-  | 'hook_stopped'
   | 'unrecoverable_tool_error' // 同一工具连续报同类错达阈值 → 循环兜底(移植 agentic_os 02.4)
   | 'handed_off' // 本 agent 经 HandoffSink 把控制权交出(pop_self/abort 等),loop 收口
   | 'max_turns';
 
+// 续轮 reason:全部作 TurnAborted 事件的 reason 载荷发布(见 agent.ts)。
 export type ContinueReason =
-  | 'next_turn'
-  | 'collapse_drain_retry'
   | 'reactive_compact_retry'
-  | 'max_output_tokens_escalate'
   | 'max_output_tokens_recovery'
   | 'stop_hook_blocking'
   | 'token_budget_continuation';
@@ -107,6 +105,9 @@ export interface RunInput {
   /** host-owned 历史（FACADE 消费 TurnRequest.history 时 seed；native 内核语义，
    *  对齐 contract.ts TurnRequest.history "NATIVE forgeax-core kernel CONSUMES it"）。 */
   history?: ProviderMessage[];
+  /** 本轮用户消息的回退锚点 id(H-02):host 侧 checkpointTurn 生成,loop 原样写进
+   *  UserPromptSubmit 事件 → WAL,使 /resume 重建历史时能还原 msgId 供文件回退。缺省=不写。 */
+  msgId?: string;
 }
 
 export interface Agent {

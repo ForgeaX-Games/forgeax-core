@@ -14,6 +14,13 @@ function applied(id: string, range: EventRange, summary: string): CoreEvent {
 function revoked(targetId: string): CoreEvent {
   return { type: 'CompactionRevoked', ts: 0, payload: { targetId } };
 }
+// rewind:遮蔽区间(无 replacement),可撤销。
+function rewApplied(id: string, range: EventRange): CoreEvent {
+  return { type: 'RewindApplied', ts: 0, payload: { id, range } };
+}
+function rewRevoked(targetId: string): CoreEvent {
+  return { type: 'RewindRevoked', ts: 0, payload: { targetId } };
+}
 
 const adapter: FoldAdapter<string> = {
   isMessage: (e) => e.type === 'Message',
@@ -24,6 +31,10 @@ const adapter: FoldAdapter<string> = {
   appliedRange: (e) => (e.payload as { range: EventRange }).range,
   appliedReplacement: (e) => (e.payload as { summary: string }).summary,
   revokedAppliedId: (e) => (e.payload as { targetId: string }).targetId,
+  isRewindApplied: (e) => e.type === 'RewindApplied',
+  isRewindRevoked: (e) => e.type === 'RewindRevoked',
+  rewindRange: (e) => (e.payload as { range: EventRange }).range,
+  revokedRewindId: (e) => (e.payload as { targetId: string }).targetId,
 };
 
 describe('foldEvents', () => {
@@ -84,5 +95,57 @@ describe('foldEvents', () => {
   test('all range collapses everything to one replacement', () => {
     const events = [msg('1', 'a'), msg('2', 'b'), applied('C', { kind: 'all' }, '[everything]')];
     expect(foldEvents(events, adapter)).toEqual(['[everything]']);
+  });
+});
+
+// ─── H-01: rewind 遮蔽(无 replacement,与 compaction 的替换语义区别)──────────────
+describe('foldEvents — rewind mask', () => {
+  test('rewind range → covered messages skipped entirely (no replacement)', () => {
+    const events = [
+      msg('1', 'a'),
+      msg('2', 'b'),
+      msg('3', 'c'),
+      rewApplied('R', { kind: 'byEventId', ids: ['2', '3'] }),
+    ];
+    expect(foldEvents(events, adapter)).toEqual(['a']);
+  });
+
+  test('revoked rewind → messages restored', () => {
+    const events = [
+      msg('1', 'a'),
+      msg('2', 'b'),
+      msg('3', 'c'),
+      rewApplied('R', { kind: 'byEventId', ids: ['2', '3'] }),
+      rewRevoked('R'),
+    ];
+    expect(foldEvents(events, adapter)).toEqual(['a', 'b', 'c']);
+  });
+
+  test('rewind is judged before compaction: a compaction inside a rewound range is fully masked', () => {
+    // 嵌套:rewind 区间 [2..4] 内含 compaction 区间 [3..4]。rewind 先判 → 2/3/4 全遮蔽,
+    // compaction 的 replacement 也不产出(其锚点消息被 rewind 吃掉)。
+    const events = [
+      msg('1', 'a'),
+      msg('2', 'b'),
+      msg('3', 'c'),
+      msg('4', 'd'),
+      applied('C', { kind: 'byEventId', ids: ['3', '4'] }, '[compact]'),
+      rewApplied('R', { kind: 'byEventId', ids: ['2', '3', '4'] }),
+    ];
+    expect(foldEvents(events, adapter)).toEqual(['a']);
+  });
+
+  test('rewound then revoked with compaction still applied inside', () => {
+    // rewind 撤销后,内层 compaction 恢复生效:2 保留、3/4 压成 [compact]。
+    const events = [
+      msg('1', 'a'),
+      msg('2', 'b'),
+      msg('3', 'c'),
+      msg('4', 'd'),
+      applied('C', { kind: 'byEventId', ids: ['3', '4'] }, '[compact]'),
+      rewApplied('R', { kind: 'byEventId', ids: ['2', '3', '4'] }),
+      rewRevoked('R'),
+    ];
+    expect(foldEvents(events, adapter)).toEqual(['a', 'b', '[compact]']);
   });
 });

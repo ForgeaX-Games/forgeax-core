@@ -72,35 +72,14 @@ import { StatusLine } from '../components/StatusLine';
 import { ThinkingIndicator } from '../components/ThinkingIndicator';
 import { Queue } from '../components/Queue';
 
-/** 一条待跑的轮:本地输入(origin 省略)或远端来源(带回复定址)。 */
-type QueuedTurn = { prompt: string; origin?: RemoteOrigin; images?: ImageAttachment[] };
+/** 一条待跑的轮:本地输入(origin 省略)或远端来源(带回复定址)。msgId=回退锚点(H-02)。 */
+type QueuedTurn = { prompt: string; origin?: RemoteOrigin; images?: ImageAttachment[]; msgId?: string };
 
 // ─── UiMessage[] → SessionEntry[](梁② reduce 的输入,无损映射)─────────────────
 function toSessionLog(msgs: UiMessage[]): SessionEntry[] {
   return msgs.map((m) =>
     m.kind === 'user' ? { kind: 'user', text: m.text } : { kind: 'event', event: m.event },
   );
-}
-
-/** 从保留的会话条目重建喂给 agent 的历史(user 文本 + assistant 文本轮;工具轮从略)。 */
-function toHistory(msgs: UiMessage[]): ProviderMessage[] {
-  const out: ProviderMessage[] = [];
-  for (const m of msgs) {
-    if (m.kind === 'user') {
-      // 多模态:该轮带图 → content block 数组([text?, image...]);无图 → 纯字符串。
-      // 展开折叠粘贴占位回原文,再拼多模态(rewind/resume 重建历史时喂模型的是完整正文)。
-      out.push({ role: 'user', content: buildUserContent(expandPastes(m.text, m.pastes), m.images) });
-      continue;
-    }
-    if (m.event.type === 'assistant') {
-      const content = (m.event.message.payload as { content?: Array<{ type: string; text?: string }> })?.content;
-      const text = Array.isArray(content)
-        ? content.filter((b) => b.type === 'text' && typeof b.text === 'string').map((b) => b.text as string).join('')
-        : '';
-      if (text) out.push({ role: 'assistant', content: text });
-    }
-  }
-  return out;
 }
 
 /** 会话条目 → 回退点(每个 user 轮一个;keep = 该轮之前保留的条数)。
@@ -300,7 +279,7 @@ export function Repl(): React.ReactElement {
 
   // ── 跑一轮:把 AgentEvent reduce 进 session(有序日志)+ 更新状态栏 ──
   const runTurn = useCallback(
-    async (text: string, origin?: RemoteOrigin, images?: ImageAttachment[]) => {
+    async (text: string, origin?: RemoteOrigin, images?: ImageAttachment[], msgId?: string) => {
       busyRef.current = true;
       status.set({ busy: true, model: agent.model }); // 墙钟耗时由 StatusLineProvider 据 busy 自走(SSOT)
       tokenTickRef.current = 0;
@@ -347,7 +326,7 @@ export function Repl(): React.ReactElement {
             tokenTickRef.current = now;
             status.set({ tokens: agent.getContextTokens() });
           }
-        }, images);
+        }, images, msgId);
       } finally {
         busyRef.current = false;
         status.set({ busy: false, tokens: agent.getContextTokens() }); // elapsedMs 由 provider 在 busy 收尾时定格
@@ -493,10 +472,10 @@ export function Repl(): React.ReactElement {
           session.push({ kind: 'user', text, msgId });
           const expanded = cmd.expand(arg);
           if (busyRef.current) {
-            setQueued((q) => [...q, { prompt: expanded }]);
+            setQueued((q) => [...q, { prompt: expanded, msgId }]);
             return;
           }
-          await runTurn(expanded);
+          await runTurn(expanded, undefined, undefined, msgId);
           return;
         }
         await cmd.run(ctx, arg);
@@ -526,10 +505,10 @@ export function Repl(): React.ReactElement {
 
       // turn 进行中 → 排队(turn 结束后顺序发)。本地输入 origin 省略。喂模型用展开文本。
       if (busyRef.current) {
-        setQueued((q) => [...q, { prompt: modelText, images }]);
+        setQueued((q) => [...q, { prompt: modelText, images, msgId }]);
         return;
       }
-      await runTurn(modelText, undefined, images);
+      await runTurn(modelText, undefined, images, msgId);
     },
     [history, session, ctx, runTurn, agent],
   );
@@ -606,10 +585,10 @@ export function Repl(): React.ReactElement {
       session.push({ kind: 'user', text: display, msgId });
       // turn 在飞 → 排队(带 origin);否则即跑。跑的是原文 m.text,显示用标注 display。
       if (busyRef.current) {
-        setQueued((q) => [...q, { prompt: m.text, origin }]);
+        setQueued((q) => [...q, { prompt: m.text, origin, msgId }]);
         return;
       }
-      void runTurn(m.text, origin);
+      void runTurn(m.text, origin, undefined, msgId);
     },
     [agent, session, runTurn],
   );
@@ -626,7 +605,7 @@ export function Repl(): React.ReactElement {
     if (queued.length === 0) return;
     const [next, ...rest] = queued;
     setQueued(rest);
-    void runTurn(next!.prompt, next!.origin, next!.images);
+    void runTurn(next!.prompt, next!.origin, next!.images, next!.msgId);
   }, [status.busy, queued, runTurn]);
 
   // turn 结束后复位 interrupt 标记,允许下一轮再 abort。
@@ -660,13 +639,15 @@ export function Repl(): React.ReactElement {
           return;
         }
         const cp = pick.cp;
-        const kept = session.messages.slice(0, cp.keep);
         // ⚠️ 先把**全量** messages 交给 driver 存 pre 快照(Redo 用),再截断屏上。
+        //   keepUserTurns = 保留前缀里的用户轮数(WAL 遮蔽 boundary 锚点);下一轮历史由 driver
+        //   从 WAL fold(H-03),不再在此有损重建。
+        const keepUserTurns = session.messages.slice(0, cp.keep).filter((m) => m.kind === 'user').length;
         const r = await agent.rewind({
           msgId: cp.msgId,
           hasCode: cp.hasCode,
+          keepUserTurns,
           currentMessages: session.messages,
-          targetHistory: toHistory(kept),
         });
         if ('error' in r) {
           replaceTranscript(() => session.push(noticeMsg(`回退失败:${r.error}`)));

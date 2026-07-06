@@ -22,9 +22,12 @@ export class ReadTracker {
   /** path → 累计读次数。 */
   private readonly counts = new Map<string, number>();
 
-  /** 记一次读,返回该 path 累加后的新次数(便于调用方就地取用)。 */
+  /** 记一次读,返回该 path 累加后的新次数(便于调用方就地取用)。
+   *  重读时把 path 移到 Map 末尾(delete+set)→ 保持「最近读在后」的插入序,供
+   *  `recentPaths()` 产出最近优先列表(D-01 压后重挂自取)。 */
   record(path: string): number {
     const n = (this.counts.get(path) ?? 0) + 1;
+    this.counts.delete(path);
     this.counts.set(path, n);
     return n;
   }
@@ -32,6 +35,11 @@ export class ReadTracker {
   /** 当前累计读次数(未读过 → 0)。 */
   count(path: string): number {
     return this.counts.get(path) ?? 0;
+  }
+
+  /** 最近读过的文件路径,**最新在前**(D-01 压后重挂的数据源:loop 自取自己的 tracker)。 */
+  recentPaths(): string[] {
+    return [...this.counts.keys()].reverse();
   }
 
   /**
@@ -47,34 +55,5 @@ export class ReadTracker {
   /** 清空(测试 / run 复用时重置)。 */
   reset(): void {
     this.counts.clear();
-  }
-}
-
-/** RecentReads 默认容量(压后重挂只取最前 1~几个,32 足够且有界)。 */
-export const DEFAULT_RECENT_READS_CAP = 32;
-
-/**
- * 最近读文件路径的**有序**环形缓冲(CORE-CTX-004 压后重挂用)。与 ReadTracker(只计次)
- * 正交:这里保「最近读的在最前 + 去重 + 有界」的顺序,供 post-compact-rehydrate 的
- * `recentReadPaths()` 消费。host 在装配期订阅 ToolCallRequested,取 read 类工具的
- * file_path 喂 `record`。纯结构、无 IO、无 import。
- */
-export class RecentReads {
-  private readonly paths: string[] = [];
-
-  constructor(private readonly cap: number = DEFAULT_RECENT_READS_CAP) {}
-
-  /** 记一次读:该 path 移到最前(已存在则先摘除,实现「最近优先」去重),超容量截尾。 */
-  record(path: string): void {
-    if (!path) return;
-    const i = this.paths.indexOf(path);
-    if (i >= 0) this.paths.splice(i, 1);
-    this.paths.unshift(path);
-    if (this.paths.length > this.cap) this.paths.length = this.cap;
-  }
-
-  /** 最近优先的路径快照(最新在前)。 */
-  list(): readonly string[] {
-    return this.paths.slice();
   }
 }

@@ -45,7 +45,7 @@ describe('driver checkpoint (real file rewind)', () => {
       const diff = driver.previewRewind(m1!);
       expect(diff?.filesChanged).toContain('foo.ts');
 
-      const r = await driver.rewind({ msgId: m1!, hasCode: true, currentMessages: [], targetHistory: [] });
+      const r = await driver.rewind({ msgId: m1!, hasCode: true, keepUserTurns: 0, currentMessages: [] });
       expect(r).not.toHaveProperty('error');
       // ★ 关键断言:盘上文件真的被还原
       expect(readFileSync(join(tmp, 'foo.ts'), 'utf-8')).toBe('v1\n');
@@ -61,7 +61,7 @@ describe('driver checkpoint (real file rewind)', () => {
       writeFileSync(join(tmp, 'new.ts'), 'created\n'); // 这一轮新建
       driver.checkpointTurn(); // m2(含 new.ts)
 
-      const r = await driver.rewind({ msgId: m1!, hasCode: true, currentMessages: [], targetHistory: [] });
+      const r = await driver.rewind({ msgId: m1!, hasCode: true, keepUserTurns: 0, currentMessages: [] });
       expect(r).not.toHaveProperty('error');
       expect(existsSync(join(tmp, 'new.ts'))).toBe(false); // 干净还原:删掉
     } finally {
@@ -76,7 +76,7 @@ describe('driver checkpoint (real file rewind)', () => {
       const m1 = driver.checkpointTurn();
       writeFileSync(join(tmp, 'foo.ts'), 'v2\n');
 
-      await driver.rewind({ msgId: m1!, hasCode: true, currentMessages: [], targetHistory: [] });
+      await driver.rewind({ msgId: m1!, hasCode: true, keepUserTurns: 0, currentMessages: [] });
       expect(readFileSync(join(tmp, 'foo.ts'), 'utf-8')).toBe('v1\n');
 
       const r = await driver.cancelRewind();

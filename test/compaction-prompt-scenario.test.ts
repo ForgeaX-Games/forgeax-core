@@ -34,13 +34,7 @@ describe('Stream D — prompt scenario + summary quality (#2/#3)', () => {
     expect(p).toContain('REMINDER');
   });
 
-  test('D-U2 partial:保旧压新措辞,异于 full', () => {
-    const p = getCompactPrompt('partial');
-    expect(p).toContain('RECENT portion');
-    expect(p).toContain('kept intact');
-    expect(p).not.toBe(getCompactPrompt('full'));
-    for (const h of NINE_SECTIONS) expect(p).toContain(h); // 仍含 9 段骨架
-  });
+  // (D-U2 partial 场景已随 D-01 删除:该 scenario 从无调用方,按闭合 union 移除。)
 
   test('D-U3 pre-message:预压场景模板', () => {
     const p = getCompactPrompt('pre-message');

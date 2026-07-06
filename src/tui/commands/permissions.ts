@@ -2,7 +2,7 @@
  *  driver.getPermissionRules / setPermissionMode。
  *  Boundary(HOST 层):仅 core 相对 import。 */
 import { registerCommand } from './registry';
-import { coercePermissionMode, PERMISSION_MODES } from '../../permission/inspect';
+import { coercePermissionMode, formatRuleView, PERMISSION_MODES, type PermissionRuleView } from '../../permission/inspect';
 
 registerCommand({
   name: 'permissions',
@@ -20,8 +20,10 @@ registerCommand({
       return;
     }
     const v = ctx.getPermissionRules();
-    const bucket = (label: string, arr: { display: string }[]): string =>
-      arr.length ? `${label}:\n  ${arr.map((r) => r.display).join('\n  ')}` : `${label}:(空)`;
+    // E-02 #4:展示规则来源(settings.permissions.* / 交互式 always-allow 等),便于用户
+    //   知道每条规则从哪来。
+    const bucket = (label: string, arr: PermissionRuleView[]): string =>
+      arr.length ? `${label}:\n  ${arr.map(formatRuleView).join('\n  ')}` : `${label}:(空)`;
     ctx.print(
       [
         `权限模式:${v.mode}`,

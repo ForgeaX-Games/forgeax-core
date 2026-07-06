@@ -56,7 +56,7 @@ function terminalNotice(reason: string, error?: unknown): { level: 'info' | 'war
   if (reason === 'max_turns' || reason === 'blocking_limit' || reason === 'token_budget_continuation') {
     return { level: 'warn', text: `已停止:${reason}` };
   }
-  // model_error / prompt_too_long / image_error / unrecoverable_tool_error / 其余 → error。
+  // model_error / prompt_too_long / unrecoverable_tool_error / 其余 → error。
   //   带上真实错误详情,否则用户只看到「model_error」无从排查。
   const detail = errorDetail(error);
   return { level: 'error', text: detail ? `异常终止:${reason} — ${detail}` : `异常终止:${reason}` };

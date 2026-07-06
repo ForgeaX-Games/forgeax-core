@@ -27,7 +27,25 @@ import type {
   PermissionResult,
   ToolContext,
 } from '../capability/types';
-import { matchRule, normalizeRules, type PermissionRuleSet } from './rules';
+import { matchRule, normalizeRules, type PermissionRule, type PermissionRuleSet } from './rules';
+
+/**
+ * 按工具的 **name + aliases** 逐一匹配规则(alias 归一)。用户按 CC 习惯写
+ * `Bash(rm *)` / `Write`,而 core 工具真实 name 是 `bash` / `write_file`(alias 才是
+ * `Bash` / `Write`)。只按 tool.name 匹配会让声明式 deny/ask 形同虚设(E-02)。
+ */
+function matchToolRule<I>(
+  rules: ReadonlyArray<PermissionRule>,
+  tool: AgentTool<I>,
+  input: unknown,
+): PermissionRule | undefined {
+  const names = [tool.name, ...(tool.aliases ?? [])];
+  for (const n of names) {
+    const m = matchRule(rules, n, input);
+    if (m) return m;
+  }
+  return undefined;
+}
 
 /** 权限模式(工具权限上下文 mode 的相关子集 + plan/acceptEdits)。
  *  - default          :标准 8 步把闸。
@@ -188,11 +206,11 @@ export async function checkRuleBasedPermissions<I>(
   const ruleSet = normalizeRules(rules);
 
   // ① deny rule
-  const deny = matchRule(ruleSet.deny, tool.name, input);
+  const deny = matchToolRule(ruleSet.deny, tool, input);
   if (deny) return denyByRule(tool.name, deny.source);
 
   // ② ask rule
-  const ask = matchRule(ruleSet.ask, tool.name, input);
+  const ask = matchToolRule(ruleSet.ask, tool, input);
   if (ask) return askByRule(tool.name, ask.source);
 
   // ③ tool.checkPermissions —— 只取 deny 分支(content-specific deny)
@@ -233,11 +251,11 @@ export async function hasPermissionsToUseTool<I>(
   const mode: PermissionMode = options?.mode ?? 'default';
 
   // ① deny rule → deny
-  const deny = matchRule(ruleSet.deny, tool.name, input);
+  const deny = matchToolRule(ruleSet.deny, tool, input);
   if (deny) return denyByRule(tool.name, deny.source);
 
   // ② ask rule → ask
-  const ask = matchRule(ruleSet.ask, tool.name, input);
+  const ask = matchToolRule(ruleSet.ask, tool, input);
   if (ask) return askByRule(tool.name, ask.source);
 
   // ②.5 plan 模式:只读强制——非只读工具(ExitPlanMode 例外)直接 deny。
@@ -317,7 +335,7 @@ export async function hasPermissionsToUseTool<I>(
   }
 
   // ⑦ always-allow rule → allow
-  const allow = matchRule(ruleSet.allow, tool.name, input);
+  const allow = matchToolRule(ruleSet.allow, tool, input);
   if (allow) {
     return {
       behavior: 'allow',

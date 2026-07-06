@@ -2,7 +2,8 @@
  * Builtin file tools (②) — `read_file` / `write_file` / `edit_file`.
  *
  * 文件工具语义:
- *   - read 只读 + 并发安全 + maxResultSizeChars=Infinity（永不 persist）；
+ *   - read 只读 + 并发安全 + maxResultSizeChars 有界(C-01:默认读前 2000 行 + 单行
+ *     2000 字符截断 + 100KB 结果预算,让 LOOP 全局兜底对 read 生效,防单次读打爆 context);
  *   - write / edit 非只读 + 非并发安全（buildTool 默认 fail-closed），对内容做实际
  *     修改（二者均不声明并发安全）。
  *
@@ -82,6 +83,20 @@ function toResultEvent(
 
 // ─── read_file ───────────────────────────────────────────────────────────────
 
+/** 不传 limit 时默认读的行数上限(对齐 cbc 2000 行)。防无参 read 打爆 context。 */
+export const DEFAULT_READ_LINE_LIMIT = 2000;
+/** 单行字符上限(对齐 cbc 2000 字符)。防超长单行(minified JS)绕过行数闸。 */
+export const MAX_READ_LINE_CHARS = 2000;
+/** read_file 结果字符预算:有界(非 Infinity)让 LOOP 全局兜底(agent.ts)对 read 生效。 */
+export const READ_FILE_MAX_RESULT_CHARS = 100_000;
+
+/** 单行超长时截断 + 行内 marker(便于人/模型识别被裁)。≤上限原样返回。 */
+function truncateLine(line: string): string {
+  if (line.length <= MAX_READ_LINE_CHARS) return line;
+  const omitted = line.length - MAX_READ_LINE_CHARS;
+  return `${line.slice(0, MAX_READ_LINE_CHARS)} … [line truncated ${omitted} chars]`;
+}
+
 export interface ReadFileInput {
   file_path: string;
   /** 起始行(1-based，含)。省略=从头读。 */
@@ -119,7 +134,7 @@ export function readFileTool(): AgentTool<ReadFileInput, ReadFileOutput> {
         },
         limit: {
           type: 'number',
-          description: 'The number of lines to read. Only provide if the file is too large to read at once.',
+          description: `The number of lines to read. Defaults to the first ${DEFAULT_READ_LINE_LIMIT} lines; use offset/limit to page through larger files.`,
         },
         pages: {
           type: 'string',
@@ -129,8 +144,8 @@ export function readFileTool(): AgentTool<ReadFileInput, ReadFileOutput> {
       required: ['file_path'],
       additionalProperties: false,
     },
-    // read 永不超限 persist（maxResultSizeChars=Infinity）。
-    maxResultSizeChars: Infinity,
+    // C-01:有界结果预算(非 Infinity)→ LOOP 全局兜底(agent.ts toolResultsToContent)对 read 生效。
+    maxResultSizeChars: READ_FILE_MAX_RESULT_CHARS,
     isReadOnly: () => true,
     isConcurrencySafe: () => true,
     async call(input, ctx): Promise<{ data: ReadFileOutput }> {
@@ -141,14 +156,20 @@ export function readFileTool(): AgentTool<ReadFileInput, ReadFileOutput> {
       // ── 多模态分支:先判图片(扩展名命中,或无扩展名时读前 12 字节验魔数)──
       const imageOut = await tryReadImage(fs, input.file_path);
       if (imageOut) return { data: imageOut };
-      // ── 文本路径(零回归)──
+      // ── 文本路径 ──
       const raw = await fs.readText(input.file_path);
       const allLines = raw.split('\n');
       const totalLines = allLines.length;
       const start = input.offset && input.offset > 0 ? input.offset - 1 : 0;
-      const end = input.limit && input.limit > 0 ? start + input.limit : totalLines;
-      const slice = allLines.slice(start, end);
-      const content = addLineNumbers(slice.join('\n'), start + 1);
+      // C-01:不传 limit → 默认只读前 DEFAULT_READ_LINE_LIMIT 行(防无参 read 打爆 context)。
+      const effectiveLimit = input.limit && input.limit > 0 ? input.limit : DEFAULT_READ_LINE_LIMIT;
+      const end = Math.min(start + effectiveLimit, totalLines);
+      const slice = allLines.slice(start, end).map(truncateLine); // 单行超长截断
+      let content = addLineNumbers(slice.join('\n'), start + 1);
+      // 还有未返回的行 → 追加分页提示(不进行号,让模型知道用 offset/limit 续读)。
+      if (end < totalLines) {
+        content += `\n\n[read_file: showing lines ${start + 1}-${end} of ${totalLines}. Use offset/limit to read more.]`;
+      }
       return {
         data: { file_path: input.file_path, content, numLines: slice.length, totalLines },
       };

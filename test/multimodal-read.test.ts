@@ -270,11 +270,11 @@ describe('read_file multimodal', () => {
     expect((ev.payload as Record<string, unknown>).imageBlocks).toBeUndefined();
   });
 
-  test('predicates unchanged: read-only + concurrency-safe + maxResultSizeChars=Infinity', () => {
+  test('predicates unchanged: read-only + concurrency-safe + maxResultSizeChars bounded (C-01)', () => {
     const t = readFileTool();
     expect(t.isReadOnly({ file_path: '/a' })).toBe(true);
     expect(t.isConcurrencySafe({ file_path: '/a' })).toBe(true);
-    expect(t.maxResultSizeChars).toBe(Infinity);
+    expect(Number.isFinite(t.maxResultSizeChars)).toBe(true);
   });
 
   test('inputJSONSchema exposes pages param (PDF forward-compat)', () => {

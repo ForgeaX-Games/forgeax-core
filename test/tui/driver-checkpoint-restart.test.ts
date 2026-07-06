@@ -48,7 +48,7 @@ describe('driver checkpoint restart (pendingRewind survives restart)', () => {
 
       writeFileSync(join(tmp, 'foo.ts'), 'v2\n');
 
-      const r = await d1.rewind({ msgId: m1!, hasCode: true, currentMessages: [], targetHistory: [] });
+      const r = await d1.rewind({ msgId: m1!, hasCode: true, keepUserTurns: 0, currentMessages: [] });
       expect(r).not.toHaveProperty('error');
       // 第一个 driver 挂起态已建立
       expect(d1.pendingRewind()).not.toBeNull();
@@ -74,7 +74,7 @@ describe('driver checkpoint restart (pendingRewind survives restart)', () => {
     try {
       writeFileSync(join(tmp, 'foo.ts'), 'v1\n');
       const m1 = d1.checkpointTurn();
-      await d1.rewind({ msgId: m1!, hasCode: true, currentMessages: [], targetHistory: [] });
+      await d1.rewind({ msgId: m1!, hasCode: true, keepUserTurns: 0, currentMessages: [] });
       d1.finalizeRewind(); // 定格:挂起态消失
       expect(d1.pendingRewind()).toBeNull();
     } finally {

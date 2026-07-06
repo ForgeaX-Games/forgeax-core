@@ -1,8 +1,8 @@
 /**
  * CORE-CTX 修复单测(上下文/压缩子系统):
  *   - CTX-001:水位 token 计数补 cache_creation(cache-写入轮不再低估 prompt 规模)。
- *   - CTX-004:RecentReads 有序缓冲(压后重挂取最近读文件)。
  *   - CTX-005:agent 注入 persistToolResult → 超限 tool 结果落盘,marker 带回读路径。
+ *   （CTX-004 压后重挂改由 D-01 的 loop 自取机制承担,单测见 test/post-compact-rehydrate.test.ts。）
  */
 import { test, expect, describe } from 'bun:test';
 import { CoreAgent } from '../src/agent/agent';
@@ -10,7 +10,6 @@ import { buildTool, type AgentTool } from '../src/capability/types';
 import type { AgentContext, AgentEvent } from '../src/agent/types';
 import type { LLMProvider, ProviderRequest, ProviderStreamEvent, Usage } from '../src/provider/types';
 import { EMPTY_USAGE } from '../src/provider/types';
-import { RecentReads, DEFAULT_RECENT_READS_CAP } from '../src/capability/read-tracker';
 
 function ctx(tools: AgentTool[], provider: LLMProvider, maxTurns = 16): AgentContext {
   return {
@@ -69,37 +68,6 @@ describe('CORE-CTX-001 — 水位 token 计数含 cache_creation', () => {
     if (turnEnd?.type === 'turn_end') {
       expect(turnEnd.usageContextRatio).toBeCloseTo(5900 / 200_000, 6);
     }
-  });
-});
-
-// ─── CORE-CTX-004 ───────────────────────────────────────────────────────────
-describe('CORE-CTX-004 — RecentReads 有序缓冲', () => {
-  test('最近读在最前 + 去重', () => {
-    const r = new RecentReads();
-    r.record('a');
-    r.record('b');
-    r.record('c');
-    expect(r.list()).toEqual(['c', 'b', 'a']);
-    r.record('a'); // 重读 a → 移到最前,去重(不出现两次)
-    expect(r.list()).toEqual(['a', 'c', 'b']);
-  });
-
-  test('空路径忽略;容量有界(截尾最旧)', () => {
-    const r = new RecentReads(3);
-    r.record('');
-    expect(r.list()).toEqual([]);
-    r.record('a');
-    r.record('b');
-    r.record('c');
-    r.record('d'); // 超容量 3 → 挤掉最旧的 a
-    expect(r.list()).toEqual(['d', 'c', 'b']);
-  });
-
-  test('默认容量导出可用', () => {
-    expect(DEFAULT_RECENT_READS_CAP).toBeGreaterThan(0);
-    const r = new RecentReads();
-    for (let i = 0; i < DEFAULT_RECENT_READS_CAP + 5; i++) r.record(`f${i}`);
-    expect(r.list().length).toBe(DEFAULT_RECENT_READS_CAP);
   });
 });
 

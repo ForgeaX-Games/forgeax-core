@@ -334,7 +334,7 @@ describe('ForgeaxCoreKernel — TurnRequest.permissionMode 起始模式(P0.3)', 
   });
 });
 
-// CORE-CTX-004 — 压后重挂在 facade host 真被装配(readBus 记录读 → 注入 rehydrate → 压后重挂)。
+// CORE-CTX-004 — 压后重挂在 facade host 真被装配(D-01:loop 内部 read-tracker 记读 → 注入 rehydrate → 压后重挂)。
 //   验证「dead code 已接线」:发现者报的 bug 是 3 个 host 从不注入 rehydrate。这里驱动真 kernel:
 //   turn0 读文件(usage 撑大 → 越 emergency),turn1 触发压缩,断言压后请求含 re-attach 消息。
 describe('ForgeaxCoreKernel — 压后重挂 host 接线(CORE-CTX-004)', () => {

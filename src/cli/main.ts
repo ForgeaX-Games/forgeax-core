@@ -35,13 +35,11 @@ import { resolveProvider } from '../provider/register';
 import type { LLMProvider, ProviderStreamEvent, Usage, ProviderRequest } from '../provider/types';
 import { EMPTY_USAGE } from '../provider/types';
 import { makeProviderCompactSummarize } from '../context/compaction-llm';
+import { makeRehydrateInjection } from '../context/post-compact-rehydrate';
 import { microCompact } from '../context/micro-compaction';
 import { contextWindowForModel } from '../context/model-window';
 import { describeWindowOverride } from '../context/watermarks';
 import { lookupModelContext } from '../context/model-context-table';
-import { RecentReads } from '../capability/read-tracker';
-import { CoreEventType } from '../events/events';
-import type { SandboxFs } from '../inject/types';
 import type { ProviderMessage } from '../provider/types';
 import { NodeSandboxFs, NodeTerminal, makeNodeBackgroundSpawn } from './io';
 import { BackgroundShellRegistry } from '../capability/builtin-tools/shell-registry';
@@ -207,7 +205,8 @@ export function buildContext(args: CliArgs, providerOverride?: LLMProvider): Age
     resolveSystem: (t) =>
       resolveSubagentSystem(registry, t, `You are a ${t ?? 'general'} subagent of forgeax-core. Do the task and report the result concisely.`)!,
     toolContext,
-    compactionV2: { summarize: makeProviderCompactSummarize(provider, args.model) }, // subagent 自压缩(V2)
+    // subagent 自压缩(V2)+ 压后重挂(D-01)。
+    compactionV2: { summarize: makeProviderCompactSummarize(provider, args.model), rehydrate: makeRehydrateInjection(toolContext) },
     contextWindow: contextWindowForModel(args.model),
     // 子 agent 兜底上限;某 agent 的 frontmatter `max-turns` 仍可逐类收紧(对齐 cc)。
     maxTurns: DEFAULT_SUBAGENT_MAX_TURNS,
@@ -252,8 +251,6 @@ export interface RunTurnOpts {
   /** 权限规则集(楔子1 · 046):从 settings.permissions 载出。runCli 传 host.rules;
    *  不传则无 settings 规则(默认 tier 行为不变)。 */
   rules?: Partial<PermissionRuleSet> | null;
-  /** CORE-CTX-004:最近读文件缓冲(runCli 订阅 bus 后传入);压后重挂取最前重挂。 */
-  recentReads?: RecentReads;
   /** CORE-CTX-005:大结果落盘钩子(runCli 据 sessionsDir 构造);截断超限结果时全量落盘可回读。 */
   persistToolResult?: (raw: string, meta: { toolUseId: string; toolName: string }) => string | undefined;
 }
@@ -279,17 +276,10 @@ export async function runTurn(
     thinking: opts.thinking,
     steeringSource: opts.steeringSource,
     ...(opts.inbox ? { inbox: opts.inbox } : {}), // team:coordinator 收 peer 回报(既有 inbox 接缝)
-    // 主 loop 到水位自压缩(V2)。CORE-CTX-004:注入 rehydrate,压后重挂最近读的文件。
+    // 主 loop 到水位自压缩(V2)+ 压后重挂最近读文件(D-01;recentReadPaths 由 loop 自取)。
     compactionV2: {
       summarize: makeProviderCompactSummarize(context.provider, context.config.model),
-      ...(opts.recentReads
-        ? {
-            rehydrate: {
-              recentReadPaths: () => opts.recentReads!.list(),
-              readFile: async (p: string) => (context.toolContext.sandboxFs as SandboxFs).readText(p),
-            },
-          }
-        : {}),
+      rehydrate: makeRehydrateInjection(context.toolContext),
     },
     microCompact: (msgs: ProviderMessage[]) => microCompact(msgs, { now: Date.now() }), // 每轮 time-based micro
     // CORE-CTX-005:大结果落盘钩子(host/sessionDir 领地);缺省不注入 → 旧行为。
@@ -489,13 +479,6 @@ export async function runCli(argv: string[], providerOverride?: LLMProvider): Pr
       })
     : undefined;
 
-  // CORE-CTX-004:订阅一次 host bus 的读事件,recentReads 跨 REPL 轮保留(每轮 runTurn 用同一份)。
-  const recentReads = new RecentReads();
-  bus.subscribe(CoreEventType.ToolCallRequested, (e) => {
-    const p = (e as { payload?: { input?: { file_path?: unknown } } }).payload?.input?.file_path;
-    if (typeof p === 'string' && p) recentReads.record(p);
-    return undefined;
-  });
   // CORE-CTX-005:大结果落盘到 <sessionsDir>/<sid>/tool-results/<id>.txt(best-effort)。
   const persistBaseDir = resolvePath(args.sessionsDir ?? defaultSessionsDir(), sessionId ?? 'default', 'tool-results');
   const persistToolResult = (raw: string, meta: { toolUseId: string }): string | undefined => {
@@ -525,7 +508,6 @@ export async function runCli(argv: string[], providerOverride?: LLMProvider): Pr
     thinking: thinkingFromArg(args.thinking),
     store,
     rules,
-    recentReads,
     persistToolResult,
     ...(host.coordinatorInbox ? { inbox: host.coordinatorInbox } : {}),
   };

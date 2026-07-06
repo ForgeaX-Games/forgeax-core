@@ -8,8 +8,11 @@
  *  - 索引:<sessionsDir>/<sessionId>/checkpoints.jsonl(append-only),重启可重建。
  *
  *  与 forgeax-cli 同名实现的差异:剥掉 Session / ledger / eventBus / 多 agent 耦合
- *  与 interruptAgents(打断在飞轮由 driver 在调本类前 abort());对话 boundary 不写 WAL、
- *  不发 mask 事件 —— 由 driver 持有的 convo/messages 内存快照承担(见 driver useAgent)。
+ *  与 interruptAgents(打断在飞轮由 driver 在调本类前 abort())。本类只管**文件侧**回退
+ *  (CAS 快照 + checkpoints.jsonl 索引);对话侧的挂起态由 driver 的内存快照承担。
+ *  H-01 起,回退/Redo 另由 driver 向**会话 WAL**(events.jsonl)append append-only 的
+ *  `rewind.applied`/`rewind.revoked` 遮蔽事件(见 driver useAgent.rewind/cancelRewind),
+ *  使 /resume 重建历史时排除被回退轮次——WAL 这份「真相」与内存快照一致,不再各说各话。
  *  单会话:core TUI 一进程一会话,故不维护 sessions map。
  *
  *  并发:per-instance promise 链互斥,所有 restore 类操作串行。
