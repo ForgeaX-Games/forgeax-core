@@ -138,6 +138,10 @@ export interface CoreAgentOptions {
   autoMemory?: AutoMemoryHook;
   /** micro-compaction(**每轮** pre-API 清旧 tool result,time-based)。纯函数,缺省不跑。 */
   microCompact?: (messages: ProviderMessage[]) => ProviderMessage[];
+  /** ★ CORE-CTX-005:超限 tool 结果被 head-tail 截断时,把**全量** raw 落盘的钩子
+   *  (host/sessionDir 领地,故注入而非 core 内置)。返回可回读路径 → marker 追加
+   *  `; full result at <path>`,模型可 read 回捞中段。缺省不注入 → 截断即中段永久丢(旧行为)。 */
+  persistToolResult?: (raw: string, meta: { toolUseId: string; toolName: string }) => string | undefined;
   /** 交互式权限:'ask' 判定时咨询 host(REPL 提示);无则 fail-closed deny。 */
   askUser?: AskUserFn;
   /** thinking(扩展思考)请求配置;缺省=不开。透传到 provider(anthropic 已支持)。 */
@@ -383,11 +387,16 @@ function foldHandoffEvents(events: CoreEvent[]): string {
 function toolResultsToContent(
   results: { toolUseId: string; toolName: string; result: CoreEvent; isError: boolean; newMessages?: CoreEvent[] }[],
   budgetFor?: (toolName: string) => number,
+  persist?: (raw: string, meta: { toolUseId: string; toolName: string }) => string | undefined,
 ): unknown {
   const blocks: unknown[] = results.map((r) => {
     // 全局预算兜底(移植 agentic_os 03.B):单 tool 声明 maxResultSizeChars,这里统一裁。
     const max = budgetFor?.(r.toolName) ?? Infinity;
-    const { output } = applyResultBudget(toolResultContent(r.result.payload), max);
+    // CORE-CTX-005:注入了 persist → 截断时全量落盘,marker 带回读路径;缺省不落盘(旧行为)。
+    const opts = persist
+      ? { persist: (raw: string) => persist(raw, { toolUseId: r.toolUseId, toolName: r.toolName }) }
+      : undefined;
+    const { output } = applyResultBudget(toolResultContent(r.result.payload), max, opts);
     // 多模态(011):工具(如 read_file 读图)在 payload 带 imageBlocks → tool_result.content
     //   组成 content 数组 [text, image…]。Anthropic 原样吃图;openai-compat 的
     //   toolResultToText 只取 text 块 → 优雅降级(丢图留文,不 400)。
@@ -879,8 +888,14 @@ export class CoreAgent implements Agent {
           if (sev.type === 'assistant') {
             assistantMessage = sev.message;
             stopReason = sev.stopReason;
-            // 记下本轮实际送入的 prompt token(input + cache read),供下一轮水位判定。
-            lastPromptTokens = (sev.usage.inputTokens ?? 0) + (sev.usage.cacheReadInputTokens ?? 0);
+            // 记下本轮实际送入的 prompt token,供下一轮水位判定。Anthropic 的 prompt 输入侧
+            //   = input + cache_creation + cache_read 三者和;漏掉 cache_creation 会在「前缀
+            //   刚被写入 cache」的轮(首轮 / 压缩后 / cache boundary 抖动)只剩 input(几百),
+            //   低估已缓存前缀一个数量级 → 水位读数震荡、压缩漏触发(CORE-CTX-001)。
+            lastPromptTokens =
+              (sev.usage.inputTokens ?? 0) +
+              (sev.usage.cacheCreationInputTokens ?? 0) +
+              (sev.usage.cacheReadInputTokens ?? 0);
             if (sev.usage.outputTokens) turnOutputTokens = sev.usage.outputTokens;
           } else if (sev.type === 'message_delta') {
             stopReason = sev.stopReason;
@@ -1178,7 +1193,7 @@ export class CoreAgent implements Agent {
       // 防御:任何未配到结果的工具 span(理论不应有)也收尾,绝不泄漏未 end 的 span。
       for (const ts of toolSpans.values()) ts.end();
       toolSpans.clear();
-      messages.push({ role: 'user', content: toolResultsToContent(results, budgetFor) });
+      messages.push({ role: 'user', content: toolResultsToContent(results, budgetFor, this.o.persistToolResult) });
 
       // 循环兜底(移植 02.4):同一工具(name+args)连续报错达阈值 → 终止,避免空转烧 maxTurns。
       //   模型已见到本轮错误结果(上一行已 push),但不再续轮重试同一失败动作。

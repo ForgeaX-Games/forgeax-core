@@ -5,7 +5,7 @@
  */
 import { test, expect, describe } from 'bun:test';
 import { ForgeaxCoreKernel, translateNeutral } from '../src/kernel-facade/forgeax-core-kernel';
-import type { LLMProvider, ProviderStreamEvent, Usage } from '../src/provider/types';
+import type { LLMProvider, ProviderRequest, ProviderStreamEvent, Usage } from '../src/provider/types';
 import { EMPTY_USAGE } from '../src/provider/types';
 import type { TurnRequest, KernelEvent } from '@forgeax/agent-runtime/contract';
 import type { HandoffSink, HandoffIntent } from '../src/inject/types';
@@ -331,6 +331,62 @@ describe('ForgeaxCoreKernel — TurnRequest.permissionMode 起始模式(P0.3)', 
     const tr = events.find((e) => e.kind === 'tool.result') as { ok: boolean } | undefined;
     expect(tr?.ok).toBe(true);
     expect(bridge).toBe(1);
+  });
+});
+
+// CORE-CTX-004 — 压后重挂在 facade host 真被装配(readBus 记录读 → 注入 rehydrate → 压后重挂)。
+//   验证「dead code 已接线」:发现者报的 bug 是 3 个 host 从不注入 rehydrate。这里驱动真 kernel:
+//   turn0 读文件(usage 撑大 → 越 emergency),turn1 触发压缩,断言压后请求含 re-attach 消息。
+describe('ForgeaxCoreKernel — 压后重挂 host 接线(CORE-CTX-004)', () => {
+  const readBig = {
+    type: 'assistant',
+    message: { role: 'assistant', content: [{ type: 'tool_use', id: 'r1', name: 'read_file', input: { file_path: '/x.ts' } }] },
+    usage: { ...EMPTY_USAGE, inputTokens: 190_000 } as Usage, // > emergency(opus 200k → 165600)
+    stopReason: 'tool_use',
+  } as ProviderStreamEvent;
+
+  /** 记录每次 provider 请求的 capturing + 按调用序脚本化 provider。 */
+  function capturing(scripts: ProviderStreamEvent[][]): { provider: LLMProvider; reqs: ProviderRequest[] } {
+    const reqs: ProviderRequest[] = [];
+    let call = 0;
+    return {
+      reqs,
+      provider: {
+        api: 'stub',
+        async *stream(r) {
+          reqs.push(r as ProviderRequest);
+          const t = scripts[Math.min(call, scripts.length - 1)];
+          call++;
+          for (const ev of t) yield ev;
+        },
+      },
+    };
+  }
+
+  test('toolContext 带 sandboxFs → 压后请求含 re-attach + 文件正文(接线生效)', async () => {
+    const cap = capturing([[readBig], [asstText('SUMMARY')], [asstText('done')]]);
+    const k = new ForgeaxCoreKernel({
+      provider: cap.provider,
+      executeTool: async () => ({ ok: true, content: 'file bytes' }),
+      toolContext: { sandboxFs: { readText: async (p: string) => `BODY-OF:${p}` } },
+    });
+    await collect(k, req({ callId: 'reh1', tools: [{ name: 'read_file', inputSchema: {} }] }));
+    const anyReattach = cap.reqs.some((r) => JSON.stringify(r.messages).includes('Re-attached after compaction'));
+    const anyBody = cap.reqs.some((r) => JSON.stringify(r.messages).includes('BODY-OF:/x.ts'));
+    expect(anyReattach).toBe(true);
+    expect(anyBody).toBe(true);
+  });
+
+  test('对照:toolContext 无 sandboxFs → rehydrate 不注入,压后无 re-attach(优雅降级)', async () => {
+    const cap = capturing([[readBig], [asstText('SUMMARY')], [asstText('done')]]);
+    const k = new ForgeaxCoreKernel({
+      provider: cap.provider,
+      executeTool: async () => ({ ok: true, content: 'file bytes' }),
+      // 不给 sandboxFs → rehydrateFs undefined → rehydrate 不接。
+    });
+    await collect(k, req({ callId: 'reh2', tools: [{ name: 'read_file', inputSchema: {} }] }));
+    const anyReattach = cap.reqs.some((r) => JSON.stringify(r.messages).includes('Re-attached after compaction'));
+    expect(anyReattach).toBe(false);
   });
 });
 

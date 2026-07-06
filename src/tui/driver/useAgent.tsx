@@ -57,8 +57,10 @@ import { makeEnvTokenProvider } from '../../cli/mcp-token';
 import { builtinSubagents } from '../../capability/agent/builtin/index';
 import { loadAgentDefs } from '../../capability/agent/index';
 import type { SandboxFs, AskQuestionFn } from '../../inject/types';
-import { readFileSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { resolve as resolvePath } from 'node:path';
+import { RecentReads } from '../../capability/read-tracker';
+import { describeWindowOverride } from '../../context/watermarks';
 import { randomUUID } from 'node:crypto';
 
 /** 上下文窗口占用口径(对齐 cc calculateContextPercentages):input + cacheCreation + cacheRead,
@@ -139,7 +141,47 @@ export function createAgentDriver(opts: DriverOptions, initial: HostContext): Ag
   //   assistant 收尾各重置一次,故静默时只剩纯 input+cache(对齐 cc 状态栏的「上下文占用」)。
   let liveOutChars = 0;
 
+  // ── CORE-CTX-004 压后重挂:最近读文件的有序缓冲(driver 级,跨 setModel 重建保留)。
+  //   makeAgent 订阅当前 bus 的 ToolCallRequested,把 read 类工具的 file_path 喂进来;
+  //   压缩后 rehydrate 取最前 1 个重挂,让模型不忘刚读的文件。
+  const recentReads = new RecentReads();
+  let unsubReads: (() => void) | undefined;
+  // ── CORE-CTX-005 大结果落盘:截断超限 tool 结果时把全量写 <sessionsDir>/<sid>/tool-results/<id>.txt,
+  //   返回路径供 marker 追加「full result at <path>」,模型可 read 回捞中段。best-effort,失败返回 undefined。
+  const toolResultsDir = (): string =>
+    resolvePath(opts.sessionsDir ?? defaultSessionsDir(), sessionId ?? 'default', 'tool-results');
+  const persistToolResult = (raw: string, meta: { toolUseId: string }): string | undefined => {
+    try {
+      const dir = toolResultsDir();
+      mkdirSync(dir, { recursive: true });
+      const path = resolvePath(dir, `${meta.toolUseId}.txt`);
+      writeFileSync(path, raw, 'utf8');
+      return path;
+    } catch {
+      return undefined; // 落盘失败 → 退回旧行为(截断无回读路径),不崩。
+    }
+  };
+
+  // ── CORE-CTX-002 诊断:FORGEAX_COMPACT_WINDOW 配得太小(会致每轮静默硬停)已被 watermarks
+  //   忽略回落真实窗口;此处装配期 warn 一次,让用户知道配置未生效。
+  {
+    const wo = describeWindowOverride(lookupModelContext(model));
+    if (wo.rejected) {
+      process.stderr.write(
+        `[forgeax-core] FORGEAX_COMPACT_WINDOW=${wo.requested} 低于有效下限 ${wo.floor}(reserve+基础提示+blocking),` +
+          `已忽略并回落模型真实窗口(避免每轮 blocking_limit 硬停)。\n`,
+      );
+    }
+  }
+
   function makeAgent(context: AgentContext, bus: HostContext['bus']): CoreAgent {
+    // 重订阅当前 bus 的读事件(setModel 重建换 bus 时先退订旧的,防泄漏)。
+    unsubReads?.();
+    unsubReads = bus.subscribe(CoreEventType.ToolCallRequested, (e) => {
+      const p = (e as { payload?: { input?: { file_path?: unknown } } }).payload?.input?.file_path;
+      if (typeof p === 'string' && p) recentReads.record(p);
+      return undefined;
+    });
     return new CoreAgent({
       context,
       bus,
@@ -154,8 +196,17 @@ export function createAgentDriver(opts: DriverOptions, initial: HostContext): Ag
       //   非 team → undefined,零变化)。每轮顶部 drain（agent.ts:758），peer 回报作合成 user 轮入上下文。
       ...(host.coordinatorInbox ? { inbox: host.coordinatorInbox } : {}),
       // ★ ISSUE-1:统一走 Compaction V2(替换 legacy makeProviderCompaction)。
-      compactionV2: { summarize: makeProviderCompactSummarize(context.provider, context.config.model) },
+      //   CORE-CTX-004:注入 rehydrate,压后把最近读的文件重挂回上下文。
+      compactionV2: {
+        summarize: makeProviderCompactSummarize(context.provider, context.config.model),
+        rehydrate: {
+          recentReadPaths: () => recentReads.list(),
+          readFile: async (p: string) => (context.toolContext.sandboxFs as SandboxFs).readText(p),
+        },
+      },
       microCompact: (msgs: ProviderMessage[]) => microCompact(msgs, { now: Date.now() }),
+      // CORE-CTX-005:大结果落盘钩子(host/sessionDir 领地)。
+      persistToolResult,
       contextWindow: contextWindowForModel(context.config.model),
     });
   }

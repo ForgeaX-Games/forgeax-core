@@ -17,6 +17,15 @@
  *   - 不用 cache-edit / blackboard 锚点;core 是 **纯函数**:`now` 作参注入
  *     (不用 Date.now),不读写任何全局状态 —— host 负责取 now 与持久化触发时机。
  *
+ * ⚠️ KNOWN-LIMITATION(CORE-CTX-006 · prefix-cache 破坏,已评估、按现设计接受):
+ *   本模块**就地改写历史消息内容**(把旧 tool_result 换成 placeholder),必然改变 prompt
+ *   前缀字节 → 触发它的**那一轮**整段 `cache_creation`(前缀缓存失效、不命中),而非
+ *   cache-edit API 那样在 API 层删除且不破前缀。**代价有界**:仅在 `gap ≥ gapThresholdMinutes`
+ *   (默认 60min = 1h prompt-cache TTL 已过期)的**冷会话恢复**轮触发 —— 此刻前缀本就必被
+ *   整段重写,content-clear 只是把要重写的体积压小,**无额外 cache 损失**;热会话(gap 内)
+ *   根本不触发,零影响。彻底免破 cache 需 provider 层支持 anthropic cache-edit beta
+ *   (`clear_tool_uses_*`)走 API-edit,属较大改动,按需排期(见 CORE-CTX-007)。
+ *
  * 消息形状(provider-neutral,与 ledger fold 产出的 message 对齐):
  *   - assistant 消息:{ role:'assistant', timestamp?, content?:Block[] }
  *   - tool 结果:既支持 { role:'tool', content } 单条形态,也支持 user 消息里的

@@ -31,6 +31,10 @@ import type { LLMProvider, ProviderMessage, ProviderRequest, ProviderStreamEvent
 import { makeProviderCompactSummarize } from '../context/compaction-llm';
 import { microCompact } from '../context/micro-compaction';
 import { contextWindowForModel } from '../context/model-window';
+import { RecentReads } from '../capability/read-tracker';
+import { EventBus } from '../events/event-bus';
+import { CoreEventType } from '../events/events';
+import type { SandboxFs } from '../inject/types';
 import { makeTaskTool } from '../agent/subagent';
 import type { SubagentRegistry } from '../agent/subagent-registry';
 import { handoffTool } from '../capability/builtin-tools/message-tools';
@@ -125,6 +129,13 @@ export interface ForgeaxCoreKernelOptions {
   localToolImpls?: AgentTool[];
   /** thinking(扩展思考)配置;给了即对每轮请求开启,并吐 thinking.delta。 */
   thinking?: ProviderRequest['thinking'];
+  /**
+   * ★ CORE-CTX-005:超限 tool 结果被截断时把**全量** raw 落盘的钩子(host/sessionDir 领地)。
+   * facade 无 session 目录概念,故作**注入接缝**:HOST 层(serve.ts/server)据自己的会话目录
+   * 装配后注入;缺省不注入 → 截断即中段永久丢(旧行为)。返回可回读路径 → marker 追加
+   * `; full result at <path>`。
+   */
+  persistToolResult?: (raw: string, meta: { toolUseId: string; toolName: string }) => string | undefined;
   /**
    * MCP server→client 反向请求(elicitation/sampling/roots)的 host handler 集合(M4)。
    *
@@ -306,6 +317,11 @@ export class ForgeaxCoreKernel implements AgentKernel {
    *  权威模型源(与 currentMode 同语义:控制面 override 持久,直到再次 setModel)。 */
   private currentModel: string | undefined;
 
+  /** CORE-CTX-004:压后重挂用的读事件总线 + 最近读文件缓冲(kernel 级,跨轮保留)。
+   *  每轮 CoreAgent 以 `bus: this.readBus` 构造 → ToolCallRequested 汇到这里记录 file_path。 */
+  private readonly readBus = new EventBus();
+  private readonly recentReads = new RecentReads();
+
   /**
    * MCP server→client 反向请求 handler(M4 存储接缝;facade 不自调用)。host 在外部
    * 装配 MCP client 时取回传给 `InProcessMCPClient(server, transport, deps)`。
@@ -325,6 +341,12 @@ export class ForgeaxCoreKernel implements AgentKernel {
   constructor(opts: ForgeaxCoreKernelOptions) {
     this.o = opts;
     this.currentMode = opts.initialMode ?? 'default';
+    // CORE-CTX-004:订阅读事件,记录最近读的文件路径(供压后 rehydrate)。
+    this.readBus.subscribe(CoreEventType.ToolCallRequested, (e) => {
+      const p = (e as { payload?: { input?: { file_path?: unknown } } }).payload?.input?.file_path;
+      if (typeof p === 'string' && p) this.recentReads.record(p);
+      return undefined;
+    });
   }
 
   /** ToolSpec → AgentTool,call 委托 host-tool 桥(K11)。 */
@@ -440,8 +462,12 @@ export class ForgeaxCoreKernel implements AgentKernel {
       toolContext,
     };
 
+    // CORE-CTX-004:压后重挂只在 toolContext 带 sandboxFs 时接(否则无处读文件,优雅跳过)。
+    const rehydrateFs = context.toolContext.sandboxFs as SandboxFs | undefined;
     const agent = new CoreAgent({
       context,
+      // CORE-CTX-004:用 kernel 级 readBus,让读事件汇入 recentReads(压后重挂)。
+      bus: this.readBus,
       globalCacheEnabled: true,
       // ★ WS-C:把权限模式 / 规则 / askUser 透传给每轮 CoreAgent,使 facade 驱动的轮也
       //   honor 注入规则、并让 setPermissionMode 改活 agent 真生效(dispatch 读 currentMode)。
@@ -450,8 +476,21 @@ export class ForgeaxCoreKernel implements AgentKernel {
       ...(this.o.askUser ? { askUser: this.o.askUser } : {}),
       // F6 生产路径也开压缩(auto + micro);长会话不至于撑爆上下文。
       // ★ ISSUE-1:主轮自压缩走 Compaction V2(替换 legacy makeProviderCompaction)。
-      compactionV2: { summarize: makeProviderCompactSummarize(this.o.provider, context.config.model) },
+      //   CORE-CTX-004:注入 rehydrate,压后重挂最近读的文件。
+      compactionV2: {
+        summarize: makeProviderCompactSummarize(this.o.provider, context.config.model),
+        ...(rehydrateFs
+          ? {
+              rehydrate: {
+                recentReadPaths: () => this.recentReads.list(),
+                readFile: async (p: string) => rehydrateFs.readText(p),
+              },
+            }
+          : {}),
+      },
       microCompact: (msgs) => microCompact(msgs, { now: Date.now() }),
+      // CORE-CTX-005:大结果落盘钩子(HOST 层经 options 注入;缺省不落盘=旧行为)。
+      ...(this.o.persistToolResult ? { persistToolResult: this.o.persistToolResult } : {}),
       contextWindow: contextWindowForModel(context.config.model),
       ...(this.o.thinking ? { thinking: this.o.thinking } : {}),
       // ★ peer 多 agent:解析出 sink 才接;缺省 → handoff_decision 维持 no-op(单 agent)。

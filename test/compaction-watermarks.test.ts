@@ -6,6 +6,9 @@ import { describe, test, expect } from 'bun:test';
 import {
   computeWatermarks,
   computeWatermarksFromModel,
+  describeWindowOverride,
+  minMeaningfulWindow,
+  BASE_PROMPT_TOKENS,
   RESERVED_FOR_SUMMARY_TOKENS,
   AUTOCOMPACT_BUFFER_TOKENS,
   WARNING_BUFFER_TOKENS,
@@ -89,5 +92,66 @@ describe('Stream A — watermarks 比例/per-model (#1)', () => {
     expect(w.emergencyThreshold).toBe(0);
     expect(w.warningThreshold).toBe(0);
     expect(w.blockingLimit).toBe(0);
+  });
+});
+
+describe('CORE-CTX-002 — 危险带 FORGEAX_COMPACT_WINDOW 拒绝回落', () => {
+  const model = { contextWindow: 200_000, maxOutputTokens: 64_000 }; // reserve=20k → 危险带 (23k, 29k)
+
+  test('minMeaningfulWindow = reserve + basePrompt + blocking(危险带上边界)', () => {
+    expect(minMeaningfulWindow(20_000)).toBe(20_000 + BASE_PROMPT_TOKENS + BLOCKING_BUFFER_TOKENS); // 29_000
+  });
+
+  test('危险带内(24000:blocking=1000∈(0,6k))→ 忽略,回落模型真实窗口(不再每轮硬停)', () => {
+    const w = computeWatermarksFromModel(model, { env: { FORGEAX_COMPACT_WINDOW: '24000' } });
+    // 若采纳 24000:effective=4000, blocking=1000(< 基础提示 6k)→ 每轮硬停。忽略后回落 200k:
+    expect(w.effectiveWindow).toBe(180_000);
+    expect(w.blockingLimit).toBe(177_000);
+  });
+
+  test('带下方(22000:blocking=clamp0(-1000)=0)→ 采纳(blocking=0 不硬停,转 PTL 路)', () => {
+    const w = computeWatermarksFromModel(model, { env: { FORGEAX_COMPACT_WINDOW: '22000' } });
+    expect(w.effectiveWindow).toBe(2_000); // 22k - 20k(采纳,未回落)
+    expect(w.blockingLimit).toBe(0);
+  });
+
+  test('带上边界(29000:blocking=6000=basePrompt)→ 采纳', () => {
+    const w = computeWatermarksFromModel(model, { env: { FORGEAX_COMPACT_WINDOW: '29000' } });
+    expect(w.effectiveWindow).toBe(9_000); // 29k - 20k
+  });
+
+  test('describeWindowOverride 报告 rejected + floor(供 host warn)', () => {
+    const rej = describeWindowOverride(model, { FORGEAX_COMPACT_WINDOW: '24000' });
+    expect(rej).toEqual({ requested: 24_000, floor: 29_000, rejected: true });
+    const belowBand = describeWindowOverride(model, { FORGEAX_COMPACT_WINDOW: '22000' });
+    expect(belowBand.rejected).toBe(false); // blocking=0 不在危险带
+    const ok = describeWindowOverride(model, { FORGEAX_COMPACT_WINDOW: '50000' });
+    expect(ok.rejected).toBe(false);
+    const none = describeWindowOverride(model, {});
+    expect(none.rejected).toBe(false);
+    expect(none.requested).toBeUndefined();
+  });
+});
+
+describe('CORE-CTX-003 — 不变量 emergency < blocking(中小窗口)', () => {
+  // effectiveWindow = contextWindow - reserve(reserve=min(maxOut??20k,20k)=20k when maxOut undefined)。
+  for (const [cw, eff] of [
+    [30_000, 10_000],
+    [40_000, 20_000],
+    [50_000, 30_000],
+    [200_000, 180_000],
+  ] as const) {
+    test(`eff=${eff}: emergency < blocking 且 autoCompact=emergency`, () => {
+      const w = computeWatermarksFromModel({ contextWindow: cw }); // maxOut undefined → reserve 20k
+      expect(w.effectiveWindow).toBe(eff);
+      expect(w.blockingLimit).toBeGreaterThan(0);
+      expect(w.emergencyThreshold).toBeLessThan(w.blockingLimit);
+      expect(w.autoCompactThreshold).toBe(w.emergencyThreshold);
+    });
+  }
+
+  test('满窗口 emergency 未被钳(min 不生效,行为不变)', () => {
+    const w = computeWatermarksFromModel({ contextWindow: 200_000 });
+    expect(w.emergencyThreshold).toBe(165_600); // 180k*0.92 < blocking 177k
   });
 });

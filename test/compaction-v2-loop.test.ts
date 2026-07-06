@@ -10,7 +10,7 @@ import { EventBus } from '../src/events/event-bus';
 import { CoreEventType } from '../src/events/events';
 import { buildTool } from '../src/capability/types';
 import type { AgentContext, AgentEvent } from '../src/agent/types';
-import type { LLMProvider, ProviderStreamEvent, Usage } from '../src/provider/types';
+import type { LLMProvider, ProviderRequest, ProviderStreamEvent, Usage } from '../src/provider/types';
 import { EMPTY_USAGE } from '../src/provider/types';
 import { CompactType } from '../src/context/compaction-types';
 
@@ -163,6 +163,35 @@ describe('Stream E — compaction V2 loop integration (#5/#8/#6/#11)', () => {
     expect(applied).toBe(1); // 压缩发生(重挂只在压缩后跑,不抛即通过)
     const last = ev.at(-1)!;
     expect(last.type === 'done' && last.terminal.reason).toBe('completed');
+  });
+
+  test('重挂集成(内容级 · CORE-CTX-004):压后 provider 请求确含 re-attach 消息(仅注入 rehydrate 才有)', async () => {
+    // 捕获压缩发生后送出的 provider 请求 messages(stage3 压缩 → stage4 发送同一 turn)。
+    function capturing(): { provider: LLMProvider; reqs: ProviderRequest[] } {
+      const reqs: ProviderRequest[] = [];
+      return { reqs, provider: { api: 'stub', async *stream(r) { reqs.push(r); yield asstText('done'); } } };
+    }
+
+    // ① 注入 rehydrate(= 修复后的 host 行为)→ 压后请求含重挂消息 + 文件正文。
+    const withReh = capturing();
+    const agentWith = new CoreAgent({
+      context: ctx(withReh.provider),
+      compactionV2: v2({
+        rehydrate: { recentReadPaths: () => ['/a.ts'], readFile: async () => 'RECENT-FILE-BODY', tokenBudget: 10_000, maxFiles: 1 },
+      }),
+    });
+    await drain(agentWith, 'q', [{ role: 'user', content: big(19_000) }]); // > emergency 18400 → 压缩
+    const withJson = JSON.stringify(withReh.reqs[0]?.messages ?? []);
+    expect(withJson).toContain('Re-attached after compaction');
+    expect(withJson).toContain('/a.ts');
+    expect(withJson).toContain('RECENT-FILE-BODY');
+
+    // ② 不注入 rehydrate(= 修复前的 host 行为:dead code 永不执行)→ 压后请求无重挂消息。
+    const noReh = capturing();
+    const agentNo = new CoreAgent({ context: ctx(noReh.provider), compactionV2: v2() });
+    await drain(agentNo, 'q', [{ role: 'user', content: big(19_000) }]);
+    const noJson = JSON.stringify(noReh.reqs[0]?.messages ?? []);
+    expect(noJson).not.toContain('Re-attached after compaction');
   });
 
   test('与 legacy compaction 互斥:V2 优先,旧 strategy 不被调', async () => {
