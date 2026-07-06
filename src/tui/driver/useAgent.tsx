@@ -79,8 +79,14 @@ export interface DriverOptions extends HostContextArgs {
  */
 export function createAgentDriver(opts: DriverOptions, initial: HostContext): AgentDriver {
   // 进程级可变 rules(§0-B):同一引用传给每一个 CoreAgent,allowAlways 就地 push。
-  //   allow 桶启动时从项目文件 <cwd>/.forgeax/permissions.json 读回(跨会话记住「总是允许」)。
-  const rules: PermissionRuleSet = { deny: [], ask: [], allow: loadAllowRules(process.cwd()) };
+  //   楔子1 · 046:从 host 载出的 settings.permissions 规则**播种**这份可变集(deny/ask/allow
+  //   立即生效);allow 桶再叠加项目文件 <cwd>/.forgeax/permissions.json 读回的「总是允许」
+  //   (跨会话记住),之后 allowAlways 仍就地 push 到同一引用。
+  const rules: PermissionRuleSet = {
+    deny: [...(initial.rules?.deny ?? [])],
+    ask: [...(initial.rules?.ask ?? [])],
+    allow: [...(initial.rules?.allow ?? []), ...loadAllowRules(process.cwd())],
+  };
   let mode: PermissionMode = 'default';
   let askUser: AskUserFn | undefined;
   // 008 结构化提问:host 注入的回调。区别于 askUser(布尔闸),AskUserQuestion 工具经

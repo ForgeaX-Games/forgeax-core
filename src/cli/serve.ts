@@ -35,6 +35,7 @@ import { builtinToolsPack } from '../capability/builtin-tools/index';
 import { notebookToolsPack } from '../capability/builtin-tools/notebook-tools';
 import { NodeSandboxFs, NodeTerminal } from './io';
 import { makeNodeObservability } from './observability';
+import { loadPermissionRulesFromSettings } from './permission-settings';
 import type { TelemetryRecord } from '@forgeax/types';
 
 /** runTurn 的线上入参 = TurnRequest 的**可序列化子集**(去掉 requestPermission/hooks 等函数)。 */
@@ -91,6 +92,12 @@ export async function startServe(sockPath: string): Promise<Server> {
   // 扩展思考:默认 adaptive,对齐重构前 working 配置(旧 working 请求即 thinking:adaptive)。
   const thinkingCfg = resolveThinkingConfig();
 
+  // 权限规则(楔子1 · 046):从分层 settings 的 permissions 段载出。Studio 经 sidecar 驱动 core 时,
+  //   askUser defer 只拦 in-core 的 'ask'(交 host 弹卡),**in-core deny 仍核内强制**(见下 kernel
+  //   注释)——故「在 .forgeax/settings.json 里写一条 deny」经此对 Studio 生效。无 permissions →
+  //   三空桶(默认 tier 行为不变)。启动读一次(settings 会话级缓存)。
+  const settingsRules = loadPermissionRulesFromSettings();
+
   const server = await listenRpc(sockPath, (conn: RpcConnection, sock) => {
     // 反向 host-tool 桥:serve 的所有工具执行都回调宿主(adapter 复跑 checkKernelTool)。
     const executeTool: ExecuteToolFn = async (name, args, sid, agentId) =>
@@ -126,6 +133,10 @@ export async function startServe(sockPath: string): Promise<Server> {
       //   其余仍走上面的 executeTool 桥(host 把闸)。
       toolContext: localToolContext,
       localToolImpls,
+      // 权限规则(楔子1 · 046):settings.permissions.{deny,ask,allow} 载出的规则集。
+      //   engine ① deny 在 dispatch 派发前就闸(先于本地/回宿主的执行路由),故 deny 对
+      //   local-delivery 与 host-bridged 工具一律生效;'ask' 由下方 askUser defer 交 host。
+      rules: settingsRules,
       // 扩展思考(重构丢了这条接线 → 旧版有 thinking 显示、新版没有)。默认 adaptive。
       ...(thinkingCfg ? { thinking: thinkingCfg } : {}),
       // 信任边界钉在 host(评审稿 §3.1):serve 的所有工具都回调宿主,宿主 host-tool-bridge

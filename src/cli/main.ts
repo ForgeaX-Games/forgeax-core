@@ -48,6 +48,7 @@ import type { EventStore } from '../inject/types';
 import { resolve as resolvePath } from 'node:path';
 import { renderEvent } from './render';
 import type { AutoMemoryHook } from '../agent/agent';
+import type { PermissionRuleSet } from '../permission/rules';
 import { demoProvider } from './demo-provider';
 import { buildHostContext, resolveHostProvider, pickApi, DEFAULT_MODEL, DEFAULT_LEADING, DEFAULT_MAIN_MAX_TURNS } from './host-context';
 import { getMergedSettings } from './settings';
@@ -243,6 +244,9 @@ export interface RunTurnOpts {
   store?: EventStore;
   /** team(FORGEAX_TEAM):coordinator inbox 闭包,挂 CoreAgent.inbox 收 peer 回报。 */
   inbox?: () => ProviderMessage[];
+  /** 权限规则集(楔子1 · 046):从 settings.permissions 载出。runCli 传 host.rules;
+   *  不传则无 settings 规则(默认 tier 行为不变)。 */
+  rules?: Partial<PermissionRuleSet> | null;
 }
 
 /** 跑一轮,把渲染结果写到 out(默认 stdout)。返回终态 reason。 */
@@ -256,6 +260,9 @@ export async function runTurn(
     context,
     bus: opts.bus,
     globalCacheEnabled: true,
+    // 权限规则(楔子1 · 046):settings.permissions.{deny,ask,allow} 载出的规则集
+    //   (runCli 经 host.rules 传入);engine ① deny > ② ask > ⑦ allow 生效。
+    ...(opts.rules ? { rules: opts.rules } : {}),
     // CLI 独立形态自管权限:开 core 内置受保护路径检查,保护本机 .git/.forgeax/shell-rc。
     enableSafetyCheck: true,
     autoMemory: opts.autoMemory,
@@ -426,7 +433,7 @@ export async function runCli(argv: string[], providerOverride?: LLMProvider): Pr
     process.stderr.write(`${e instanceof Error ? e.message : String(e)}\n`);
     return 1;
   }
-  const { context, bus, provider, store, disposers } = host;
+  const { context, bus, provider, store, disposers, rules } = host;
   if (sessionId) {
     const file = resolvePath(args.sessionsDir ?? `${process.cwd()}/.forgeax/sessions`, sessionId, 'events.jsonl');
     write(`[forgeax-core] session "${sessionId}" → ${file}\n`);
@@ -466,6 +473,7 @@ export async function runCli(argv: string[], providerOverride?: LLMProvider): Pr
     askUser: makeAskUser(!!args.yes),
     thinking: thinkingFromArg(args.thinking),
     store,
+    rules,
     ...(host.coordinatorInbox ? { inbox: host.coordinatorInbox } : {}),
   };
 

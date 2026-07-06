@@ -40,6 +40,8 @@ import { makeTeamPeerSpawner } from './peer';
 import { makeEnvSlot } from './env-slot';
 import { effectiveSkillDirs, effectiveCommandDirs, discoverAgentDirs, discoverPluginDirs, loadMergedMcpConfig } from './locations';
 import { getMergedSettings } from './settings';
+import { loadPermissionRulesFromSettings } from './permission-settings';
+import type { PermissionRuleSet } from '../permission/rules';
 
 export const DEFAULT_MODEL = 'claude-opus-4-8';
 export const DEFAULT_LEADING = 'You are forgeax-core, a self-contained coding agent running as a CLI.';
@@ -90,6 +92,10 @@ export interface HostContext {
   store?: EventStore;
   /** 退出清理:断 store + dispose 装配的子进程(mcp/plugin/hooks)。 */
   disposers: Array<() => void | Promise<void>>;
+  /** 从分层 settings 的 `permissions.{deny,ask,allow}` 载出的规则集(楔子1 · 046)。
+   *  调用方须把它喂进 `new CoreAgent({rules})`,「配置里写 deny」才对本 host 生效。
+   *  无 permissions → 三空桶(不改变默认 tier 行为)。 */
+  rules: PermissionRuleSet;
   /** team 模式(FORGEAX_TEAM=1):coordinator 的 inbox 闭包——挂到 CoreAgent.inbox 收 peer 回报。
    *  非 team → undefined(CoreAgent 不挂 inbox,零变化)。 */
   coordinatorInbox?: () => ProviderMessage[];
@@ -260,5 +266,8 @@ export async function buildHostContext(args: HostContextArgs, providerOverride?:
     disposers.unshift(disconnect);
   }
 
-  return { context, bus, provider, store, disposers, ...(coordinatorInbox ? { coordinatorInbox } : {}) };
+  // 权限规则(楔子1 · 046):从分层 settings 的 permissions 段载出(与上面读 hooks 同口径)。
+  const rules = loadPermissionRulesFromSettings();
+
+  return { context, bus, provider, store, disposers, rules, ...(coordinatorInbox ? { coordinatorInbox } : {}) };
 }
