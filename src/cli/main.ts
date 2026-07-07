@@ -637,12 +637,11 @@ export async function runCli(argv: string[], providerOverride?: LLMProvider): Pr
   }
 }
 
-// 直接运行时执行(bun / node `src/cli/main.ts ...`),被 import 为库时不执行。
-// Bun 有 `import.meta.main`;Node(< 24.2)没有 → 回退比对入口脚本路径。
-// (node-runnable 化漏网的 Bun 专属 API:node 下 `--serve` 子进程原本静默不启动。)
+// 直接运行时执行(node `dist/cli/main.js …` / `src/cli/main.ts …`),被 import 为库时不执行。
+// 用 node-portable 的入口脚本路径比对。**不用 `import.meta.main`**:它是 Bun/Node≥24.2 专属,
+// 且 bun build 会把它转成引用未定义 `__require` 的 polyfill —— 在 ESM 产物里直接 ReferenceError 崩溃。
 const runAsEntry =
-  (import.meta as { main?: boolean }).main ??
-  (process.argv[1] ? import.meta.url === pathToFileURL(process.argv[1]).href : false);
+  process.argv[1] ? import.meta.url === pathToFileURL(process.argv[1]).href : false;
 if (runAsEntry) {
   runCli(process.argv.slice(2)).then((code) => process.exit(code));
 }

@@ -990,8 +990,14 @@ export class CoreAgent implements Agent {
         continue;
       }
 
-      // 无 tool_use → end_turn → 完成
-      if (toolUses.length === 0 || stopReason === 'end_turn' || stopReason === 'stop_sequence') {
+      // 完成判定:工具调用优先于 stop_reason —— 只要本轮聚合出了 tool_use,就必须往下派发工具,
+      //   绝不能因 stop_reason 提前收尾。兼容层(如 GLM/zai)会返回不标准组合「有 tool_use 但
+      //   stop_reason=end_turn」,若这里用 `|| stopReason==='end_turn'` 就会把这类轮当成结束、
+      //   把已存在的工具调用丢弃 → 模型思考完却静默、流程卡死(classic_cn 首轮 get_game_detail
+      //   被吞即此)。因此只在「无 tool_use」时才交由 stop hook / token budget 等收尾门决定收工;
+      //   end_turn / stop_sequence / null / refusal 等 stopReason 在无工具时同样落入本分支(与旧
+      //   逻辑对无工具场景逐字等价),避免空 toolUses 落到 dispatch 循环再回灌导致的空转死循环。
+      if (toolUses.length === 0) {
         // ② stop-hook gate(Stop hook):收尾前发 Stop 事件给 hook 一个「别停」的机会。
         //   hook 经 EventBus 把 preventStop/reason 合并进回执(modify/返回替换事件);
         //   preventStop===true 且未触续轮上限 → 注回 reason(system-reminder)并续轮,不收尾。

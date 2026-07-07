@@ -108,6 +108,46 @@ describe('LOOP normal scenario — tool loop then complete', () => {
   });
 });
 
+/** 兼容层(GLM/zai 等)不标准组合:content 里有 tool_use,但 stop_reason=end_turn。 */
+function asstToolUseButEndTurn(id: string, name: string, input: unknown): ProviderStreamEvent {
+  return {
+    type: 'assistant',
+    message: { role: 'assistant', content: [{ type: 'tool_use', id, name, input }] },
+    usage: EMPTY_USAGE as Usage,
+    stopReason: 'end_turn',
+  };
+}
+
+describe('LOOP compat regression — tool_use must beat stop_reason=end_turn', () => {
+  // 回归:兼容层返回「有 tool_use 但 stop_reason=end_turn」时,旧逻辑用 `||` 让 end_turn
+  //   盖过 tool_use → 直接判完成、丢弃工具调用 → 模型思考完却静默卡死(classic_cn 首轮
+  //   get_game_detail 被吞)。修复后:只要有 tool_use,必须派发,end_turn 不得提前收尾。
+  test('dispatches tool even when stop_reason=end_turn, then completes next turn', async () => {
+    const provider = scriptedProvider([
+      [asstToolUseButEndTurn('t1', 'echo', { v: 1 })],
+      [asstText('done')],
+    ]);
+    const agent = new CoreAgent({ context: ctx([echoTool], provider) });
+    const events = await collect(agent, { input: { type: 'user', payload: 'hi', ts: 0 } });
+
+    // 关键断言:工具确实被派发并执行,而不是被当成本轮结束吞掉。
+    expect(events.some((e) => e.type === 'tool_call')).toBe(true);
+    expect(events.some((e) => e.type === 'tool_result')).toBe(true);
+    // 后续第二轮纯文本 end_turn 才正常收尾。
+    const last = events.at(-1)!;
+    expect(last.type === 'done' && last.terminal.reason).toBe('completed');
+  });
+
+  test('no tool_use + end_turn still completes immediately (no regression)', async () => {
+    const provider = scriptedProvider([[asstText('done')]]);
+    const agent = new CoreAgent({ context: ctx([echoTool], provider) });
+    const events = await collect(agent, { input: { type: 'user', payload: 'hi', ts: 0 } });
+    expect(events.some((e) => e.type === 'tool_call')).toBe(false);
+    const last = events.at(-1)!;
+    expect(last.type === 'done' && last.terminal.reason).toBe('completed');
+  });
+});
+
 describe('LOOP interrupt scenario', () => {
   test('emits turn_aborted + done(aborted_streaming)', async () => {
     const provider = scriptedProvider([[asstText('x')]]);

@@ -1,21 +1,26 @@
 {
   "name": "@forgeax/forgeax-core",
-  "version": "0.1.0",
+  "version": "0.1.4",
   "private": true,
   "type": "module",
   "description": "forgeax-core — self-contained single-agent runtime (agent loop, events, history, capability, provider, compaction). Embeddable natively; also implements the AgentKernel contract as a drop-in kernel. Phase F0 ships the foundation (EventBus block/modify, EventStore, ledger fold, injection interfaces).",
-  "main": "src/index.ts",
+  "main": "./dist/index.js",
   "bin": {
-    "forgeax-core": "src/cli/main.ts"
+    "forgeax-core": "./dist/cli/main.js"
   },
   "exports": {
-    ".": "./src/index.ts",
-    "./events": "./src/events/index.ts",
-    "./history": "./src/history/index.ts",
-    "./inject": "./src/inject/types.ts",
-    "./cli": "./src/cli/main.ts"
+    ".": "./dist/index.js",
+    "./events": "./dist/events/index.js",
+    "./history": "./dist/history/index.js",
+    "./inject": "./dist/inject/types.js",
+    "./cli": "./dist/cli/main.js"
   },
+  "files": [
+    "dist"
+  ],
   "scripts": {
+    "build": "bun build.mjs",
+    "pack:tgz": "npm pack",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
     "check:boundaries": "bun scripts/check-core-boundaries.mjs",
@@ -29,8 +34,6 @@
     "e2e": "bun test/e2e-real.ts && bun test test/mcp && bun test/plan-serve-e2e.ts && bun test/subagent-serve-e2e.ts"
   },
   "dependencies": {
-    "@forgeax/agent-runtime": "workspace:*",
-    "@forgeax/types": "workspace:*",
     "@opentelemetry/api": "^1.9.0",
     "@opentelemetry/exporter-trace-otlp-http": "^0.219.0",
     "@opentelemetry/resources": "^2.8.0",
