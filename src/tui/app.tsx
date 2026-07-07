@@ -135,6 +135,7 @@ export async function runTui(args: TuiArgs, providerOverride?: LLMProvider): Pro
     searchUrl: args.searchUrl,
     sessionId,
     sessionsDir: args.sessionsDir,
+    sandbox: args.sandbox,
   };
   // 把用户/项目的 markdown 指令(~/.forgeax/commands 等)接到 TUI slash(菜单/解析/分发)。
   //   provider 现取 → 热更新;给了 --skills/--commands 只用 flag,否则自动发现两层。

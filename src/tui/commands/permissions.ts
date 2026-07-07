@@ -3,6 +3,7 @@
  *  Boundary(HOST 层):仅 core 相对 import。 */
 import { registerCommand } from './registry';
 import { coercePermissionMode, formatRuleView, PERMISSION_MODES, type PermissionRuleView } from '../../permission/inspect';
+import { guardBypassMode } from '../../cli/escalation-guard';
 
 registerCommand({
   name: 'permissions',
@@ -14,6 +15,14 @@ registerCommand({
       if (!want) {
         ctx.print(`无效模式 ${m}。可选:${PERMISSION_MODES.join(' / ')}`);
         return;
+      }
+      // E-05:切 bypassPermissions 前过护栏(root 拒绝 / settings killswitch)。
+      if (want === 'bypassPermissions') {
+        const v = guardBypassMode();
+        if (!v.allowed) {
+          ctx.print(`⚠ 拒绝切换到 bypassPermissions:${v.reason}`);
+          return;
+        }
       }
       ctx.setPermissionMode(want);
       ctx.print(`已切换权限模式 -> ${want}`);

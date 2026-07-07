@@ -215,9 +215,11 @@ describe('assembleCapabilities', () => {
       task: { provider, model: 'm' },
     });
     const names = out.tools.map((t) => t.name);
-    for (const n of ['read_file', 'bash', 'web_fetch', 'web_search', 'todo_write', 'notebook_edit', 'memory_search', 'remember', 'Task']) {
+    for (const n of ['read_file', 'bash', 'web_fetch', 'todo_write', 'notebook_edit', 'memory_search', 'remember', 'Task']) {
       expect(names).toContain(n);
     }
+    // C-02:未注入 searchBackend → web_search 不进工具清单(web_fetch 仍在)。
+    expect(names).not.toContain('web_search');
     // memory slot 进 slots。
     expect(out.slots.length).toBeGreaterThan(0);
   });

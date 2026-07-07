@@ -124,8 +124,9 @@ export interface CoreAgentOptions {
   bus?: EventBus;
   rules?: Partial<PermissionRuleSet> | null;
   mode?: PermissionMode;
-  /** 启用 core 内置受保护路径 safetyCheck(.git/.forgeax/shell-rc)。默认 false——
-   *  core 不默认限路径,权限归 host。CLI 独立形态(host 自管)可显式开。 */
+  /** 启用 core 内置受保护路径 safetyCheck(.git/.forgeax/shell-rc,bypass 免疫)。
+   *  **默认 true(E-04 secure-by-default)**——库嵌入 / serve 也有路径保护;host 若自带
+   *  等效把闸可显式传 `false` opt-out。 */
   enableSafetyCheck?: boolean;
   assembler?: SystemPromptAssembler;
   /** static/dynamic slot 二分(默认全 static)。 */
@@ -1140,7 +1141,9 @@ export class CoreAgent implements Agent {
         signal,
         rules: this.o.rules,
         mode: this.currentMode,
-        enableSafetyCheck: this.o.enableSafetyCheck,
+        // E-04:secure-by-default —— 未显式指定即开内置受保护路径检查(.git/.forgeax/shell-rc,
+        //   bypass 免疫)。库嵌入 / serve 形态不再零路径保护;host 可显式传 false opt-out。
+        enableSafetyCheck: this.o.enableSafetyCheck ?? true,
         askUser: this.o.askUser,
         isBlocked: (use) => preToolReceipt(use).blocked === true,
         preToolPermission: (use) => preToolReceipt(use).permissionDecision,

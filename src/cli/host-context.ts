@@ -18,9 +18,10 @@ import { resolveProvider } from '../provider/register';
 import { makeProviderCompactSummarize } from '../context/compaction-llm';
 import { contextWindowForModel } from '../context/model-window';
 import { NodeSandboxFs, NodeTerminal, makeNodeBackgroundSpawn } from './io';
+import { withSandbox } from './sandbox-terminal';
 import { EventBus } from '../events/event-bus';
 import { assembleCapabilities } from '../runtime/assemble';
-import { makeSpawnSyncHookRunner, makeHttpSearchBackend } from './host-bits';
+import { makeSpawnSyncHookRunner, makeHttpSearchBackend, makeDefaultSearchBackend } from './host-bits';
 import { makeStdioMcpFactory } from './mcp-stdio';
 import { makeEnvTokenProvider } from './mcp-token';
 import { connectStore } from '../history/event-store';
@@ -80,6 +81,8 @@ export interface HostContextArgs {
   sessionId?: string;
   /** 会话 WAL 根目录(默认 ./.forgeax/sessions)。 */
   sessionsDir?: string;
+  /** OS 沙箱开关(E-03):true/false 显式,undefined=看 env/settings。 */
+  sandbox?: boolean;
 }
 
 /** 全量装配结果。disposers 退出时必须 await(R4)。 */
@@ -134,10 +137,12 @@ export function readHooksSettings(path: string): Record<string, Array<{ matcher?
 export async function buildHostContext(args: HostContextArgs, providerOverride?: LLMProvider): Promise<HostContext> {
   const provider = resolveHostProvider(args, providerOverride);
   const sandboxFs = new NodeSandboxFs();
+  // E-03:OS 沙箱(可用且开启时套 SandboxedTerminal;要求但不可用 → loud 降级)。
+  const { terminal } = withSandbox(new NodeTerminal(), args.sandbox);
   // toolContext 开放形状:assemble 建出的后台进程注册表(007)在装配后挂到 shellRegistry。
-  const toolContext: Record<string, unknown> = { sandboxFs, terminal: new NodeTerminal(), cwd: process.cwd() };
+  const toolContext: Record<string, unknown> = { sandboxFs, terminal, cwd: process.cwd() };
   const bus = new EventBus();
-  const searchBackend = args.searchUrl ? makeHttpSearchBackend(args.searchUrl) : undefined;
+  const searchBackend = args.searchUrl ? makeHttpSearchBackend(args.searchUrl) : makeDefaultSearchBackend();
 
   // 自动发现:各能力按 `.forgeax` 约定发现「项目级 + 用户级」目录(项目优先,见 locations.ts)。
   //   规则:**给了 flag 就只用 flag**(关闭该能力的自动发现);否则用发现到的两层目录。

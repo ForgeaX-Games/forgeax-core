@@ -185,11 +185,20 @@ export function webSearchTool(opts: WebToolsOptions = {}): AgentTool<WebSearchIn
   });
 }
 
-/** web 工具聚合包(builtin 层)。 */
+/**
+ * web 工具聚合包(builtin 层)。
+ *
+ * `web_fetch` 始终挂载(靠全局 fetch,无外部依赖)。`web_search` **仅在注入了
+ * `searchBackend` 时才进工具清单**——未配置后端时不挂载,让模型根本看不到不可用的
+ * 工具(比运行期 throw 干净:模型不会尝试→失败→重试浪费轮次)。运行期的 loud throw
+ * 作为 ctx 注入路径的二道防线保留。
+ */
 export function webToolsPack(opts: WebToolsOptions = {}) {
+  const tools: AgentTool[] = [webFetchTool(opts)];
+  if (opts.searchBackend) tools.push(webSearchTool(opts));
   return {
     name: 'web-tools',
     layer: 'builtin' as const,
-    tools: [webFetchTool(opts), webSearchTool(opts)],
+    tools,
   };
 }

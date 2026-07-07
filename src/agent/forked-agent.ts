@@ -136,6 +136,10 @@ export async function runForkedAgent(
     bus: new EventBus(), // 隔离 bus:提取过程不流进父对话
     initialMessages: spec.parentMessages, // ★ 复用父前缀(缓存命中的根)
     contextWindow: spec.contextWindow,
+    // E-04:提取 fork 是 core 自身的记忆簿记(bus 隔离 + canUseTool 门控 + 只写 memory 目录),
+    //   非用户/模型自由编辑;显式关闭 secure-by-default safetyCheck,否则写 `.forgeax/memory/*.md`
+    //   会被受保护路径检查拦下。
+    enableSafetyCheck: false,
   });
 
   let text = '';

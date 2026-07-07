@@ -228,17 +228,46 @@ function readOnlyTool(name: string) {
 }
 
 describe('acceptEdits', () => {
-  test('edit/write tool → allow without any rule (by isDestructive)', async () => {
+  // E-06:acceptEdits 仅放行 cwd 内的写;ctx 需带 cwd。
+  const ctxCwd = (cwd: string): ToolContext => ({ signal: new AbortController().signal, cwd }) as ToolContext;
+
+  test('edit/write tool in cwd → allow (scope in-cwd)', async () => {
     const tool = editTool('write_file');
-    const r = await hasPermissionsToUseTool(tool, { file_path: '/repo/src/x.ts' }, ctx(), NO_RULES, {
+    const r = await hasPermissionsToUseTool(tool, { file_path: '/repo/src/x.ts' }, ctxCwd('/repo'), NO_RULES, {
       mode: 'acceptEdits',
     });
     expect(r.behavior).toBe('allow');
     expect(r.decisionReason?.type).toBe('mode');
     expect((r.decisionReason as { mode?: string }).mode).toBe('acceptEdits');
+    expect((r.decisionReason as { scope?: string }).scope).toBe('in-cwd');
   });
 
-  test('edit tool by canonical name (Write alias) → allow', async () => {
+  test('relative path resolves under cwd → allow', async () => {
+    const tool = editTool('write_file');
+    const r = await hasPermissionsToUseTool(tool, { file_path: 'src/a.ts' }, ctxCwd('/repo'), NO_RULES, {
+      mode: 'acceptEdits',
+    });
+    expect(r.behavior).toBe('allow');
+    expect((r.decisionReason as { scope?: string }).scope).toBe('in-cwd');
+  });
+
+  test('E-06: absolute path outside cwd → ask (not auto-allowed)', async () => {
+    const tool = editTool('write_file');
+    const r = await hasPermissionsToUseTool(tool, { file_path: '/tmp/x' }, ctxCwd('/repo'), NO_RULES, {
+      mode: 'acceptEdits',
+    });
+    expect(r.behavior).toBe('ask');
+  });
+
+  test('E-06: `..` escape outside cwd → ask', async () => {
+    const tool = editTool('write_file');
+    const r = await hasPermissionsToUseTool(tool, { file_path: '../evil' }, ctxCwd('/repo'), NO_RULES, {
+      mode: 'acceptEdits',
+    });
+    expect(r.behavior).toBe('ask');
+  });
+
+  test('edit tool by canonical name (Write alias) in cwd → allow', async () => {
     // tool whose name is not in EDIT set but alias is.
     const tool = buildTool({
       name: 'my_writer',
@@ -248,7 +277,7 @@ describe('acceptEdits', () => {
       mapResult: (_o, id) => ({ type: 'tool.result', payload: { id }, ts: 0 }),
       maxResultSizeChars: 1000,
     });
-    const r = await hasPermissionsToUseTool(tool, { file_path: '/repo/a.ts' }, ctx(), NO_RULES, {
+    const r = await hasPermissionsToUseTool(tool, { file_path: '/repo/a.ts' }, ctxCwd('/repo'), NO_RULES, {
       mode: 'acceptEdits',
     });
     expect(r.behavior).toBe('allow');

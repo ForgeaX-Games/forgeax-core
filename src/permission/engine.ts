@@ -27,6 +27,7 @@ import type {
   PermissionResult,
   ToolContext,
 } from '../capability/types';
+import { relative as pathRelative, resolve as pathResolve } from 'node:path';
 import { matchRule, normalizeRules, type PermissionRule, type PermissionRuleSet } from './rules';
 
 /**
@@ -92,14 +93,27 @@ function extractTargetPath(input: unknown): string | undefined {
   return typeof candidate === 'string' ? candidate : undefined;
 }
 
+/**
+ * target 解析后是否落在 cwd 内(E-06 acceptEdits 边界)。纯字符串层(node:path.resolve
+ * 不触磁盘):相对路径按 cwd 解析,`..` 逃逸 / 绝对越界 → 落在 cwd 外。symlink 不解析
+ * (保守:与 safetyCheck 同款不触盘,注明局限)。cwd 自身(rel==='')视为内。 */
+function isWithinCwd(target: string, cwd: string): boolean {
+  const rel = pathRelative(pathResolve(cwd), pathResolve(cwd, target));
+  return rel === '' || !rel.startsWith('..');
+}
+
 /** 路径是否落在受保护目录/文件。纯字符串判定(不触磁盘):
  *  - 含 `/.git/` 或以 `.git/` 开头或正是 `.git`;
  *  - 含 `/.forgeax/` 或以 `.forgeax/` 开头或正是 `.forgeax`;
  *  - basename 命中 shell 配置文件。 */
+/** 受保护目录段(任意路径深度命中即保护)。SSOT:safetyCheck 与 OS 沙箱
+ *  (cli/sandbox-terminal.ts)共用,避免两处各自硬编码 `.git`/`.forgeax`。 */
+export const PROTECTED_DIR_SEGMENTS = ['.git', '.forgeax'] as const;
+
 export function isProtectedPath(path: string): boolean {
   const norm = path.replace(/\\/g, '/');
   const segments = norm.split('/').filter(Boolean);
-  if (segments.includes('.git') || segments.includes('.forgeax')) return true;
+  if (PROTECTED_DIR_SEGMENTS.some((s) => segments.includes(s))) return true;
   const base = segments.length > 0 ? segments[segments.length - 1] : norm;
   if (SHELL_CONFIG_BASENAMES.has(base)) return true;
   // fish 的嵌套形式 .config/fish/config.fish
@@ -315,13 +329,27 @@ export async function hasPermissionsToUseTool<I>(
     if (safety) return safety;
   }
 
-  // ⑤.5 acceptEdits 模式:edit/write 系工具自动放行(safetyCheck 已先行,受保护路径仍 ask)。
-  //   其余工具继续走 default(bypass→always-allow→passthrough)。
+  // ⑤.5 acceptEdits 模式:edit/write 系工具自动放行,但**仅限 cwd 内**(E-06)。
+  //   safetyCheck 已先行(受保护路径仍 ask);目标落在 cwd 外(绝对越界 / `..` 逃逸)
+  //   或抽不出路径 → 不自动放行,回落 default(继续往下 → 最终 ask)。心智对齐
+  //   「自动接受**本项目**的编辑」。cwd 取 ctx.cwd(host 注入),缺省 process.cwd()。
   if (mode === 'acceptEdits' && isEditTool(tool, input)) {
+    const target = extractTargetPath(input);
+    const cwdRaw = (ctx as { cwd?: unknown }).cwd;
+    const cwd = typeof cwdRaw === 'string' ? cwdRaw : process.cwd();
+    if (target !== undefined && isWithinCwd(target, cwd)) {
+      return {
+        behavior: 'allow',
+        updatedInput: getUpdatedInputOrFallback(toolResult, input),
+        decisionReason: { type: 'mode', mode: 'acceptEdits', scope: 'in-cwd' },
+      };
+    }
+    // cwd 外 / 无法抽出路径:acceptEdits 的自动放行**不覆盖项目外的写**——显式 ask
+    //   (edit 工具自身 checkPermissions 多为 allow,若在此回落会被 ⑧ 直接放行,失去边界)。
     return {
-      behavior: 'allow',
-      updatedInput: getUpdatedInputOrFallback(toolResult, input),
-      decisionReason: { type: 'mode', mode: 'acceptEdits' },
+      behavior: 'ask',
+      message: `acceptEdits auto-approves edits only inside the working directory; "${tool.name}" targets a path outside it — approval required.`,
+      decisionReason: { type: 'mode', mode: 'acceptEdits', scope: 'out-of-cwd' },
     };
   }
 

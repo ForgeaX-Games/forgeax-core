@@ -25,6 +25,7 @@
 import type { LLMProvider } from '../provider/types';
 import { inspectMcpServers, type InspectMcpOptions } from '../capability/mcp/inspect';
 import type { LspServerDef } from '../capability/lsp/servers';
+import type { SandboxStatus } from './sandbox-terminal';
 
 // ─── 对外形状 ──────────────────────────────────────────────────────────────────
 
@@ -32,7 +33,7 @@ import type { LspServerDef } from '../capability/lsp/servers';
 export type DoctorCheckStatus = 'ok' | 'fail' | 'warn' | 'skip';
 
 /** 探测分组(便于渲染层归类)。 */
-export type DoctorCheckCategory = 'provider' | 'mcp' | 'lsp';
+export type DoctorCheckCategory = 'provider' | 'mcp' | 'lsp' | 'sandbox';
 
 /** 单项探测结果(渲染层逐条画 ✅/❌/⚠️/➖ + label + 提示)。 */
 export interface DoctorCheck {
@@ -72,6 +73,17 @@ export interface DoctorOptions {
   mcp?: InspectMcpOptions;
   /** 可选 LSP 探测(003 落地后接)。缺则跳过。 */
   lsp?: DoctorLspProbe;
+  /** OS 沙箱状态(E-03):host 侧预解析(resolveSandboxStatus)后传入。缺则跳过。 */
+  sandbox?: SandboxStatus;
+}
+
+/** 把预解析的沙箱状态折成一项 doctor check(enabled=ok / 要求但不可用=fail / 可用未开=warn)。 */
+function sandboxCheck(s: SandboxStatus): DoctorCheck {
+  const base = { category: 'sandbox' as const, id: 'sandbox', label: `OS 沙箱(${s.kind})` };
+  // enabled(requested+available)=ok;要求但不可用=fail;其余(未要求)=warn。
+  if (s.enabled) return { ...base, status: 'ok', detail: s.reason };
+  if (s.requested) return { ...base, status: 'fail', detail: s.reason };
+  return { ...base, status: 'warn', detail: s.reason };
 }
 
 // ─── provider 连通探测 ──────────────────────────────────────────────────────────
@@ -211,6 +223,9 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorReport>
   }
   if (opts.lsp) {
     checks.push(...(await probeLsp(opts.lsp)));
+  }
+  if (opts.sandbox) {
+    checks.push(sandboxCheck(opts.sandbox));
   }
 
   const healthy = checks.every((c) => c.status !== 'fail');

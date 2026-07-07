@@ -130,6 +130,14 @@ export function listSessions(sessionsDir: string = defaultSessionsDir()): Sessio
 }
 
 /**
+ * 当前目录下 **最近活跃**(mtime 最新)的会话 id;无任何会话 → `undefined`。
+ * H-04:`-c/--continue` 与 TUI `/continue` 的 SSOT —— 「续接最近一次会话」而非固定 `default`。
+ */
+export function mostRecentSessionId(sessionsDir: string = defaultSessionsDir()): string | undefined {
+  return listSessions(sessionsDir)[0]?.id;
+}
+
+/**
  * 按 id 打开一个会话 WAL store 并 fold 出历史(B 层 `resume(id)` 的底层能力)。
  *
  * 纯读:new JsonlFileEventStore(指向该会话的 events.jsonl)→ foldSessionHistory。

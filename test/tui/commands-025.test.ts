@@ -177,10 +177,12 @@ describe('025 命令补齐:行为', () => {
     expect(prints.join()).toContain('未找到');
   });
 
-  test('/continue → 续接 default', async () => {
+  test('/continue → 续接最近会话(无会话时给出提示)', async () => {
+    // H-04:/continue 改为续接「最近活跃」会话。测试环境通常无会话目录 → 打印无会话提示;
+    //   若恰有会话则打印「已续接」。两者都表示命令已正确接线运行。
     const { ctx, prints } = makeCtx();
     await resolveCommand('continue')!.run(ctx, '');
-    expect(prints.join()).toContain('已续接');
+    expect(prints.join()).toMatch(/已续接|没有可续接的会话/);
   });
 
   test('/init → 生成 AGENTS.md', async () => {

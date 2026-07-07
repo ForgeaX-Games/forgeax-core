@@ -55,6 +55,7 @@ import { computeWatermarksFromModel } from '../../context/watermarks';
 import { lookupModelContext } from '../../context/model-context-table';
 import { makeStdioMcpFactory } from '../../cli/mcp-stdio';
 import { makeEnvTokenProvider } from '../../cli/mcp-token';
+import { resolveSandboxStatus, sandboxRequested } from '../../cli/sandbox-terminal';
 import { builtinSubagents } from '../../capability/agent/builtin/index';
 import { loadAgentDefs } from '../../capability/agent/index';
 import type { SandboxFs, AskQuestionFn } from '../../inject/types';
@@ -472,7 +473,9 @@ export function createAgentDriver(opts: DriverOptions, initial: HostContext): Ag
     },
 
     async runDoctor() {
-      return runDoctor({ provider: { provider: host.provider, model }, mcp: mcpOpts() });
+      // E-03:沙箱状态(host 侧解析)进 doctor —— /doctor 可见当前沙箱是否生效/可用。
+      const sandbox = resolveSandboxStatus(sandboxRequested(opts.sandbox));
+      return runDoctor({ provider: { provider: host.provider, model }, mcp: mcpOpts(), sandbox });
     },
 
     async triggerCompact(instructions?: string): Promise<{ compacted: boolean; usedLLM: boolean }> {

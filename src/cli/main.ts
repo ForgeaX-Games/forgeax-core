@@ -42,11 +42,13 @@ import { describeWindowOverride } from '../context/watermarks';
 import { lookupModelContext } from '../context/model-context-table';
 import type { ProviderMessage } from '../provider/types';
 import { NodeSandboxFs, NodeTerminal, makeNodeBackgroundSpawn } from './io';
+import { withSandbox } from './sandbox-terminal';
 import { BackgroundShellRegistry } from '../capability/builtin-tools/shell-registry';
 import { EventBus } from '../events/event-bus';
 import type { AskUserFn } from '../agent/dispatch';
-import { makeAskUser, makeHttpSearchBackend } from './host-bits';
-import { defaultSessionsDir, foldSessionHistory } from './resume-fold';
+import { makeAskUser, makeHttpSearchBackend, makeDefaultSearchBackend } from './host-bits';
+import { guardYes } from './escalation-guard';
+import { defaultSessionsDir, foldSessionHistory, mostRecentSessionId } from './resume-fold';
 import type { EventStore } from '../inject/types';
 import { resolve as resolvePath } from 'node:path';
 import { renderEvent } from './render';
@@ -90,12 +92,16 @@ export interface CliArgs {
   sock?: string;
   /** 会话 id(--resume/--session)。设了即开磁盘 WAL + 跨进程 resume。 */
   sessionId?: string;
-  /** --continue:续接「default」会话(= --resume default 的快捷)。 */
+  /** --continue:续接当前目录**最近活跃**会话(H-04;无会话则新建)。 */
   continueSession?: boolean;
   /** 会话 WAL 根目录(默认 ./.forgeax/sessions)。 */
   sessionsDir?: string;
   /** 关闭 Ink TUI,强制走原 readline REPL(§0-C / R9 回落)。 */
   noTui?: boolean;
+  /** OS 沙箱开关(E-03):true=--sandbox、false=--no-sandbox、undefined=看 env/settings。 */
+  sandbox?: boolean;
+  /** print 模式输出格式(A-01):text(默认,人类可读)/ json(轮终单对象)/ stream-json(逐事件 NDJSON)。 */
+  outputFormat?: 'text' | 'json' | 'stream-json';
 }
 
 function appendList(prev: string[] | undefined, v: string): string[] {
@@ -153,6 +159,12 @@ export function parseArgs(argv: string[]): CliArgs {
     else if (t === '--sessions-dir') a.sessionsDir = argv[++i];
     else if (t === '--yes') a.yes = true;
     else if (t === '--no-tui') a.noTui = true;
+    else if (t === '--sandbox') a.sandbox = true;
+    else if (t === '--no-sandbox') a.sandbox = false;
+    else if (t === '--output-format') {
+      const v = argv[++i];
+      if (v === 'text' || v === 'json' || v === 'stream-json') a.outputFormat = v;
+    }
     else if (t === '--thinking') {
       // 可选紧跟一个数字预算;否则布尔开。
       const next = argv[i + 1];
@@ -170,8 +182,10 @@ export function buildContext(args: CliArgs, providerOverride?: LLMProvider): Age
   const sandboxFs = new NodeSandboxFs();
   // 007:后台 bash 三件套共享注册表(经 toolContext 开放字段挂给三工具)。
   const shellRegistry = new BackgroundShellRegistry(makeNodeBackgroundSpawn());
-  const toolContext = { sandboxFs, terminal: new NodeTerminal(), cwd: process.cwd(), shellRegistry };
-  const searchBackend = args.searchUrl ? makeHttpSearchBackend(args.searchUrl) : undefined;
+  // E-03:OS 沙箱(可用且开启时套 SandboxedTerminal;要求但不可用 → loud 降级)。
+  const { terminal } = withSandbox(new NodeTerminal(), args.sandbox);
+  const toolContext = { sandboxFs, terminal, cwd: process.cwd(), shellRegistry };
+  const searchBackend = args.searchUrl ? makeHttpSearchBackend(args.searchUrl) : makeDefaultSearchBackend();
 
   // 同步可构造的能力包(builtin + web/todo/notebook + memory + skill)。mcp/plugin/hooks
   // 这类异步/绑定 bus 的能力由 runCli 经 assembleCapabilities 接;buildContext 服务
@@ -253,6 +267,10 @@ export interface RunTurnOpts {
   rules?: Partial<PermissionRuleSet> | null;
   /** CORE-CTX-005:大结果落盘钩子(runCli 据 sessionsDir 构造);截断超限结果时全量落盘可回读。 */
   persistToolResult?: (raw: string, meta: { toolUseId: string; toolName: string }) => string | undefined;
+  /** A-01:输出格式(缺省 text)。json=轮终一次性 result 对象;stream-json=每事件一行 NDJSON。 */
+  outputFormat?: 'text' | 'json' | 'stream-json';
+  /** A-01:json result 里回填的 session id(供机器消费方关联)。 */
+  sessionId?: string;
 }
 
 /** 跑一轮,把渲染结果写到 out(默认 stdout)。返回终态 reason。 */
@@ -291,16 +309,43 @@ export async function runTurn(
   //   resume-fold.ts 的纯函数,与未来 TUI /resume、serve RPC 复用同一条 fold 路径)。
   //   空/无 store → undefined → 单轮。
   const history = await foldSessionHistory(opts.store);
+  const fmt = opts.outputFormat ?? 'text';
   let reason = 'completed';
+  let resultText = ''; // A-01 json:累积 assistant 文本块
   for await (const ev of agent.run({
     input: { type: 'user', payload: prompt, ts: 0 },
     ...(history ? { history } : {}),
   })) {
-    const s = renderEvent(ev);
-    if (s) out(s);
+    if (fmt === 'stream-json') {
+      // 逐事件 NDJSON —— 直接序列化 bus 上的 AgentEvent(SSOT,不另造 DTO)。
+      out(JSON.stringify(ev) + '\n');
+    } else if (fmt === 'json') {
+      if (ev.type === 'assistant') {
+        const content = (ev.message.payload as { content?: Array<{ type: string; text?: string }> })?.content;
+        if (Array.isArray(content)) {
+          resultText += content.filter((b) => b.type === 'text' && typeof b.text === 'string').map((b) => b.text as string).join('');
+        }
+      }
+    } else {
+      const s = renderEvent(ev);
+      if (s) out(s);
+    }
     if (ev.type === 'done') reason = ev.terminal.reason;
   }
   await agent.drainAutoMemory(); // 等 auto-memory 后台抽取落盘
+  if (fmt === 'json') {
+    // 轮终一次性结果对象(对齐 CC/cbc headless json result 形态)。
+    out(
+      JSON.stringify({
+        type: 'result',
+        subtype: reason === 'completed' ? 'success' : reason,
+        is_error: reason !== 'completed',
+        result: resultText,
+        session_id: opts.sessionId ?? null,
+        reason,
+      }) + '\n',
+    );
+  }
   return reason;
 }
 
@@ -310,9 +355,11 @@ usage:
   forgeax-core -p "<prompt>"     one-shot print mode
   forgeax-core                   REPL
   forgeax-core --demo -p "hi"    demo (no API key)
+  forgeax-core mcp-serve         reverse MCP server over stdio (expose core tools to MCP clients; --allow-writes for mutating tools)
 
 flags:
   -p, --print <prompt>   run once and exit
+  --output-format <fmt>  print output: text (default) | json (one result object) | stream-json (NDJSON per event)
   --model <id>           model (default ${DEFAULT_MODEL})
   --demo                 built-in echo provider (no network)
   --memory <dir>         auto-memory dir (default ./.forgeax/memory)
@@ -323,14 +370,15 @@ flags:
   --mcp-token <s=ENV|ENV>  MCP bearer token env name (per server or wildcard)
   --plugins <dir,...>    plugin source dir(s)
   --hooks <config.json>  settings hooks ({PreToolUse:[{matcher,command}],...})
-  --search-url <url>     web_search backend (POST {query})
+  --search-url <url>     web_search backend (POST {query}); else env FORGEAX_SEARCH_URL / BRAVE_API_KEY; unset → web_search hidden
   --thinking [budget]    enable extended thinking (optional token budget)
   --resume <id>          persist + resume a session (multi-turn across processes)
   --session-id <id>      use a specific session id (new or existing; alias of --resume)
-  -c, --continue         resume the "default" session (shortcut for --resume default)
+  -c, --continue         resume the most recently active session in this dir (new if none)
   --sessions-dir <dir>   session WAL root (default ./.forgeax/sessions)
-  --yes                  auto-approve tools that require permission (ask)
+  --yes                  ⚠ DANGER: auto-approve ALL permission prompts (full access; = --dangerously-skip-permissions). Refused as root.
   --no-tui               force readline REPL (disable Ink TUI)
+  --sandbox / --no-sandbox  OS sandbox for Bash (macOS Seatbelt / Linux bwrap); else env FORGEAX_SANDBOX / settings.sandbox.enabled
   -h, --help             this help
   -v, --version          version
 env: ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL, FORGEAX_MODEL, FORGEAX_MEMORY_DIR`;
@@ -365,6 +413,24 @@ function readStdin(timeoutMs = 3000): Promise<string> {
 }
 
 export async function runCli(argv: string[], providerOverride?: LLMProvider): Promise<number> {
+  // 反向 MCP server 子命令(F-01):`forgeax-core mcp-serve` 以 stdio MCP server
+  //   形态暴露本内核工具集给外部 MCP 客户端。与 `--serve`(AgentKernel sidecar)并存。
+  //   host 入口在此装配工具集 + 权限规则,把纯 deps 交给 mcp-serve 的协议循环
+  //   (mcp-serve 不反向 import main —— 避免入口 ↔ 子模块循环依赖)。
+  if (argv[0] === 'mcp-serve') {
+    const sub = argv.slice(1);
+    const allowMutations = sub.includes('--allow-writes') || process.env.FORGEAX_MCP_ALLOW_WRITES === '1';
+    const context = buildContext(parseArgs(sub.filter((a) => a !== '--allow-writes')), providerOverride);
+    const { loadPermissionRulesFromSettings } = await import('./permission-settings');
+    const { runMcpServe } = await import('./mcp-serve');
+    return await runMcpServe({
+      tools: context.config.tools,
+      toolContext: context.toolContext as Record<string, unknown>,
+      rules: loadPermissionRulesFromSettings(),
+      allowMutations,
+    });
+  }
+
   const args = parseArgs(argv);
   if (args.help) {
     process.stdout.write(HELP + '\n');
@@ -373,6 +439,15 @@ export async function runCli(argv: string[], providerOverride?: LLMProvider): Pr
   if (args.version) {
     process.stdout.write('forgeax-core 0.1.0\n');
     return 0;
+  }
+
+  // E-05:`--yes`(自动放行一切 ask)是危险姿态 —— root/sudo 下拒绝启动(误伤面最大)。
+  if (args.yes) {
+    const v = guardYes();
+    if (!v.allowed) {
+      process.stderr.write(`[forgeax-core] ${v.reason}\n`);
+      return 1;
+    }
   }
 
   // serve 模式:起 RPC server 托管本内核,常驻直到 sidecar SIGTERM(不返回)。
@@ -390,6 +465,9 @@ export async function runCli(argv: string[], providerOverride?: LLMProvider): Pr
   }
 
   const write = (s: string): void => void process.stdout.write(s);
+  // A-01:json/stream-json 模式下,stdout 必须是纯净的机器可读流 —— 诊断/提示行改走 stderr。
+  const jsonMode = args.outputFormat === 'json' || args.outputFormat === 'stream-json';
+  const info = (s: string): void => void (jsonMode ? process.stderr.write(s) : write(s));
 
   // ── TUI 分支(PRD §0-C / R9):裸跑 + TTY + 无 -p/--serve + 非 FORGEAX_NO_TUI/--no-tui
   //    → 起 Ink TUI(进程内 embed CoreAgent,原生 askUser 弹卡)。否则维持原 headless /
@@ -421,7 +499,10 @@ export async function runCli(argv: string[], providerOverride?: LLMProvider): Pr
   // 全量装配(builtin + web/todo/notebook + memory + skill + mcp + plugin + hooks + Task),
   // plugins/hooks 订阅同一 bus(loop 用之),disposers 退出时清理。统一走 buildHostContext
   // (与 TUI driver 同源,§0-A)。
-  const sessionId = args.sessionId ?? (args.continueSession ? 'default' : undefined);
+  // H-04:`-c/--continue` = 续接当前目录**最近活跃**会话(非固定 `default`);无会话则回落
+  //   新建(undefined = 本次不持久化,不报错)。`--resume/--session <id>` 显式指名仍照旧。
+  const sessionId =
+    args.sessionId ?? (args.continueSession ? mostRecentSessionId(args.sessionsDir) : undefined);
   let host;
   try {
     host = await buildHostContext(
@@ -448,7 +529,7 @@ export async function runCli(argv: string[], providerOverride?: LLMProvider): Pr
   const { context, bus, provider, store, disposers, rules } = host;
   if (sessionId) {
     const file = resolvePath(args.sessionsDir ?? `${process.cwd()}/.forgeax/sessions`, sessionId, 'events.jsonl');
-    write(`[forgeax-core] session "${sessionId}" → ${file}\n`);
+    info(`[forgeax-core] session "${sessionId}" → ${file}\n`);
   }
 
   // auto-memory:一个 session 一个实例,跨 REPL 轮保留 surfaced/预算。
@@ -495,7 +576,7 @@ export async function runCli(argv: string[], providerOverride?: LLMProvider): Pr
   {
     const wo = describeWindowOverride(lookupModelContext(args.model));
     if (wo.rejected) {
-      write(
+      info(
         `[forgeax-core] FORGEAX_COMPACT_WINDOW=${wo.requested} 低于有效下限 ${wo.floor},已忽略并回落模型真实窗口(避免每轮 blocking_limit 硬停)。\n`,
       );
     }
@@ -509,6 +590,8 @@ export async function runCli(argv: string[], providerOverride?: LLMProvider): Pr
     store,
     rules,
     persistToolResult,
+    ...(args.outputFormat ? { outputFormat: args.outputFormat } : {}),
+    ...(sessionId ? { sessionId } : {}),
     ...(host.coordinatorInbox ? { inbox: host.coordinatorInbox } : {}),
   };
 
@@ -533,7 +616,7 @@ export async function runCli(argv: string[], providerOverride?: LLMProvider): Pr
     }
     if (oneShot != null) {
       await runTurn(context, oneShot, write, runOpts);
-      write('\n');
+      if (!jsonMode) write('\n'); // json/stream-json:stdout 保持纯净,不追加尾换行
       return 0;
     }
     // REPL(--no-tui + TTY / TUI 回落 → 原 readline)

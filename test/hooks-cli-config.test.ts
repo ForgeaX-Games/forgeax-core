@@ -18,7 +18,7 @@ import { EventBus } from '../src/events/event-bus';
 import { CoreEventType } from '../src/events/events';
 import type { CoreEvent } from '../src/events/types';
 import { readHooksSettings } from '../src/cli/host-context';
-import { getMergedSettings } from '../src/cli/settings';
+import { getMergedSettings, resetSettingsCache } from '../src/cli/settings';
 
 function tmp(): string {
   return mkdtempSync(join(tmpdir(), 'fx-hooks-'));
@@ -66,6 +66,9 @@ describe('getMergedSettings — 从项目 settings 读 hooks(27.79)', () => {
         join(dir, '.forgeax', 'settings.json'),
         JSON.stringify({ hooks: { Stop: [{ command: 'noop' }] } }),
       );
+      // getMergedSettings 用全局缓存(忽略 cwd 入参),cwd 专属 fixture 读前须先清缓存
+      // (与 permission-settings.test.ts 同约定,避免依赖测试执行顺序)。
+      resetSettingsCache();
       const merged = getMergedSettings(dir) as { hooks?: Record<string, unknown> };
       expect(merged.hooks?.Stop).toEqual([{ command: 'noop' }]);
     } finally {

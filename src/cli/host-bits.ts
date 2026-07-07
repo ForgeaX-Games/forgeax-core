@@ -86,6 +86,47 @@ export function makeHttpSearchBackend(url: string): WebSearchBackend {
   };
 }
 
+/**
+ * Brave Search API 后端(开箱参考实现,单 key 即用)。
+ * GET api.search.brave.com/res/v1/web/search?q=…,`X-Subscription-Token` 鉴权。
+ */
+export function makeBraveSearchBackend(apiKey: string): WebSearchBackend {
+  return async (query: string, signal?: AbortSignal): Promise<WebSearchResult[]> => {
+    const url = `https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(query)}`;
+    const res = await fetch(url, {
+      headers: {
+        accept: 'application/json',
+        'user-agent': FORGEAX_USER_AGENT,
+        'x-subscription-token': apiKey,
+      },
+      signal,
+    });
+    if (!res.ok) throw new Error(`brave search ${res.status}`);
+    const data = (await res.json()) as { web?: { results?: Array<{ title?: string; url?: string; description?: string }> } };
+    return (data.web?.results ?? []).map((r) => ({
+      title: r.title ?? '',
+      url: r.url ?? '',
+      snippet: r.description,
+    }));
+  };
+}
+
+/**
+ * 从 env 解析默认 web_search 后端(`--search-url` flag 不给时的兜底):
+ *   1. `FORGEAX_SEARCH_URL` → 通用 HTTP `POST {query}` 后端(与 flag 同实现);
+ *   2. `BRAVE_API_KEY` / `BRAVE_SEARCH_API_KEY` → Brave Search 参考后端;
+ *   3. 都无 → `undefined`(web_search 不进工具清单,裸跑保持干净)。
+ */
+export function makeDefaultSearchBackend(
+  env: Record<string, string | undefined> = process.env,
+): WebSearchBackend | undefined {
+  const url = env.FORGEAX_SEARCH_URL?.trim();
+  if (url) return makeHttpSearchBackend(url);
+  const braveKey = (env.BRAVE_API_KEY ?? env.BRAVE_SEARCH_API_KEY)?.trim();
+  if (braveKey) return makeBraveSearchBackend(braveKey);
+  return undefined;
+}
+
 /** 交互式权限:approveAll(--yes)→ 全放行;否则非交互一律 deny(fail-closed)。 */
 export function makeAskUser(approveAll: boolean): AskUserFn {
   return async () => approveAll;
