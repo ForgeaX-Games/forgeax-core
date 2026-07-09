@@ -333,6 +333,34 @@ export class ForgeaxCoreKernel implements AgentKernel {
     this.currentMode = opts.initialMode ?? 'default';
   }
 
+  /**
+   * 应用 `TurnRequest.toolPolicy`(契约 contract.ts:184)到最终模型工具集。
+   *
+   * 为何在此:host 声明的 `req.tools` 是宿主可控的白名单,但 facade 会在其上**额外叠加**
+   * 内核内建编排工具(`Task` 子 agent / `Handoff` 团队交接 / plan 下的 `ExitPlanMode`)。
+   * 这些内建工具不在 host roster 里,若无条件注入,game-gen 等 profile 会**意外暴露**编排能力
+   * (模型可能派子 agent、改变生成路径/产物归属,见验收报告 D.3)。`toolPolicy` 让宿主按
+   * profile roster 精确裁剪:studio 侧对不打算开放编排的 profile 传 `deny:['Task','Handoff']`
+   * 即与 legacy(无内建包)对齐。
+   *
+   * 语义(对齐契约注释):
+   *   - `allow` 存在 → **独占白名单**,只保留名字命中的工具(缺省 ⇒ 全放行)。
+   *   - `deny`  → 从模型上下文移除;支持裸名(`Bash`)与通配(`mcp__*`)。
+   *   - 缺省(policy 全空)⇒ 全放行(向后兼容,零行为变化)。
+   */
+  private applyToolPolicy(tools: AgentTool[], policy: TurnRequest['toolPolicy']): AgentTool[] {
+    if (!policy || (!policy.allow?.length && !policy.deny?.length)) return tools;
+    const toMatcher = (pat: string): ((name: string) => boolean) =>
+      pat.endsWith('*') ? (name) => name.startsWith(pat.slice(0, -1)) : (name) => name === pat;
+    const allow = policy.allow?.length ? policy.allow.map(toMatcher) : null;
+    const deny = policy.deny?.length ? policy.deny.map(toMatcher) : null;
+    return tools.filter((t) => {
+      if (allow && !allow.some((m) => m(t.name))) return false;
+      if (deny && deny.some((m) => m(t.name))) return false;
+      return true;
+    });
+  }
+
   /** ToolSpec → AgentTool,call 委托 host-tool 桥(K11)。 */
   private wrapTools(req: TurnRequest): AgentTool[] {
     const sid = req.hostSessionId as string | undefined;
@@ -431,9 +459,13 @@ export class ForgeaxCoreKernel implements AgentKernel {
         : this.o.handoff;
     // plan 模式:把 ExitPlanMode 工具加进模型工具集(只在 plan 下可见——它是退出 plan 的唯一缝)。
     const planTools = this.currentMode === 'plan' ? [exitPlanModeTool()] : [];
-    const tools = handoffSink
+    // 内建编排工具(Task/Handoff)默认叠加;再经 req.toolPolicy 按 host roster 裁剪
+    //   (缺省全放行 = 零行为变化;studio 对 game-gen profile deny Task/Handoff → 与 legacy 对齐,
+    //   见 applyToolPolicy 与验收报告 D.3)。
+    const assembled = handoffSink
       ? [...hostTools, taskTool, handoffTool(), ...planTools]
       : [...hostTools, taskTool, ...planTools];
+    const tools = this.applyToolPolicy(assembled, req.toolPolicy);
     const context: AgentContext = {
       agentId: req.session.agentId,
       provider: this.o.provider,

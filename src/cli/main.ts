@@ -15,6 +15,7 @@
  * Boundary: 仅 core 相对 + node:。
  */
 import { createInterface } from 'node:readline';
+import { StringDecoder } from 'node:string_decoder';
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import { CoreAgent } from '../agent/agent';
@@ -395,15 +396,19 @@ function readStdin(timeoutMs = 3000): Promise<string> {
   return new Promise((resolve) => {
     let data = '';
     let settled = false;
+    // StringDecoder:stdin 分片可能切在多字节 UTF-8 序列中间,逐块 `toString` 会把不完整
+    // 尾字节解成 U+FFFD 并丢字节(同 ipc/rpc 帧解析,见验收报告 A.5)。缓到下一片再解。
+    const decoder = new StringDecoder('utf8');
     const finish = (): void => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       process.stdin.off('data', onData);
+      data += decoder.end(); // flush 任何残留尾字节
       resolve(data);
     };
     const onData = (chunk: Buffer | string): void => {
-      data += typeof chunk === 'string' ? chunk : chunk.toString('utf8');
+      data += typeof chunk === 'string' ? chunk : decoder.write(chunk);
     };
     const timer = setTimeout(finish, timeoutMs);
     process.stdin.on('data', onData);

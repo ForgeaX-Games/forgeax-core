@@ -5,9 +5,10 @@
  * 请求/响应按 id 关联 + 单向通知)。**core 边界禁止 import agent-host**,故这里复制一份最小
  * 实现(仅 node:net),供 forgeax-core `--serve` 数据面用;adapter 侧仍用 agent-host 的同款。
  *
- * Boundary: 仅 node:net。
+ * Boundary: 仅 node:net + node:string_decoder。
  */
 import { createServer, type Server, type Socket } from 'node:net';
+import { StringDecoder } from 'node:string_decoder';
 
 export interface RpcRequest { jsonrpc: '2.0'; id: number; method: string; params?: unknown }
 export interface RpcNotify { jsonrpc: '2.0'; method: string; params?: unknown }
@@ -18,11 +19,15 @@ function encodeFrame(msg: RpcMessage): string {
   return JSON.stringify(msg) + '\n';
 }
 
-/** 半包/粘包安全:喂 chunk,吐完整消息。 */
+/** 半包/粘包安全:喂 chunk,吐完整消息。
+ *  ⚠️ 用 StringDecoder(而非 `chunk.toString('utf8')`)解 Buffer:socket 分片可能落在
+ *  多字节 UTF-8 序列中间,`toString` 会把不完整尾字节解成 `U+FFFD` 并丢字节,大 charter
+ *  静默损坏中文(见验收报告 A.5)。StringDecoder 把不完整尾字节缓到下一片再解。 */
 function createFrameParser(): (chunk: Buffer | string) => RpcMessage[] {
+  const decoder = new StringDecoder('utf8');
   let buf = '';
   return (chunk) => {
-    buf += typeof chunk === 'string' ? chunk : chunk.toString('utf8');
+    buf += typeof chunk === 'string' ? chunk : decoder.write(chunk);
     const out: RpcMessage[] = [];
     let i: number;
     while ((i = buf.indexOf('\n')) >= 0) {
@@ -56,6 +61,10 @@ export class RpcConnection {
       this.pending.clear();
     });
   }
+
+  /** 连接是否仍存活(底层 socket 未 close)。消费者复用前据此探测直连,socket
+   *  被动关闭(sidecar 重启 / serve 崩溃)后可主动驱逐而非白丢一轮。 */
+  get isOpen(): boolean { return !this.closed; }
 
   setRequestHandler(h: RequestHandler): void { this.reqHandler = h; }
   onNotify(h: NotifyHandler): void { this.notifyHandler = h; }

@@ -471,3 +471,53 @@ describe('ForgeaxCoreKernel — delivery 二分(B 路径)', () => {
     expect(bridge).toBe(1); // 缺实现 → fail-safe 回桥
   });
 });
+
+describe('ForgeaxCoreKernel — toolPolicy 裁剪内建工具(验收报告 D.3)', () => {
+  // 捕获本轮呈递给模型的工具名(第一次 stream 调用的 ProviderRequest.tools)。
+  function capturingProvider(seen: string[][]): LLMProvider {
+    return {
+      api: 'stub',
+      async *stream(r: ProviderRequest) {
+        seen.push(r.tools.map((t) => t.name));
+        yield asstText('ok');
+      },
+    };
+  }
+
+  test('缺省(无 policy)→ 内建 Task 随 host 工具一同上线(现状回归)', async () => {
+    const seen: string[][] = [];
+    const k = new ForgeaxCoreKernel({ provider: capturingProvider(seen), executeTool: async () => null });
+    await collect(k, req({ tools: [{ name: 'echo', inputSchema: {} }] }));
+    expect(seen[0]).toContain('echo');
+    expect(seen[0]).toContain('Task');
+  });
+
+  test('toolPolicy.deny:[Task] → Task 从模型工具集移除,host 工具保留', async () => {
+    const seen: string[][] = [];
+    const k = new ForgeaxCoreKernel({ provider: capturingProvider(seen), executeTool: async () => null });
+    await collect(k, req({ tools: [{ name: 'echo', inputSchema: {} }], toolPolicy: { deny: ['Task'] } }));
+    expect(seen[0]).toContain('echo');
+    expect(seen[0]).not.toContain('Task');
+  });
+
+  test('toolPolicy.deny 通配 mcp__* → 前缀命中的 host 工具被剔,其余保留', async () => {
+    const seen: string[][] = [];
+    const k = new ForgeaxCoreKernel({ provider: capturingProvider(seen), executeTool: async () => null });
+    await collect(k, req({
+      tools: [{ name: 'echo', inputSchema: {} }, { name: 'mcp__x__foo', inputSchema: {} }],
+      toolPolicy: { deny: ['mcp__*'] },
+    }));
+    expect(seen[0]).toContain('echo');
+    expect(seen[0]).not.toContain('mcp__x__foo');
+  });
+
+  test('toolPolicy.allow 独占白名单 → 仅命中项保留(含内建也被卡)', async () => {
+    const seen: string[][] = [];
+    const k = new ForgeaxCoreKernel({ provider: capturingProvider(seen), executeTool: async () => null });
+    await collect(k, req({
+      tools: [{ name: 'echo', inputSchema: {} }, { name: 'read_file', inputSchema: {} }],
+      toolPolicy: { allow: ['echo'] },
+    }));
+    expect(seen[0]).toEqual(['echo']);
+  });
+});
