@@ -20,6 +20,7 @@
  */
 import { useEffect, useState } from 'react';
 import { inkInstanceRef } from './ink-instance-ref';
+import { COMMAND_CLOSE, shellMarksEnabled } from './shell-marks';
 
 /** clearTerminal = ERASE_SCREEN + ERASE_SCROLLBACK + CURSOR_HOME(对齐 ansi-escapes.clearTerminal)。 */
 const ESC = String.fromCharCode(27); // 避免源码内裸 ESC 字节被 formatter 弄坏
@@ -35,6 +36,9 @@ const CLEAR_TERMINAL = `${ESC}[2J${ESC}[3J${ESC}[H`;
 export function cleanRedraw(): void {
   inkInstanceRef.current?.resetStaticOutput?.();
   try {
+    // 清屏前先收口当前 open command(D;0):VS Code 拦截 2J 时会把视口内已提交的 command
+    //   连记账一起清,不先收口会残留一条持陈旧 marker 的垃圾条目。仅真 TTY 发(见 shell-marks)。
+    if (shellMarksEnabled()) process.stdout.write(COMMAND_CLOSE);
     process.stdout.write(CLEAR_TERMINAL);
   } catch {
     /* 写失败也无妨,调用方的 remount 仍会重绘 */

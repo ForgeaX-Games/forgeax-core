@@ -8,6 +8,7 @@
 import { mkdtempSync, rmSync, writeFileSync, existsSync, readFileSync, readdirSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { FORGEAX_CORE_VERSION } from '../src/version';
 
 const MAIN = join(import.meta.dir, '..', 'src', 'cli', 'main.ts');
 const KEY = process.env.ANTHROPIC_API_KEY;
@@ -117,7 +118,7 @@ const cases: CaseDef[] = [
   {
     name: 'cli/--version',
     args: () => ['--version'],
-    assert: (r) => (r.code === 0 && has(r.out, 'forgeax-core 0.1.0') ? null : 'version 输出异常'),
+    assert: (r) => (r.code === 0 && has(r.out, `forgeax-core ${FORGEAX_CORE_VERSION}`) ? null : 'version 输出异常'),
   },
   {
     name: 'cli/--demo (无 key echo)',

@@ -23,6 +23,7 @@ import { notebookToolsPack } from '../capability/builtin-tools/notebook-tools';
 import { BackgroundShellRegistry, type BackgroundSpawnFn } from '../capability/builtin-tools/shell-registry';
 import { lspToolsPack } from '../capability/lsp/index';
 import { memoryPack } from '../capability/memory/index';
+import { instructionsPack, type InstructionDirs } from '../capability/instructions/index';
 import { skillPack } from '../capability/skill/index';
 import {
   parseMcpConfig,
@@ -55,6 +56,9 @@ export interface AssembleCapabilitiesOptions {
   todoStore?: TodoStore;
   /** 记忆:给了即挂 memory_search/remember + MEMORY.md slot。 */
   memory?: { dir: string; sandboxFs: SandboxFs; selectFn?: MemorySelectFn };
+  /** 分层指令(AGENTS.md/CLAUDE.md + rules + @import):给了即挂 instructions static slot
+   *  (排在 memory 之前;host 从 configHomeDir()/homedir()/cwd 算出 dirs)。缺省 → 不装载。 */
+  instructions?: InstructionDirs;
   /** skill 根目录(给了即挂 Skill 工具)。 */
   skillDirs?: readonly string[];
   /** 单文件 markdown 指令根目录(目录下递归 `*.md`;与 skill 合并进同一 Skill 工具)。 */
@@ -119,6 +123,10 @@ export async function assembleCapabilities(opts: AssembleCapabilitiesOptions): P
   packs.push(lspToolsPack()); // LSP 代码智能工具(独立 pack;缺 server 时优雅降级)。
 
   // ② 记忆(memory_search/remember + MEMORY.md slot)。
+  //   分层指令 slot 排在 memory 之前(env slot 由 host 前置 → env → instructions → memory)。
+  if (opts.instructions) {
+    packs.push(instructionsPack(opts.instructions));
+  }
   if (opts.memory) {
     packs.push(memoryPack({ memoryDir: opts.memory.dir, sandboxFs: opts.memory.sandboxFs, selectFn: opts.memory.selectFn }));
   }

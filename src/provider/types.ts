@@ -121,11 +121,23 @@ export type ProviderStreamEvent =
 
 // ─── Provider 接口 ─────────────────────────────────────────────────────────
 
+/** 一次重试即将发生前的观测信息(T5 onRetry seam)。attempt = 刚失败的尝试序号(1 起,
+ *  重试是 attempt+1);reason = 触发原因(如 '429'/'529'/'500'/'overloaded'/'stream_idle');
+ *  retryAfterMs = 服务端建议退避(Retry-After 存在时)。纯观测,不影响重试决策。 */
+export interface RetryInfo {
+  attempt: number;
+  reason: string;
+  retryAfterMs?: number;
+}
+
 export interface ProviderCallOpts {
   signal: AbortSignal;
   /** 切模型回调（流式 fallback 时 LOOP 决定真正切换）。 */
   onStreamingFallback?: () => void;
   fallbackModel?: string;
+  /** ★ T5 观测缝(可选;不传 = 与今天逐字一致,零回归):每次即将重试前调用一次,供上层
+   *  (loop)把重试事件投射到 bus → facade 映射成 `api_retry` KernelEvent 出墙。 */
+  onRetry?: (info: RetryInfo) => void;
 }
 
 export interface LLMProvider {

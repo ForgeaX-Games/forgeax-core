@@ -58,6 +58,8 @@ import type { PermissionRuleSet } from '../permission/rules';
 import { demoProvider } from './demo-provider';
 import { buildHostContext, resolveHostProvider, pickApi, DEFAULT_MODEL, DEFAULT_LEADING, DEFAULT_MAIN_MAX_TURNS } from './host-context';
 import { getMergedSettings } from './settings';
+import { FORGEAX_CORE_VERSION } from '../version';
+import { trustGate } from './trust';
 import { discoverSkillDirs, discoverCommandDirs, discoverAgentDirs } from './locations';
 import { makeEnvSlot } from './env-slot';
 
@@ -442,7 +444,7 @@ export async function runCli(argv: string[], providerOverride?: LLMProvider): Pr
     return 0;
   }
   if (args.version) {
-    process.stdout.write('forgeax-core 0.1.0\n');
+    process.stdout.write(`forgeax-core ${FORGEAX_CORE_VERSION}\n`);
     return 0;
   }
 
@@ -491,6 +493,22 @@ export async function runCli(argv: string[], providerOverride?: LLMProvider): Pr
     !process.env.FORGEAX_NO_TUI &&
     stdoutTTY &&
     stdinRawOk;
+
+  // ── 信任门(设计稿 §3.1 / P0-1):交互式首次进入未信任目录 → 弹确认;拒绝即退出,
+  //    **不装配任何项目侧可执行配置**(hooks/MCP/plugins)。门刻意在下方 TUI 回落
+  //    try/catch 之外:runTui 崩溃回落 readline 也已在门内;弹窗自身异常在 trustGate
+  //    里降级纯文本 y/N(fail-closed,绝不因异常放行)。--demo / --yes 照常弹
+  //    (demo 只换 provider、装配面不减,P0-2;--yes 与 trust 正交,§1.3)。
+  //    非交互(-p / 管道 / serve)跳过,对齐 cc `-p`;FORGEAX_SKIP_TRUST=1 为 CI 逃生口。
+  const interactive = args.prompt == null && !args.serve && process.stdin.isTTY === true;
+  const trusted = await trustGate({
+    cwd: process.cwd(),
+    interactive,
+    wantTui,
+    dialog: async (cwd) => (await import('../tui/screens/Trust')).runTrustDialog(cwd),
+  });
+  if (!trusted) return 1;
+
   if (wantTui) {
     try {
       const { runTui } = await import('../tui/app');

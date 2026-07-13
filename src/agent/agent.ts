@@ -42,8 +42,10 @@ import {
   markCompactSuccess,
   markCompactFailure,
   initialGateState,
+  triggerThresholdFor,
 } from '../context/compaction-gate';
 import { runCompaction } from '../context/compaction-pipeline';
+import { estimateTokens } from '../context/deterministic-compact';
 import { rehydrate } from '../context/post-compact-rehydrate';
 import {
   CompactType,
@@ -73,7 +75,7 @@ import { ReadTracker } from '../capability/read-tracker';
 import { aggregateErrorCategories, summarizeErrorStats } from '../diagnostics/error-stats';
 import type { HandoffSink, HandoffIntent, HandoffResolution } from '../inject/types';
 import { HANDOFF_INTENT_KEY } from '../capability/builtin-tools/message-tools';
-import { EXIT_PLAN_INTENT_KEY } from '../capability/builtin-tools/plan-tools';
+import { EXIT_PLAN_INTENT_KEY, exitPlanModeTool } from '../capability/builtin-tools/plan-tools';
 
 /**
  * Compaction V2(压缩改造,可选;注入即激活新路径,缺省走旧 `compaction` strategy → 零回归)。
@@ -124,6 +126,10 @@ export interface CoreAgentOptions {
   bus?: EventBus;
   rules?: Partial<PermissionRuleSet> | null;
   mode?: PermissionMode;
+  /** 进入 plan 前的权限模式(mode==='plan' 时才有意义)。ExitPlanMode 获批退出时恢复此值
+   *  (无则回退 'default')。facade 每轮重建 agent 时经此把「进入前模式」带进来;
+   *  直连长活 agent 由 setMode 自动追踪,无需传。 */
+  prePlanMode?: PermissionMode;
   /** 启用 core 内置受保护路径 safetyCheck(.git/.forgeax/shell-rc,bypass 免疫)。
    *  **默认 true(E-04 secure-by-default)**——库嵌入 / serve 也有路径保护;host 若自带
    *  等效把闸可显式传 `false` opt-out。 */
@@ -186,13 +192,6 @@ export interface CoreAgentOptions {
    *  缺省 → agent.run 作 root span(library/独立形态)。本字段内部于 core,不对外契约(其它 track
    *  不依赖)。绝不读 active-context —— parent 只认这个显式参数。 */
   parentSpan?: Span;
-}
-
-/** 粗估 messages token 数(量级:~4 char/token)。 */
-function estimateTokens(messages: ProviderMessage[]): number {
-  let chars = 0;
-  for (const m of messages) chars += typeof m.content === 'string' ? m.content.length : JSON.stringify(m.content).length;
-  return Math.ceil(chars / 4);
 }
 
 /** 稳定 JSON 序列化(键排序):用作「同 tool + 同 args」循环兜底的去重 key。 */
@@ -439,9 +438,13 @@ export class CoreAgent implements Agent {
   /** 同一文件重复读计数 + 最近读顺序(per-run;run() 起始重置)。D-01:压后重挂自取它的
    *  `recentPaths()` 作数据源(host 拿不到 loop 内部 tracker → loop 自取)。 */
   private readTracker = new ReadTracker();
-  /** 当前权限模式(可被 facade `setMode` 在运行中切换;ExitPlanMode 命中后翻回 default)。
+  /** 当前权限模式(可被 facade `setMode` 在运行中切换;ExitPlanMode 获批后恢复 prePlanMode)。
    *  初值取 options.mode(缺省 'default'),从此**取代** o.mode 作为 dispatch 的权威模式源。 */
   private currentMode: PermissionMode;
+  /** 进入 plan 前的权限模式(仅 currentMode==='plan' 期间有意义;ExitPlanMode 获批退出时
+   *  恢复它而非硬编码 'default',公理 §2 Derive)。setMode 进 plan 时自动记录;
+   *  facade 每轮重建 agent 经 options.prePlanMode 带入。 */
+  private prePlanMode: PermissionMode | undefined;
   /** 当前模型(可被 facade `setModel` 在运行中切换)。初值取 context.config.model,
    *  从此**取代** o.context.config.model 作为 buildRequest 的权威模型源。 */
   private currentModel: string;
@@ -452,6 +455,7 @@ export class CoreAgent implements Agent {
     this.bus = opts.bus ?? new EventBus();
     this.assembler = opts.assembler ?? systemPromptAssembler;
     this.currentMode = opts.mode ?? 'default';
+    this.prePlanMode = this.currentMode === 'plan' ? opts.prePlanMode : undefined;
     this.currentModel = opts.context.config.model;
   }
 
@@ -460,9 +464,22 @@ export class CoreAgent implements Agent {
   }
 
   /** 运行中切换权限模式(facade `TurnHandle.setPermissionMode` → translateNeutral → 此)。
-   *  影响后续 turn 的 dispatch 把闸;当前正在执行的工具批不回溯。 */
+   *  影响后续 turn 的 dispatch 把闸;当前正在执行的工具批不回溯。
+   *  进 plan(非 plan → plan)自动记录进入前模式供退出时恢复;显式切到非 plan 则清掉。 */
   setMode(m: PermissionMode): void {
+    if (m === 'plan' && this.currentMode !== 'plan') this.prePlanMode = this.currentMode;
+    else if (m !== 'plan') this.prePlanMode = undefined;
     this.currentMode = m;
+  }
+
+  /** 当前权限模式(facade 轮终回读,同步 kernel 级状态——修复 exit-plan 后 facade 失同步)。 */
+  getMode(): PermissionMode {
+    return this.currentMode;
+  }
+
+  /** 进入 plan 前的模式(仅 plan 期间非空;facade 轮终回读)。 */
+  getPrePlanMode(): PermissionMode | undefined {
+    return this.prePlanMode;
   }
 
   /** 运行中切换模型(facade `TurnHandle.setModel` → 此)。下一次 provider 调用即生效;
@@ -487,11 +504,32 @@ export class CoreAgent implements Agent {
   private async reactiveCompactOnce(messages: ProviderMessage[], turn: number): Promise<boolean> {
     const strategy = this.o.compaction;
     if (!strategy) return false;
-    this.bus.publish(this.ev(CoreEventType.PreCompact, { trigger: 'auto', tokenCount: estimateTokens(messages) }));
-    const { replacement, coveredFrom, coveredTo } = await strategy.compact(messages);
+    const preTokens = estimateTokens(messages);
+    this.bus.publish(this.ev(CoreEventType.PreCompact, { trigger: 'auto', tokenCount: preTokens }));
+    let result: Awaited<ReturnType<typeof strategy.compact>>;
+    try {
+      result = await strategy.compact(messages);
+    } catch (e) {
+      // 04.4:失败不再静默(caller 可能吞异常落 prompt_too_long,事件是观测口)。
+      this.bus.publish(
+        this.ev(CoreEventType.CompactionFailed, {
+          error: e instanceof Error ? e.message : String(e),
+          trigger: 'auto',
+          tokenCount: preTokens,
+        }),
+      );
+      throw e;
+    }
+    const { replacement, coveredFrom, coveredTo } = result;
     const count = Math.max(0, coveredTo - coveredFrom + 1);
     if (count <= 0) return false;
-    this.bus.publish(this.ev(CoreEventType.CompactionApplied, { coveredFrom, coveredTo, replacement }));
+    // ★ T5:压缩前后 token(观测,不进 fold)。postTokens 用「前 − 覆盖区 + replacement」估算,
+    //   免 splice 依赖 → 保持发布时机不变(零回归)。
+    const postTokens =
+      preTokens - estimateTokens(messages.slice(coveredFrom, coveredTo + 1)) + estimateTokens([replacement as ProviderMessage]);
+    this.bus.publish(
+      this.ev(CoreEventType.CompactionApplied, { coveredFrom, coveredTo, replacement, preTokens, postTokens, trigger: 'auto' }),
+    );
     messages.splice(coveredFrom, count, replacement as ProviderMessage);
     this.bus.publish(this.ev(CoreEventType.PostCompact, { coveredFrom, coveredTo }));
     this.bus.publish(this.ev(CoreEventType.TurnAborted, { turn, reason: 'reactive_compact_retry' }));
@@ -535,14 +573,43 @@ export class CoreAgent implements Agent {
         autoCompactEnabled: v2.autoCompactEnabled ?? true,
         config: v2.gateConfig ?? DEFAULT_GATE_CONFIG,
       });
-      if (!decision.compact) return 'skipped';
+      if (!decision.compact) {
+        // 04.4:skip 不再静默。仅在「阈值已达却被治理机制拦下」(busy/cooldown/circuit-open/
+        //   recursive)时发——below-threshold/disabled 属每轮常态,发了会刷爆 WAL。
+        //   注意 gate 的 cooldown/circuit 检查先于阈值,故此处必须自行复核阈值再发。
+        if (
+          decision.reason !== 'below-threshold' &&
+          decision.reason !== 'disabled' &&
+          tokenCount >= triggerThresholdFor(type, marks)
+        ) {
+          this.bus.publish(
+            this.ev(CoreEventType.CompactionSkipped, {
+              reason: decision.reason,
+              trigger: compactTrigger(type),
+              type,
+              tokenCount,
+            }),
+          );
+        }
+        return 'skipped';
+      }
     }
 
     // PreCompact(可阻断):hook 回执 blocked===true → 跳过本次压缩(E-I5)。
     const pre = this.bus.publish(
       this.ev(CoreEventType.PreCompact, { trigger: compactTrigger(type), tokenCount, type }),
     ) as CoreEvent & { blocked?: boolean };
-    if (pre.blocked === true) return 'skipped';
+    if (pre.blocked === true) {
+      this.bus.publish(
+        this.ev(CoreEventType.CompactionSkipped, {
+          reason: 'hook-blocked',
+          trigger: compactTrigger(type),
+          type,
+          tokenCount,
+        }),
+      );
+      return 'skipped';
+    }
 
     this.gateState = markCompactStart(this.gateState);
     const scenario: SummaryScenario =
@@ -562,6 +629,14 @@ export class CoreAgent implements Agent {
           coveredFrom: result.coveredFrom,
           coveredTo: result.coveredTo,
           replacement: result.replacement,
+          // ★ T5:压缩前后 token + 触发原因(观测,fold 不读)。postTokens 用
+          //   「前 − 覆盖区 + replacement」估算,免 splice 依赖 → 发布时机不变(零回归)。
+          preTokens: tokenCount,
+          postTokens:
+            tokenCount -
+            estimateTokens(messages.slice(result.coveredFrom, result.coveredTo + 1)) +
+            estimateTokens([result.replacement]),
+          trigger: compactTrigger(type),
         }),
       );
       const count = Math.max(0, result.coveredTo - result.coveredFrom + 1);
@@ -593,7 +668,16 @@ export class CoreAgent implements Agent {
       return 'compacted';
     } catch (e) {
       // 失败:messages 未 splice(自动回滚)+ 熔断计数 +1;上抛交 caller 处理终态。
+      // 04.4:失败不再静默——pre-message 路的 caller 会吞异常,本事件是唯一观测口。
       this.gateState = markCompactFailure(this.gateState);
+      this.bus.publish(
+        this.ev(CoreEventType.CompactionFailed, {
+          error: e instanceof Error ? e.message : String(e),
+          trigger: compactTrigger(type),
+          type,
+          tokenCount,
+        }),
+      );
       throw e;
     }
   }
@@ -713,10 +797,16 @@ export class CoreAgent implements Agent {
     const toolSearch =
       deferred.length > 0 ? buildToolSearchTool(deferred, (names) => names.forEach((n) => activated.add(n))) : null;
 
+    // plan 出口工具(007,SSOT 注入点):plan 模式的轮才把 ExitPlanMode 进模型工具集(见
+    //   stage1)。注入收敛在 loop 这一处 —— 直连(TUI/CLI/库嵌入)与 facade 路径同源获得,
+    //   host 无需(也不应)各自注入。
+    const planExitTool = exitPlanModeTool();
+
     // ─── 全局 tool-result 预算兜底(移植 agentic_os 03.B):单 tool 声明 maxResultSizeChars,LOOP 统一裁。
     const budgetMap = new Map<string, number>();
     for (const t of allTools) budgetMap.set(t.name, t.maxResultSizeChars);
     if (toolSearch) budgetMap.set(toolSearch.name, toolSearch.maxResultSizeChars);
+    budgetMap.set(planExitTool.name, planExitTool.maxResultSizeChars);
     const budgetFor = (name: string): number => budgetMap.get(name) ?? Infinity;
 
     // ─── 真实 token 账(reactive autocompact):用上一轮 API 回传 prompt token 判水位。
@@ -802,9 +892,15 @@ export class CoreAgent implements Agent {
       }
 
       // stage1 resolve capabilities —— effectiveTools = active + 已激活 deferred + ToolSearch。
-      const tools: AgentTool[] = toolSearch
+      const baseTools: AgentTool[] = toolSearch
         ? [...activeTools, ...deferred.filter((d) => activated.has(d.name)), toolSearch]
         : activeTools;
+      // plan 模式:补注 ExitPlanMode(它是模型走出 plan 的唯一缝;host 已声明同名工具则不重复)。
+      //   逐轮判定:setMode 中途切 plan 也能在下一轮拿到工具、退出后即从工具集消失。
+      const tools: AgentTool[] =
+        this.currentMode === 'plan' && !baseTools.some((t) => t.name === planExitTool.name)
+          ? [...baseTools, planExitTool]
+          : baseTools;
       yield { type: 'stage', stage: 'resolve_capabilities', turn };
       this.bus.publish(this.ev(CoreEventType.CapabilitiesResolved, { toolNames: tools.map((t) => t.name) }));
 
@@ -866,6 +962,14 @@ export class CoreAgent implements Agent {
           } catch (e) {
             // 压缩自身失败(如 summarize 仍超长且无法再头部截断、provider 报错)→ 优雅终止,
             //   绝不让异常穿出 generator 崩掉整轮(>1M resume 的兜底:host 拿到 prompt_too_long)。
+            // 04.4:失败不再静默,发 CompactionFailed 供离线统计。
+            this.bus.publish(
+              this.ev(CoreEventType.CompactionFailed, {
+                error: e instanceof Error ? e.message : String(e),
+                trigger: 'auto',
+                tokenCount,
+              }),
+            );
             yield done('prompt_too_long', { error: e });
             return;
           }
@@ -894,7 +998,13 @@ export class CoreAgent implements Agent {
         for await (const sev of streamWithRetry(
           this.o.context.provider,
           req,
-          { signal, fallbackModel: this.o.context.config.fallbackModel },
+          {
+            signal,
+            fallbackModel: this.o.context.config.fallbackModel,
+            // ★ T5:每次上游重试前把观测信息投射到 bus → facade 映射成 api_retry 出墙。
+            //   纯观测,不改重试行为(缺省无订阅者时是一次空 publish)。
+            onRetry: (info) => this.bus.publish(this.ev(CoreEventType.ApiRetry, info)),
+          },
           this.o.retry,
         )) {
           yield { type: 'stream', event: sev };
@@ -1160,12 +1270,15 @@ export class CoreAgent implements Agent {
         (tu) => interceptedReads.get(tu.id) ?? dispById.get(tu.id)!,
       ).filter((r): r is ToolDispatchResult => r != null);
 
-      // ExitPlanMode:本轮工具结果含 sentinel → 把权限模式翻回 default(plan→执行)。
+      // ExitPlanMode:本轮工具结果含 sentinel(= 人类已在 ask 闸 approve,工具才执行到)→
+      //   恢复进入 plan 前的权限模式(无记录则回退 default,不再硬编码)。
       //   置于 dispatch 之后:本轮 ExitPlanMode 调用本身仍在 plan 把闸下被放行(只读豁免),
       //   翻模式只影响下一 turn 的 dispatch(模型据 tool.result 知道已可执行)。
       if (this.currentMode === 'plan' && hasExitPlanIntent(results)) {
-        this.currentMode = 'default';
-        this.bus.publish(this.ev('permission.mode_changed', { turn, mode: 'default', reason: 'exit_plan_mode' }));
+        const restored = this.prePlanMode ?? 'default';
+        this.prePlanMode = undefined;
+        this.currentMode = restored;
+        this.bus.publish(this.ev('permission.mode_changed', { turn, mode: restored, reason: 'exit_plan_mode' }));
       }
 
       // 诊断:本轮工具错误按五类聚合,发一条 tool.error_stats 事件(纯函数,无 IO;WS5)。

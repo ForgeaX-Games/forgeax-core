@@ -24,15 +24,80 @@ export const OMIT_ARG = '<omitted>';
 /** 默认被 omit 的 tool_use 大参数字段。 */
 export const DEFAULT_LARGE_ARG_FIELDS = ['content', 'code', 'widget_code', 'file_text', 'new_string'] as const;
 
-/** 粗估 token(~4 char/token)。 */
+// ── image/media token 估算(bytes-band,移植 agentic_os 04.8)─────────────────────
+// base64 char/4 会把 1MB 图估成 ~333K token(真实 ~1.5K,偏差 100-1000x),导致首轮
+// 水位判定 / 压后 blocking 判定被虚高值误触发。改按解码字节三档经验系数;保持**高估
+// 方向**(绝不回退到低估 → HTTP body 逼近 API 上限仍不触发压缩的旧 bug)。
+
+/** raw < 50KB 的小图。 */
+export const IMAGE_TOKEN_SMALL = 250;
+/** 50KB ≤ raw < 500KB 的中图。 */
+export const IMAGE_TOKEN_MEDIUM = 1_500;
+/** raw ≥ 500KB 的大图(主流模型单图真实 token 不超 3000)。 */
+export const IMAGE_TOKEN_LARGE = 3_000;
+const IMAGE_BYTES_SMALL = 50_000;
+const IMAGE_BYTES_MEDIUM = 500_000;
+
+/** base64 字符长度 → image/media token 估算(raw bytes ≈ len × 0.75,三档)。 */
+export function imageTokensFromBase64Length(base64Len: number): number {
+  const rawBytes = base64Len * 0.75;
+  if (rawBytes < IMAGE_BYTES_SMALL) return IMAGE_TOKEN_SMALL;
+  if (rawBytes < IMAGE_BYTES_MEDIUM) return IMAGE_TOKEN_MEDIUM;
+  return IMAGE_TOKEN_LARGE;
+}
+
+/** 粗估 token(~4 char/token;image/media block 走 bytes-band,不按字符计)。 */
 export function estimateTokens(messages: readonly unknown[]): number {
   let chars = 0;
+  let mediaTokens = 0;
   for (const m of messages) {
     const rec = asRecord(m);
     const c = rec?.content;
-    chars += typeof c === 'string' ? c.length : JSON.stringify(c ?? m).length;
+    if (typeof c === 'string') {
+      chars += c.length;
+    } else if (Array.isArray(c)) {
+      for (const block of c) {
+        const r = estimateBlockSize(block);
+        chars += r.chars;
+        mediaTokens += r.mediaTokens;
+      }
+    } else {
+      chars += JSON.stringify(c ?? m).length;
+    }
   }
-  return Math.ceil(chars / 4);
+  return Math.ceil(chars / 4) + mediaTokens;
+}
+
+/** 单 block 的估算量:文本类按 JSON 字符计,image/media 按 bytes-band 单独计,
+ *  tool_result 的数组 content(read_file 读图 → [text, image…])递归按块计。 */
+function estimateBlockSize(block: unknown): { chars: number; mediaTokens: number } {
+  const b = asRecord(block);
+  if (!b) return { chars: JSON.stringify(block ?? null).length, mediaTokens: 0 };
+  const kind = classifyBlock(b);
+  if (kind === 'image' || kind === 'media') {
+    const data = base64DataOf(b);
+    // 有 base64 → bytes-band;无(已被剥成占位/仅引用)→ 按结构 JSON 长度(很小)。
+    if (data !== null) return { chars: 0, mediaTokens: imageTokensFromBase64Length(data.length) };
+    return { chars: JSON.stringify(b).length, mediaTokens: 0 };
+  }
+  if (kind === 'tool_result' && Array.isArray(b.content)) {
+    let chars = JSON.stringify({ ...b, content: undefined }).length;
+    let mediaTokens = 0;
+    for (const inner of b.content) {
+      const r = estimateBlockSize(inner);
+      chars += r.chars;
+      mediaTokens += r.mediaTokens;
+    }
+    return { chars, mediaTokens };
+  }
+  return { chars: JSON.stringify(b).length, mediaTokens: 0 };
+}
+
+/** image/media block 的 base64 数据(Anthropic 形 `source.data`,或扁平 `data`);无 → null。 */
+function base64DataOf(b: Record<string, unknown>): string | null {
+  const src = asRecord(b.source);
+  const d = src?.data ?? b.data;
+  return typeof d === 'string' ? d : null;
 }
 
 /** L1 后是否已"足够小"(#12 sufficiency 短路):estimated ≤ effective × ratio。 */

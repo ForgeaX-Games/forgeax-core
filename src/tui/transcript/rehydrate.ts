@@ -84,6 +84,46 @@ export interface CheckpointRef {
   hasCode: boolean;
 }
 
+/** resume 一致性探针结果(T1)。ok=false 时可直接 console.warn。 */
+export interface ResumeConsistency {
+  ok: boolean;
+  /** 原始 WAL 文本里 user_prompt.submit + assistant.message 记录行数(不经 JSON.parse)。 */
+  rawCount: number;
+  /** 成功解析出的 user_prompt.submit + assistant.message 事件数(loader 实际拿到的)。 */
+  parsedCount: number;
+}
+
+/**
+ * T1 resume 一致性探针 —— 对比**原始 WAL 文本**里的对话记录行数 vs **成功解析**出的对话事件数。
+ *
+ * 病理(此类护栏专治):`JsonlFileEventStore.read()` 对坏行/截断行**静默跳过** —— WAL 尾部被
+ * 截断(进程崩溃/磁盘满/并发写)会让最后一条 assistant.message 只落了半行,loader 丢弃它,
+ * 于是**重放出的历史比盘上真有的少一条**(正是 T1「续接后历史不全」的一个隐蔽变体)。二者
+ * 都从「同一份解析后事件」派生就永远相等、探不出;必须拿**不过 parse 的原始行数**作独立基准。
+ *
+ * 设计对齐 CC 的 resume 一致性校验思路(recorded-on-disk vs reconstructed;非复制其实现)。
+ * rawCount 用廉价子串扫(匹配 `"type":"user_prompt.submit"` / `"type":"assistant.message"`,
+ * 避免逐行 JSON.parse);对 rewind 遮蔽**免疫**——被遮蔽的行仍是合法 JSON、两侧同样计入。
+ * rawCount > parsedCount = 有对话记录行没解析成功(截断/损坏)→ ok=false。纯函数、可单测。
+ */
+export function checkResumeConsistency(rawJsonl: string, events: CoreEvent[]): ResumeConsistency {
+  let rawCount = 0;
+  for (const line of rawJsonl.split('\n')) {
+    if (!line) continue;
+    if (
+      line.indexOf(`"type":"${USER_PROMPT}"`) !== -1 ||
+      line.indexOf(`"type":"${ASSISTANT_MESSAGE}"`) !== -1
+    ) {
+      rawCount++;
+    }
+  }
+  let parsedCount = 0;
+  for (const e of events) {
+    if (e.type === USER_PROMPT || e.type === ASSISTANT_MESSAGE) parsedCount++;
+  }
+  return { ok: rawCount === parsedCount, rawCount, parsedCount };
+}
+
 /**
  * H-02 ordinal fallback —— 给**旧 WAL**(user_prompt.submit 无 msgId 载荷)的历史轮次按序
  * 回填 msgId,使 /resume 后文件回退仍可用。新 WAL 已由 rehydrate 直接还原 msgId,本函数对已

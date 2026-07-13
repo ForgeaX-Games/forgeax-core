@@ -34,6 +34,7 @@ import { ThinkingView, thinkingText } from '../views/messages/Thinking';
 import { LiveThinking } from '../components/LiveThinking';
 import { useResizeRedraw } from '../use-resize-redraw';
 import { termWidth } from '../text-width';
+import { shellMarksEnabled } from '../shell-marks';
 
 /** driver.toolMeta 的最小形状(查工具卡只需 canonical;别名在此被吃掉)。 */
 type ToolMetaFn = (name: string) => { canonical: string; displayName: string };
@@ -57,7 +58,18 @@ export interface TranscriptProps {
    *  (thinking 先于答案),dim 呈现;`assistant` 事件到达即清空 → 由 durable 条目的折叠
    *  ThinkingView 接管(「先显示 → 折叠」)。 */
   streamingThinking?: string;
+  /** 欢迎横幅等一次性头部:prepend 到 <Static> items 最前,发射一次随 scrollback 上滚;
+   *  redrawNonce/resize 重挂载时白得重现(/clear 后横幅重现即由此而来)。
+   *  渲染关切非会话数据 —— 不进 log,不参与 reduce/回放窗口计算。 */
+  header?: React.ReactNode;
 }
+
+/** header 的 Static 哨兵条目。**刻意不进闭合 union `TranscriptItem`**(否则
+ *  redraw-window 的穷尽 switch `estimateItemLines` 要加死分支);仅 Transcript 内部
+ *  把 Static items 元素类型局部放宽为 `TranscriptItem | BannerItem`,render callback
+ *  先按 kind==='banner' 分流。id=-2 哨兵(-1 已被流式合成条目占用,真实条目 ≥0)。 */
+type BannerItem = { kind: 'banner'; id: -2; node: React.ReactNode };
+type StaticEntry = TranscriptItem | BannerItem;
 
 /** 把在写文本包成一条合成 assistant 条目,复用 renderItem → AssistantView → Markdown。
  *  id 用 -1 哨兵(绝不与真实 log 下标 ≥0 冲突)。 */
@@ -73,8 +85,11 @@ function streamingItem(text: string): TranscriptItem {
 }
 
 export function Transcript(props: TranscriptProps): React.ReactElement {
-  const { log, busy, toolMeta, expanded, redrawNonce = 0, streamingText = '', streamingThinking = '' } = props;
+  const { log, busy, toolMeta, expanded, redrawNonce = 0, streamingText = '', streamingThinking = '', header } = props;
   const theme = useTheme();
+  // shell-integration 标记(OSC 133)只挂 committed 的 user 条目(live 区每帧重画会重置终端
+  //   command 记账 —— 绝不发)。enablement 两道闸走 shellMarksEnabled()(真 TTY + 未 env 关)。
+  const shellMarks = shellMarksEnabled();
 
   // resize 干净重绘:staticKey 随终端 resize 自增,用作 <Static key> 触发重挂载 +
   //   重新 emit 整段 transcript(配合 patch 的 resetStaticOutput + clearTerminal,绕开
@@ -127,8 +142,13 @@ export function Transcript(props: TranscriptProps): React.ReactElement {
         : tailStartIndex(committed, termWidth(), process.stdout.rows ?? 24),
     };
   }
-  const staticItems =
+  // header(欢迎横幅哨兵)prepend 到**尾部切片之后**的 committed 最前:tailStartIndex 只
+  //   吃纯 committed(TranscriptItem[]、永不见哨兵),重挂载重放时横幅恒在最前;尾窗切掉
+  //   历史(tailStart>0)时横幅仍随尾部窗口重现。/clear 后横幅重现即由此而来。
+  const tail =
     windowRef.current.tailStart > 0 ? committed.slice(windowRef.current.tailStart) : committed;
+  const staticItems: StaticEntry[] =
+    header != null ? [{ kind: 'banner', id: -2, node: header }, ...tail] : tail;
 
   return (
     <Box flexDirection="column">
@@ -138,7 +158,9 @@ export function Transcript(props: TranscriptProps): React.ReactElement {
       <Static key={staticRenderKey} items={staticItems}>
         {(item) => (
           <Box key={item.id} flexDirection="column" marginTop={1}>
-            {renderItem(item, theme, toolMeta, expanded)}
+            {item.kind === 'banner'
+              ? item.node
+              : renderItem(item, theme, toolMeta, expanded, shellMarks)}
           </Box>
         )}
       </Static>
@@ -175,6 +197,7 @@ function renderItem(
   theme: ThemeTokens,
   toolMeta: ToolMetaFn,
   expanded?: boolean,
+  shellMarks?: boolean,
 ): React.ReactNode {
   if (item.kind === 'tool') {
     // 工具卡:经 toolMeta(name).canonical 解析(吃掉别名)→ views/tools/registry。
@@ -205,9 +228,10 @@ function renderItem(
   }
 
   // user / notice / 其它 assistant → messages registry 按 key 分发。
+  //   shellMarks 仅 UserView 消费(committed user 条目带 OSC 133;live 传 undefined→不带)。
   if (item.kind === 'user' || item.kind === 'notice' || item.kind === 'assistant') {
     const view = resolveMessageByItem(item);
-    return view({ item, theme, expanded });
+    return view({ item, theme, expanded, shellMarks });
   }
   return null;
 }

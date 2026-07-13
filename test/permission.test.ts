@@ -145,7 +145,8 @@ describe('safetyCheck — bypass immune', () => {
     const r = await hasPermissionsToUseTool(
       tool,
       { file_path: '/repo/.git/config' },
-      ctx(),
+      // cwd=/repo → 目标 in-cwd,隔离 CWE-22 cwd-escape 守卫,单验「safetyCheck 关 → bypass 放行」。
+      { signal: new AbortController().signal, cwd: '/repo' } as ToolContext,
       NO_RULES,
       { mode: 'bypassPermissions' },
     );
@@ -158,7 +159,7 @@ describe('safetyCheck — bypass immune', () => {
     const r = await hasPermissionsToUseTool(
       tool,
       { file_path: '/repo/src/x.ts' },
-      ctx(),
+      { signal: new AbortController().signal, cwd: '/repo' } as ToolContext,
       NO_RULES,
       { mode: 'bypassPermissions' },
     );

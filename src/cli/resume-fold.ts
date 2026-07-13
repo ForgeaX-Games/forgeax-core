@@ -138,6 +138,23 @@ export function mostRecentSessionId(sessionsDir: string = defaultSessionsDir()):
 }
 
 /**
+ * 一个会话是否**已有 WAL 历史**(events.jsonl 存在且非空)。T1:TUI 启动 `--resume`/`--continue`
+ * 时据此决定是否触发 boot rehydrate —— 只对**真有历史**的会话续接,避免 `--resume <新id>`
+ * (合法的「以此 id 新建」)在启动时误报「未找到会话」。
+ *
+ * 廉价探测(仅 statSync,不读内容);文件不存在 / 不可读 / 空文件 → false(fail-soft)。
+ * 路径约定与 event-store-fs / host-context 一致(SSOT 归本模块)。
+ */
+export function sessionHasHistory(id: string, sessionsDir: string = defaultSessionsDir()): boolean {
+  const file = join(resolvePath(sessionsDir), id, EVENTS_FILE);
+  try {
+    return statSync(file).size > 0;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * 按 id 打开一个会话 WAL store 并 fold 出历史(B 层 `resume(id)` 的底层能力)。
  *
  * 纯读:new JsonlFileEventStore(指向该会话的 events.jsonl)→ foldSessionHistory。
@@ -170,4 +187,18 @@ export async function readSessionEvents(
   const out: CoreEvent[] = [];
   for await (const e of store.read()) out.push(e);
   return out;
+}
+
+/**
+ * 读一个会话 WAL 的**原始文本**(未过 JSON.parse),供 T1 resume 一致性探针拿「盘上真有多少
+ * 对话记录行」作独立基准(与 readSessionEvents 的「解析后事件」对比,探出被静默丢弃的截断/坏行)。
+ * 会话不存在 / 不可读 → 空串(fail-soft)。路径约定与本模块其余读取一致(SSOT)。
+ */
+export function readSessionRaw(id: string, sessionsDir: string = defaultSessionsDir()): string {
+  const file = join(resolvePath(sessionsDir), id, EVENTS_FILE);
+  try {
+    return readFileSync(file, 'utf8');
+  } catch {
+    return '';
+  }
 }

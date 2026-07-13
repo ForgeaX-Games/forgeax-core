@@ -32,6 +32,9 @@ import type { PermissionRuleSet } from '../permission/rules';
 import type { PermissionMode } from '../permission/engine';
 import { EventBus } from '../events/event-bus';
 import type { EventBusAPI } from '../events/types';
+import { connectStore } from '../history/event-store';
+import type { EventStore } from '../inject/types';
+import type { ProviderMessage } from '../provider/types';
 import {
   type SubagentRegistry,
   resolveSubagentTools,
@@ -119,6 +122,22 @@ export interface SubagentSpec {
    * 未给 ⇒ 不挂该工具,行为与从前 byte-for-byte 一致(零回归)。
    */
   schema?: JSONSchema;
+  /**
+   * 可选(T6):子 loop transcript 的持久化 EventStore(注入接缝)。给定时,`runSubagent`
+   * 把子 loop 的隔离 childBus 经 `connectStore` 接到该 store —— 子的每条事件(user_prompt /
+   * assistant / tool.call / tool.result / compaction…)顺序落盘,形成**可 fold 回历史**的
+   * append-only 事件流(与主会话 WAL 同构)。**缺省 ⇒ 子 loop 仅内存(§6.5 默认无状态),
+   * 行为与从前 byte-for-byte 一致(零回归)**。持久化 = opt-in;host(serve)按 agentId
+   * 派生磁盘路径造 `JsonlFileEventStore` 注入(机制层不碰 node:fs)。
+   */
+  eventStore?: EventStore;
+  /**
+   * 可选(T6):开机回放 seed —— 从上一次子 loop 的持久化事件流 fold 出的历史消息,作
+   * CoreAgent.initialMessages 置于最前(在本轮子 prompt 之前)。resumeSubagent 从
+   * `eventStore` fold 出历史填入此项,使续跑的子 agent **带着上一次上下文**。缺省 = 空
+   * (首次派生),行为与从前一致。
+   */
+  initialMessages?: ProviderMessage[];
 }
 
 export interface SubagentDeps {
@@ -154,6 +173,12 @@ export interface SubagentDeps {
 export interface SubagentResult {
   /** 子 agent 最终回答 —— 父只见此(transcript→result 压缩)。 */
   text: string;
+  /**
+   * 子 agent 的对外稳定标识(T6)。= 本次子 loop 的 `agentId`(Task 工具在启用持久化时
+   * 生成唯一 id,否则为 `subagent:<type>`)。父/host 拿此 id 作 `resumeSubagent(agentId, …)`
+   * 的续聊句柄。始终返回(additive,不影响既有字段)。
+   */
+  agentId: string;
   terminalReason: TerminalReason;
   turns: number;
   toolCalls: number;
@@ -215,7 +240,16 @@ export async function runSubagent(spec: SubagentSpec, deps: SubagentDeps): Promi
     contextWindow: spec.contextWindow,
     rules: deps.rules,
     mode: deps.mode,
+    // T6:resume seed —— 上一次子 loop 的历史(由 resumeSubagent 从 eventStore fold 得),
+    //   置于最前;缺省空 ⇒ 首次派生,零回归。
+    ...(spec.initialMessages && spec.initialMessages.length > 0
+      ? { initialMessages: spec.initialMessages }
+      : {}),
   });
+
+  // T6:给了 eventStore ⇒ 把子 loop 的隔离 childBus 接到 store,子 transcript 顺序落盘
+  //   (append-only,可 fold 回历史)。缺省不接 ⇒ 子仅内存(零回归)。跑完 disconnect。
+  const disconnectStore = spec.eventStore ? connectStore(childBus, spec.eventStore) : undefined;
 
   // 生命周期事件统一发到 hook 可见的父侧 bus,缺省退回子自己的隔离 bus(零回归)。
   const lifeBus = deps.bus ?? childBus;
@@ -235,34 +269,40 @@ export async function runSubagent(spec: SubagentSpec, deps: SubagentDeps): Promi
   let terminalReason: TerminalReason = 'completed';
   let turns = 0;
   let toolCalls = 0;
-  for await (const ev of child.run({ input: { type: 'user', payload: spec.input, ts: 0 }, signal: deps.signal })) {
-    if (ev.type === 'assistant') {
-      const t = lastAssistantText(ev.message);
-      if (t) text = t; // 保留最后一条非空 assistant 文本作结果
-    } else if (ev.type === 'tool_call') {
-      toolCalls++;
-      // L4:子工具调用事件。
-      emitSubagentToolCall(lifeBus, {
-        agentId,
-        toolName: ev.toolName,
-        toolUseId: ev.toolUseId,
-        turn: turns,
-        depth: spec.depth,
-      });
-      deps.onSubagentEvent?.({
-        type: 'subagent.tool_call',
-        agentId,
-        toolName: ev.toolName,
-        toolUseId: ev.toolUseId,
-        turn: turns,
-        depth: spec.depth,
-      });
-    } else if (ev.type === 'turn_start') {
-      turns = ev.turn + 1;
-      // L4:子进轮事件(turns 已更新后发)。
-      emitSubagentTurn(lifeBus, { agentId, turn: turns, depth: spec.depth });
-      deps.onSubagentEvent?.({ type: 'subagent.turn', agentId, turn: turns, depth: spec.depth });
-    } else if (ev.type === 'done') terminalReason = ev.terminal.reason;
+  try {
+    for await (const ev of child.run({ input: { type: 'user', payload: spec.input, ts: 0 }, signal: deps.signal })) {
+      if (ev.type === 'assistant') {
+        const t = lastAssistantText(ev.message);
+        if (t) text = t; // 保留最后一条非空 assistant 文本作结果
+      } else if (ev.type === 'tool_call') {
+        toolCalls++;
+        // L4:子工具调用事件。
+        emitSubagentToolCall(lifeBus, {
+          agentId,
+          toolName: ev.toolName,
+          toolUseId: ev.toolUseId,
+          turn: turns,
+          depth: spec.depth,
+        });
+        deps.onSubagentEvent?.({
+          type: 'subagent.tool_call',
+          agentId,
+          toolName: ev.toolName,
+          toolUseId: ev.toolUseId,
+          turn: turns,
+          depth: spec.depth,
+        });
+      } else if (ev.type === 'turn_start') {
+        turns = ev.turn + 1;
+        // L4:子进轮事件(turns 已更新后发)。
+        emitSubagentTurn(lifeBus, { agentId, turn: turns, depth: spec.depth });
+        deps.onSubagentEvent?.({ type: 'subagent.turn', agentId, turn: turns, depth: spec.depth });
+      } else if (ev.type === 'done') terminalReason = ev.terminal.reason;
+    }
+  } finally {
+    // T6:子 loop 跑完(含异常/取消)即断开 store 订阅 —— 只落 transcript,不把随后的
+    //   subagent.stop 生命周期事件写进 store(保 fold 干净)。缺省无 store ⇒ no-op。
+    disconnectStore?.();
   }
 
   // S3:子终态事件。优先发到 hook 可见的父侧 bus,缺省退回子自己的隔离 bus。
@@ -285,7 +325,7 @@ export async function runSubagent(spec: SubagentSpec, deps: SubagentDeps): Promi
   });
 
   // 010:子若经 StructuredOutput 提交过合法 payload,作 structured 返回值(父/Workflow 取已校验对象)。
-  return { text, terminalReason, turns, toolCalls, structured: structuredPayload };
+  return { text, agentId, terminalReason, turns, toolCalls, structured: structuredPayload };
 }
 
 // ─── worktree 隔离(P2)──────────────────────────
@@ -441,6 +481,15 @@ export interface TaskToolDeps {
    */
   background?: BackgroundTasks<SubagentResult>;
   /**
+   * 可选(T6):子 loop transcript 持久化 store 工厂(注入接缝)。给定时:
+   *   - 每次 Task 派子会**生成唯一 agentId**(`subagent:<type>:<uniq>`)作续聊句柄,
+   *     并经此工厂按 agentId 取一个 `EventStore`,把子 transcript 落盘(可 `resumeSubagent`);
+   *   - **缺省 ⇒ 维持今日行为 byte-for-byte**:agentId = `subagent:<type>`、子仅内存、
+   *     不落盘(零回归)。
+   * host(serve)按 agentId 派生磁盘路径造 `JsonlFileEventStore` 注入 —— 机制层不碰 node:fs。
+   */
+  subagentStore?: (agentId: string) => EventStore | undefined;
+  /**
    * 可选(P2):后台子 loop settle(成功/失败)时回调。仅在 `background` 注入且本次
    * 走后台路径时生效;与 `background.onDone` 二选一即可(若构造 `background` 时已带
    * `onDone`,可不传此项)。缺省 ⇒ 不回调。
@@ -483,6 +532,8 @@ export interface TaskToolDeps {
 export function makeTaskTool(deps: TaskToolDeps): AgentTool<TaskInput, SubagentResult> {
   // 闭包级并发闸:同一 Task 工具实例的所有调用共享一个限流器 → 整体 fan-out 受控。
   const limiter = new ConcurrencyLimiter(deps.concurrency ?? DEFAULT_SUBAGENT_CONCURRENCY);
+  // T6:启用持久化时给每次派子生成唯一 agentId 后缀(续聊句柄不撞);缺省不用。
+  let subSeq = 0;
   const maxDepth = deps.maxDepth ?? DEFAULT_SUBAGENT_MAX_DEPTH;
   const resultBudget = deps.resultBudget ?? DEFAULT_SUBAGENT_RESULT_BUDGET;
 
@@ -554,11 +605,19 @@ export function makeTaskTool(deps: TaskToolDeps): AgentTool<TaskInput, SubagentR
         }
       }
 
+      // T6:agentId 与持久化 store。启用 subagentStore ⇒ 唯一 id + 落盘(续聊句柄);
+      //   缺省 ⇒ 沿用今日的 `subagent:<type>`、仅内存(零回归)。
+      const baseId = `subagent:${type ?? 'default'}`;
+      const agentId = deps.subagentStore ? `${baseId}:${Date.now().toString(36)}-${subSeq++}` : baseId;
+      const eventStore = deps.subagentStore?.(agentId);
+
       // 一次子 loop 的运行单元(限流器内跑);worktree 在子 settle 后清理(吞错)。
       const spec: SubagentSpec = {
         input: input.prompt,
         agentType: type,
-        agentId: `subagent:${type ?? 'default'}`,
+        agentId,
+        // T6:子 transcript 持久化 store(缺省 undefined ⇒ 仅内存,零回归)。
+        eventStore,
         // L4:registry 类型声明的 role / omitHeavyContext 透传进 spec(供事件归因 + 轻装上阵)。
         role: reg?.role,
         omitHeavyContext: reg?.omitHeavyContext,
@@ -605,6 +664,7 @@ export function makeTaskTool(deps: TaskToolDeps): AgentTool<TaskInput, SubagentR
         return {
           data: {
             text: `Subagent started in background (id=${id})`,
+            agentId,
             terminalReason: 'completed' as TerminalReason,
             turns: 0,
             toolCalls: 0,
@@ -631,6 +691,8 @@ export function makeTaskTool(deps: TaskToolDeps): AgentTool<TaskInput, SubagentR
         result: r.text,
         turns: r.turns,
         toolCalls: r.toolCalls,
+        // T6:子对外稳定 agentId,additive 透给父(host 据此 resumeSubagent 续聊)。
+        agentId: r.agentId,
         // 010:子经 StructuredOutput 提交的已校验对象(仅给了 schema 时存在),additive 透给父。
         ...(r.structured !== undefined ? { structured: r.structured } : {}),
       },

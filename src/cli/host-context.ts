@@ -12,6 +12,7 @@
  */
 import { readFileSync } from 'node:fs';
 import { resolve as resolvePath } from 'node:path';
+import { homedir } from 'node:os';
 import type { AgentContext } from '../agent/types';
 import type { LLMProvider, ProviderMessage } from '../provider/types';
 import { resolveProvider } from '../provider/register';
@@ -30,7 +31,9 @@ import type { EventStore } from '../inject/types';
 import { loadAgentDefs, buildSubagentRegistry } from '../capability/agent/index';
 import { builtinSubagents } from '../capability/agent/builtin/index';
 import { resolveSubagentSystem } from '../agent/subagent-registry';
-import { DEFAULT_SUBAGENT_MAX_TURNS } from '../agent/subagent';
+import { DEFAULT_SUBAGENT_MAX_TURNS, type SubagentResult } from '../agent/subagent';
+import { BackgroundTasks } from '../agent/background';
+import { TaskNotificationHub } from './task-notification';
 import { demoProvider } from './demo-provider';
 import { TeamBoardStore, taskBoardToolsPack } from '../agent/team/task-board-tools';
 import { InProcessTeammateExecutor } from '../inject/in-process-teammate-executor';
@@ -41,6 +44,7 @@ import { makeTeamPeerSpawner } from './peer';
 import { makeEnvSlot } from './env-slot';
 import { effectiveSkillDirs, effectiveCommandDirs, discoverAgentDirs, discoverPluginDirs, loadMergedMcpConfig } from './locations';
 import { getMergedSettings } from './settings';
+import { configHomeDir } from './settings';
 import { loadPermissionRulesFromSettings } from './permission-settings';
 import type { PermissionRuleSet } from '../permission/rules';
 
@@ -144,6 +148,14 @@ export async function buildHostContext(args: HostContextArgs, providerOverride?:
   const bus = new EventBus();
   const searchBackend = args.searchUrl ? makeHttpSearchBackend(args.searchUrl) : makeDefaultSearchBackend();
 
+  // T4:后台完成 → 对话主动回注(`<task_notification>`)。纯 HOST 层接线,core 不改。
+  //   观察侧①:包装 makeNodeBackgroundSpawn() 看后台 bash 的 exit;②:BackgroundTasks.onDone
+  //   看后台子 agent settle。注入侧:subscribe(bus) 在 UserPromptSubmit 回执挂 additionalContext。
+  const taskNotifications = new TaskNotificationHub();
+  // 后台子 agent 登记处:注入 task 工具后,`Task run_in_background:true` 走真后台路径,
+  //   settle 时经 onSubagentDone 入队(缺省未注入时该标记被忽略,同步跑;此处注入即启用)。
+  const subagentBackground = new BackgroundTasks<SubagentResult>({ onDone: taskNotifications.onSubagentDone });
+
   // 自动发现:各能力按 `.forgeax` 约定发现「项目级 + 用户级」目录(项目优先,见 locations.ts)。
   //   规则:**给了 flag 就只用 flag**(关闭该能力的自动发现);否则用发现到的两层目录。
   const skillDirs = effectiveSkillDirs(args.skillDirs);
@@ -167,6 +179,9 @@ export async function buildHostContext(args: HostContextArgs, providerOverride?:
     bus,
     searchBackend,
     memory: args.memoryDir ? { dir: args.memoryDir, sandboxFs } : undefined,
+    // 分层指令(AGENTS.md/CLAUDE.md + rules + @import):dirs 由 host 算出(发现层不读 env)。
+    //   canonical=~/.forgeax(FORGEAX_CONFIG_DIR 优先),CC 兼容=~/.claude,项目=cwd。
+    instructions: { cwd: process.cwd(), userForgeax: configHomeDir(), userClaude: resolvePath(homedir(), '.claude') },
     skillDirs,
     commandDirs,
     mcp: mcpConfig
@@ -182,7 +197,8 @@ export async function buildHostContext(args: HostContextArgs, providerOverride?:
         }
       : undefined,
     // 007:host 注入真实非阻塞 spawn → 后台 bash 三件套可用。
-    backgroundSpawn: makeNodeBackgroundSpawn(),
+    //   T4:包一层观察 exit chunk,后台 bash 跑完入队一条 task_notification。
+    backgroundSpawn: taskNotifications.wrapBackgroundSpawn(makeNodeBackgroundSpawn()),
     pluginSources: pluginDirs.map((d) => ({ source: 'session' as const, dir: d })),
     hooks: hooksSettings && Object.keys(hooksSettings).length > 0
       ? { settings: hooksSettings, runHook: makeSpawnSyncHookRunner() }
@@ -202,6 +218,8 @@ export async function buildHostContext(args: HostContextArgs, providerOverride?:
       contextWindow: contextWindowForModel(args.model),
       // 子 agent 兜底上限;某 agent 的 frontmatter `max-turns` 仍可逐类收紧(对齐 cc)。
       maxTurns: DEFAULT_SUBAGENT_MAX_TURNS,
+      // T4:后台子 agent 登记处 —— `Task run_in_background:true` 走真后台,settle 时入队通知。
+      background: subagentBackground,
     },
   });
 
@@ -273,6 +291,12 @@ export async function buildHostContext(args: HostContextArgs, providerOverride?:
 
   // 权限规则(楔子1 · 046):从分层 settings 的 permissions 段载出(与上面读 hooks 同口径)。
   const rules = loadPermissionRulesFromSettings();
+
+  // T4 注入侧:在 bus 上订阅 UserPromptSubmit,drain 后台完成通知 → additionalContext。
+  //   排在 connectStore 之后订阅:WAL 持久化的是干净事件,ephemeral 的 task_notification
+  //   只落到 loop 读的内存回执上(resume 不重放旧通知)。unsub 挂 disposers 清理。
+  const unsubTaskNotifications = taskNotifications.subscribe(bus);
+  disposers.push(unsubTaskNotifications);
 
   return { context, bus, provider, store, disposers, rules, ...(coordinatorInbox ? { coordinatorInbox } : {}) };
 }

@@ -13,6 +13,11 @@
  *   ⑦ always-allow rule→ allow
  *   ⑧ passthrough      → 转 ask
  *
+ * CWE-22 路径硬化(validateTargetPath,T3)横切在两处:file 工具目标路径
+ *   - **deny**(NUL/控制字符 / write-glob,永不合法)置于 ① 之前,规则也压不过;
+ *   - **强制 ask**(写规范化后逃出 cwd)与 ⑤ safetyCheck 同层(bypass/acceptEdits/allow
+ *     免疫),但排在 ①deny/②ask/③tool-deny 之后 —— 真 deny 仍先行。
+ *
  * fail-closed:任何异常/不确定 → 更严(deny/ask)。非 deny/ask/allow 的越界值
  * 当 passthrough 处理(最终落到 ask)。
  *
@@ -29,6 +34,7 @@ import type {
 } from '../capability/types';
 import { relative as pathRelative, resolve as pathResolve } from 'node:path';
 import { matchRule, normalizeRules, type PermissionRule, type PermissionRuleSet } from './rules';
+import { validateTargetPath, type PathVerdict } from './path-validation';
 
 /**
  * 按工具的 **name + aliases** 逐一匹配规则(alias 归一)。用户按 CC 习惯写
@@ -67,9 +73,10 @@ export interface PermissionOptions {
 const SAFETY_CHECK_REASON =
   'This path is protected and requires explicit approval even in bypass mode.';
 
-/** 受保护路径片段:`.git/` / `.forgeax/` / shell rc(写前安全检查
- *  集合)。命中即 ask 且 bypass 免疫。 */
-const SHELL_CONFIG_BASENAMES = new Set<string>([
+/** 受保护路径片段:`.git/` / `.forgeax/` / shell rc / 敏感配置(写前安全检查
+ *  集合)。命中即 ask 且 bypass 免疫。`.gitconfig` / `.mcp.json` 与 shell rc 同层
+ *  (srt 禁写清单邻域,SSOT);`.git/hooks/` 已被 `.git` 段覆盖。 */
+const PROTECTED_FILE_BASENAMES = new Set<string>([
   '.bashrc',
   '.bash_profile',
   '.bash_login',
@@ -83,6 +90,8 @@ const SHELL_CONFIG_BASENAMES = new Set<string>([
   '.tcshrc',
   '.config/fish/config.fish',
   'config.fish',
+  '.gitconfig',
+  '.mcp.json',
 ]);
 
 /** 从工具 input 抽出可能写入的目标路径(用于 safetyCheck)。 */
@@ -115,7 +124,7 @@ export function isProtectedPath(path: string): boolean {
   const segments = norm.split('/').filter(Boolean);
   if (PROTECTED_DIR_SEGMENTS.some((s) => segments.includes(s))) return true;
   const base = segments.length > 0 ? segments[segments.length - 1] : norm;
-  if (SHELL_CONFIG_BASENAMES.has(base)) return true;
+  if (PROTECTED_FILE_BASENAMES.has(base)) return true;
   // fish 的嵌套形式 .config/fish/config.fish
   if (norm.endsWith('.config/fish/config.fish')) return true;
   return false;
@@ -181,6 +190,31 @@ export function isEditTool<I>(tool: AgentTool<I>, input: I): boolean {
   return false;
 }
 
+/**
+ * CWE-22 硬化(T3):对 file 工具目标路径做两档校验。非 file 工具(抽不出路径)→
+ * undefined。op 由 edit 工具判定为 `write`(cwd confine + write-glob),其余 `read`
+ * (仅查控制字符)。cwd 取 ctx.cwd(host 注入),缺省 process.cwd()。纯函数,不触盘
+ * 于常态(见 path-validation.ts)。
+ */
+function pathHardeningVerdict<I>(tool: AgentTool<I>, input: I, ctx: ToolContext): PathVerdict | undefined {
+  const target = extractTargetPath(input);
+  if (target === undefined) return undefined;
+  const op = isEditTool(tool, input) ? 'write' : 'read';
+  const cwdRaw = (ctx as { cwd?: unknown }).cwd;
+  const cwd = typeof cwdRaw === 'string' ? cwdRaw : process.cwd();
+  return validateTargetPath(target, op, cwd);
+}
+
+/** validateTargetPath verdict → PermissionResult(deny/ask 共用形状,decisionReason
+ *  带 pathValidation 判别 + scope,便于 host 观测与 e2e 断言)。 */
+function pathVerdictToResult(v: Extract<PathVerdict, { verdict: 'deny' | 'ask' }>): PermissionResult {
+  return {
+    behavior: v.verdict === 'deny' ? 'deny' : 'ask',
+    message: v.reason,
+    decisionReason: { type: 'pathValidation', scope: v.scope },
+  };
+}
+
 function denyByRule(toolName: string, ruleSource?: string): PermissionResult {
   return {
     behavior: 'deny',
@@ -219,6 +253,10 @@ export async function checkRuleBasedPermissions<I>(
 ): Promise<PermissionResult | null> {
   const ruleSet = normalizeRules(rules);
 
+  // ⓿ CWE-22 path hardening — deny(NUL/控制字符/write-glob)先于所有规则(永不合法)。
+  const pathV = pathHardeningVerdict(tool, input, ctx);
+  if (pathV?.verdict === 'deny') return pathVerdictToResult(pathV);
+
   // ① deny rule
   const deny = matchToolRule(ruleSet.deny, tool, input);
   if (deny) return denyByRule(tool.name, deny.source);
@@ -243,6 +281,9 @@ export async function checkRuleBasedPermissions<I>(
     if (safety) return safety;
   }
 
+  // ⓿b CWE-22 强制 ask(写逃出 cwd)——即便走 hook-allow 子集也不放行,routes 到 askUser。
+  if (pathV?.verdict === 'ask') return pathVerdictToResult(pathV);
+
   // 规则层无异议
   return null;
 }
@@ -263,6 +304,12 @@ export async function hasPermissionsToUseTool<I>(
 ): Promise<PermissionResult> {
   const ruleSet = normalizeRules(rules);
   const mode: PermissionMode = options?.mode ?? 'default';
+
+  // ⓿ CWE-22 path hardening(T3):file 工具目标路径两档校验。
+  //   - deny(NUL/控制字符/write-glob)先于 ① deny rule —— 永不合法,规则也压不过。
+  //   - ask(写逃出 cwd)holdback,注入在 ⑤ safetyCheck 同层(bypass/acceptEdits/allow 免疫)。
+  const pathV = pathHardeningVerdict(tool, input, ctx);
+  if (pathV?.verdict === 'deny') return pathVerdictToResult(pathV);
 
   // ① deny rule → deny
   const deny = matchToolRule(ruleSet.deny, tool, input);
@@ -328,6 +375,11 @@ export async function hasPermissionsToUseTool<I>(
     const safety = safetyCheck(input);
     if (safety) return safety;
   }
+
+  // ⓿b CWE-22 强制 ask(写逃出 cwd)——与 safetyCheck 同层:排在 acceptEdits/bypass/allow
+  //   之前,即便 settings 配了 `allow:["Write"]` / acceptEdits / bypass 也压不掉,保留用户
+  //   批准通道(写 /tmp 合法,已在 validateTargetPath 内豁免 os.tmpdir())。
+  if (pathV?.verdict === 'ask') return pathVerdictToResult(pathV);
 
   // ⑤.5 acceptEdits 模式:edit/write 系工具自动放行,但**仅限 cwd 内**(E-06)。
   //   safetyCheck 已先行(受保护路径仍 ask);目标落在 cwd 外(绝对越界 / `..` 逃逸)

@@ -15,6 +15,7 @@
  * JSON-RPC（tools/list、tools/call）—— 供测试 / host 适配参考，非生产实现。
  */
 import type { Transport, TransportMessage } from './transport';
+import { FORGEAX_CORE_VERSION } from '../../version';
 import {
   handleServerRequest,
   type ServerRequest,
@@ -85,7 +86,7 @@ export interface MCPClientInfo {
 export const MCP_PROTOCOL_VERSION = '2025-06-18';
 export const DEFAULT_MCP_CLIENT_INFO: MCPClientInfo = {
   name: 'forgeax-core',
-  version: '0.1.0',
+  version: FORGEAX_CORE_VERSION,
 };
 
 // ─── MCPClient 接缝 ──────────────────────────────────────────────────────────

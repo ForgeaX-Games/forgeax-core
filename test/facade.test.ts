@@ -246,18 +246,51 @@ describe('ForgeaxCoreKernel — setPermissionMode live + injected rules honored'
 });
 
 describe('ForgeaxCoreKernel — ExitPlanMode conditional surfacing', () => {
-  test('plan mode → ExitPlanMode tool present in model tool set', async () => {
+  test('plan mode → ExitPlanMode tool present in model tool set (approved via askUser)', async () => {
     // model immediately tries ExitPlanMode; if absent it would be an unknown_tool error.
     const k = new ForgeaxCoreKernel({
       provider: scripted([[asstToolUse('x1', 'ExitPlanMode', { plan: 'p' })], [asstText('done')]]),
       executeTool: async () => null,
       initialMode: 'plan',
+      askUser: async () => true, // 007:出口是 ask 闸,approve 后才执行
     });
     const events = await collect(k, req({ callId: 'p1', tools: [] }));
     const call = events.find((e) => e.kind === 'tool.call' && e.name === 'ExitPlanMode');
     expect(call).toBeDefined();
     const tr = events.find((e) => e.kind === 'tool.result') as { ok: boolean } | undefined;
     // ExitPlanMode is read-only-exempt → allowed → ok (not an unknown-tool / denied error).
+    expect(tr?.ok).toBe(true);
+  });
+
+  test('007: plan mode + no askUser → exit gate fail-closed(调用被 deny,留在 plan)', async () => {
+    const k = new ForgeaxCoreKernel({
+      provider: scripted([[asstToolUse('x1', 'ExitPlanMode', { plan: 'p' })], [asstText('done')]]),
+      executeTool: async () => null,
+      initialMode: 'plan',
+    });
+    const events = await collect(k, req({ callId: 'p2', tools: [] }));
+    const tr = events.find((e) => e.kind === 'tool.result') as { ok: boolean } | undefined;
+    expect(tr?.ok).toBe(false); // ask 无人应答 → deny
+  });
+
+  test('007: approved exit 后 facade 轮终回读模式 —— 下一轮不再按 plan 构造(写可执行)', async () => {
+    const k = new ForgeaxCoreKernel({
+      provider: scripted([
+        [asstToolUse('x1', 'ExitPlanMode', { plan: 'p' })], // turn A:获批退出
+        [asstText('done')],
+        [asstToolUse('w1', 'write_file', { file_path: '/x' })], // turn B:写(plan 下必 deny)
+        [asstText('done')],
+      ]),
+      executeTool: async () => ({ ok: true }),
+      askUser: async () => true,
+    });
+    const h = k.openHandle('h');
+    await h.setPermissionMode('autoEdits'); // 进入 plan 前的模式
+    await h.setPermissionMode('planning');
+    await collect(k, req({ callId: 'a', tools: [{ name: 'write_file', inputSchema: {} }] }));
+    const b = await collect(k, req({ callId: 'b', tools: [{ name: 'write_file', inputSchema: {} }] }));
+    const tr = b.find((e) => e.kind === 'tool.result') as { ok: boolean } | undefined;
+    // 修复前:facade currentMode 停在 'plan',turn B 的写被 plan-deny(ok=false)。
     expect(tr?.ok).toBe(true);
   });
 

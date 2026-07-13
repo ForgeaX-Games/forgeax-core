@@ -30,6 +30,9 @@ export const CoreEventType = {
   // compaction (ledger fold consumes these)
   CompactionApplied: 'compaction.applied',
   CompactionRevoked: 'compaction.revoked',
+  /** ★ T5:上游 API 即将重试(观测事件;facade 映射成 api_retry KernelEvent 出墙)。
+   *  纯观测,不进 ledger fold、不影响重试决策。 */
+  ApiRetry: 'api.retry',
   // rewind (ledger fold consumes these; 遮蔽区间、无 replacement,区别于 compaction 的替换)
   RewindApplied: 'rewind.applied',
   RewindRevoked: 'rewind.revoked',
@@ -42,6 +45,11 @@ export const CoreEventType = {
   UserPromptSubmit: 'user_prompt.submit',
   PreCompact: 'compaction.pre',
   PostCompact: 'compaction.post',
+  /** ★ 压缩被治理机制拦下(04.4:skip 不再静默)。仅在「阈值已达却没压」时发
+   *  (below-threshold/disabled 属常态不触发,不发,防每轮刷 WAL)。 */
+  CompactionSkipped: 'compaction.skipped',
+  /** ★ 压缩管线失败(04.4:失败不再静默)。发生即发,与熔断计数 +1 同步。 */
+  CompactionFailed: 'compaction.failed',
   Notification: 'notification',
   /** 专用 stop 事件；后续阶段将 REPLACE loop 里临时的 'stop.hook' 字符串。 */
   Stop: 'stop',
@@ -84,8 +92,24 @@ export interface CoreEventPayloads {
     result?: unknown;
     isError?: boolean;
   };
-  [CoreEventType.CompactionApplied]: { coveredFrom: number; coveredTo: number; replacement: unknown };
+  /**
+   * 压缩落地事件(ledger fold 消费 coveredFrom/coveredTo/replacement)。
+   * ★ T5 additive:另携三个可选观测字段(fold 不读,纯供 facade → compact_boundary 出墙):
+   *   `preTokens`/`postTokens` = 压缩前后会话 token 估算;`trigger` = 触发原因(auto/manual/...)。
+   *   老发布方不带这三字段 → facade 优雅降级(字段为 undefined),零回归。
+   */
+  [CoreEventType.CompactionApplied]: {
+    coveredFrom: number;
+    coveredTo: number;
+    replacement: unknown;
+    preTokens?: number;
+    postTokens?: number;
+    trigger?: string;
+  };
   [CoreEventType.CompactionRevoked]: { appliedId: string };
+  /** ★ T5:上游 API 重试观测。attempt = 刚失败的尝试序号(1 起);reason = 触发原因
+   *  (如 '429'/'529'/'500'/'overloaded'/'stream_idle'/'fallback');retryAfterMs = 服务端退避。 */
+  [CoreEventType.ApiRetry]: { attempt: number; reason: string; retryAfterMs?: number };
   /**
    * 对话回退 boundary(append-only,事件流是真相 §6.1)。语义 = **遮蔽**从第
    * `keepUserTurns` 个用户轮(0-based)起、直到本事件之前的全部会话事件——无 replacement
@@ -108,6 +132,20 @@ export interface CoreEventPayloads {
   [CoreEventType.PreCompact]: { trigger?: 'auto' | 'manual'; tokenCount?: number };
   /** 压缩后:被压缩覆盖的消息区间。 */
   [CoreEventType.PostCompact]: { coveredFrom: number; coveredTo: number };
+  /** 压缩被拦:拒绝原因(gate reject reason / hook-blocked / nothing-to-compact)+ 触发上下文。 */
+  [CoreEventType.CompactionSkipped]: {
+    reason: string;
+    trigger?: 'auto' | 'manual';
+    type?: string;
+    tokenCount?: number;
+  };
+  /** 压缩失败:错误文案 + 触发上下文(与 gate 熔断计数 +1 同步发)。 */
+  [CoreEventType.CompactionFailed]: {
+    error: string;
+    trigger?: 'auto' | 'manual';
+    type?: string;
+    tokenCount?: number;
+  };
   /** 通知:消息文本 + 可选级别。 */
   [CoreEventType.Notification]: { message: string; level?: string };
   /**

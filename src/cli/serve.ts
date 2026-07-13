@@ -13,6 +13,9 @@
  * 反向(serve → adapter):
  *   - `hostTool({name,args,sid})` 请求       **所有工具执行回调宿主**——宿主复跑 checkKernelTool
  *     (信任边界钉在 host;serve 不持危险工具本地实现)。详见评审稿 §3.1。
+ *   - `askUser({toolName,toolUseId,input,message})` 请求  in-core 交互式 'ask' 回宿主裁决,
+ *     应答 `{granted:boolean}`。当前仅 ExitPlanMode(007 plan 出口人类闸)走此路;宿主未实现
+ *     → loud 降级为放行(旧行为)。
  *
  * 凭据:provider 从 **env 的 scoped token** 造(真 key 只在 sidecar cred-vault);serve 进程
  * 不持真 upstream key。
@@ -36,6 +39,7 @@ import { notebookToolsPack } from '../capability/builtin-tools/notebook-tools';
 import { NodeSandboxFs, NodeTerminal } from './io';
 import { makeNodeObservability } from './observability';
 import { loadPermissionRulesFromSettings } from './permission-settings';
+import { isExitPlanTool } from '../permission/engine';
 import type { TelemetryRecord } from '@forgeax/types';
 
 /** runTurn 的线上入参 = TurnRequest 的**可序列化子集**(去掉 requestPermission/hooks 等函数)。 */
@@ -145,7 +149,27 @@ export async function startServe(sockPath: string): Promise<Server> {
       //   in-core 的 **deny**(规则 / plan 只读)仍照常在核内强制(askUser 只拦 'ask',不影响 deny)。
       //   若不传 askUser,in-core 对 'ask' 会 fail-closed deny(agent.ts:131),Bash/写等永远到不了
       //   host 卡 —— 故这里必须显式 defer。
-      askUser: async () => true,
+      //   **例外:ExitPlanMode**(007 出口人类闸)——它是 in-core 工具,不过 hostTool 桥,
+      //   blanket-allow 会把出口人类确认整个吞掉。改为经 `askUser` RPC 回宿主裁决;宿主未实现
+      //   该方法(或请求失败)→ loud 降级为放行(= 旧「自动退出 plan」行为,§9 优雅降级,零回归)。
+      askUser: async (perm, use) => {
+        if (!isExitPlanTool(use.name)) return true;
+        try {
+          const r = await conn.request('askUser', {
+            toolName: use.name,
+            toolUseId: use.id,
+            input: use.input,
+            message: perm.message,
+          });
+          return (r as { granted?: boolean } | undefined)?.granted === true;
+        } catch (e) {
+          process.stderr.write(
+            `[forgeax-core serve] host 未应答 askUser(${use.name}),降级为自动放行(旧行为)。` +
+              `宿主实现 'askUser' RPC 后即获出口人类闸。err=${e instanceof Error ? e.message : String(e)}\n`,
+          );
+          return true;
+        }
+      },
       // peer 多 agent:每轮工厂用本轮 provider/model/host 工具建调度器(子 agent 同源回调宿主)。
       //   M2:把 team 接线(共享 bus + executor)透进 spawn 工厂,子 agent 走共享 bus + mailbox
       //   inbox 闭包(可寻址 + 收 SendMessage 真投递);scheduler 也接同一 bus 供 sleep{event}。

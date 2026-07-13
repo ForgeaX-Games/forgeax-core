@@ -205,3 +205,61 @@ describe('Stream E — compaction V2 loop integration (#5/#8/#6/#11)', () => {
     expect(legacyCalled).toBe(false);
   });
 });
+
+describe('04.4 — compaction skipped/failed 事件(skip/失败不再静默)', () => {
+  test('summarize 失败 → CompactionFailed(带 error/type/trigger)', async () => {
+    const bus = new EventBus();
+    const failed: any[] = [];
+    bus.subscribe(CoreEventType.CompactionFailed, (e) => { failed.push(e.payload); });
+    const agent = new CoreAgent({
+      context: ctx(),
+      bus,
+      compactionV2: v2({ summarize: async () => { throw new Error('model exploded'); } }),
+    });
+    await drain(agent, 'q', [{ role: 'user', content: big(19_000) }]);
+    expect(failed.length).toBe(1);
+    expect(failed[0].error).toContain('model exploded');
+    expect(failed[0].type).toBe(CompactType.EMERGENCY_AUTO);
+    expect(failed[0].trigger).toBe('auto');
+  });
+
+  test('熔断(3 连败)后阈值已达 → CompactionSkipped(reason=circuit-open)', async () => {
+    const bus = new EventBus();
+    const skipped: any[] = [];
+    bus.subscribe(CoreEventType.CompactionSkipped, (e) => { skipped.push(e.payload); });
+    const agent = new CoreAgent({
+      context: ctx(),
+      bus,
+      compactionV2: v2({ summarize: async () => { throw new Error('boom'); } }),
+    });
+    // 连续 3 次失败 → 熔断(gateState 跨 run 留在同一 agent 实例);失败阶段无 skip。
+    for (let i = 0; i < 3; i++) await drain(agent, 'q', [{ role: 'user', content: big(19_000) }]);
+    expect(skipped.length).toBe(0);
+    // 第 4 次:gate circuit-open 拦下,且 tokenCount ≥ emergency 阈值 → 发 skipped。
+    await drain(agent, 'q', [{ role: 'user', content: big(19_000) }]);
+    expect(skipped.length).toBe(1);
+    expect(skipped[0].reason).toBe('circuit-open');
+    expect(skipped[0].type).toBe(CompactType.EMERGENCY_AUTO);
+    expect(skipped[0].tokenCount).toBeGreaterThanOrEqual(18_400);
+  });
+
+  test('PreCompact hook 阻断 → CompactionSkipped(reason=hook-blocked)', async () => {
+    const bus = new EventBus();
+    bus.subscribe(CoreEventType.PreCompact, (e) => { (e as unknown as { blocked?: boolean }).blocked = true; });
+    const skipped: any[] = [];
+    bus.subscribe(CoreEventType.CompactionSkipped, (e) => { skipped.push(e.payload); });
+    const agent = new CoreAgent({ context: ctx(), bus, compactionV2: v2() });
+    await drain(agent, 'q', [{ role: 'user', content: big(19_000) }]);
+    expect(skipped.length).toBe(1);
+    expect(skipped[0].reason).toBe('hook-blocked');
+  });
+
+  test('below-threshold 常态不发 skipped(防每轮刷 WAL)', async () => {
+    const bus = new EventBus();
+    const skipped: any[] = [];
+    bus.subscribe(CoreEventType.CompactionSkipped, (e) => { skipped.push(e.payload); });
+    const agent = new CoreAgent({ context: ctx(), bus, compactionV2: v2({ preMessage: true }) });
+    await drain(agent, 'q', [{ role: 'user', content: big(1_000) }]);
+    expect(skipped.length).toBe(0);
+  });
+});

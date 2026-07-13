@@ -10,7 +10,7 @@
  */
 import type { LLMProvider, ProviderRequest, ProviderCallOpts, ProviderStreamEvent } from './types';
 import { FallbackTriggeredError, StreamIdleError } from './types';
-import { getRetryDelay, shouldRetry, getDefaultMaxRetries } from './retry';
+import { getRetryDelay, shouldRetry, getDefaultMaxRetries, retryReason, getRetryAfterMs } from './retry';
 
 /** 流式空闲(上游/代理 stall)mid-stream 重发上限。区别于通用 maxRetries(默认 10):idle 每次要等
  *  满整个空闲阈值(默认 5min)才触发,若也重发 10 次最坏 ~50min,故单独有界。对齐 cc「idle → 丢弃
@@ -56,6 +56,7 @@ export async function* streamWithRetry(
     } catch (err) {
       // 模型 fallback:529 连发触发,切 fallbackModel 重来。
       if (err instanceof FallbackTriggeredError && opts.fallbackModel && !started) {
+        opts.onRetry?.({ attempt, reason: 'fallback' });
         opts.onStreamingFallback?.();
         model = opts.fallbackModel;
         continue;
@@ -66,11 +67,13 @@ export async function* streamWithRetry(
       if (err instanceof StreamIdleError) {
         if (idleRetries >= MID_STREAM_IDLE_MAX_RETRIES || opts.signal.aborted) throw err;
         idleRetries++;
+        opts.onRetry?.({ attempt: idleRetries, reason: 'stream_idle' });
         await sleep(getRetryDelay(idleRetries));
         continue;
       }
       // 已吐事件 / 不可重试 / 次数耗尽 → 抛给上层。
       if (started || !shouldRetry(err) || attempt > maxRetries || opts.signal.aborted) throw err;
+      opts.onRetry?.({ attempt, reason: retryReason(err), retryAfterMs: getRetryAfterMs(err) });
       await sleep(getRetryDelay(attempt, retryAfterHeader(err)));
     }
   }

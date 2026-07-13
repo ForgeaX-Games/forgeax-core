@@ -6,7 +6,7 @@
  * 其余生命周期事件(turn/stop/session/stage)被跳过。
  */
 import { test, expect, describe } from 'bun:test';
-import { walEventsToUiMessages, relinkMsgIds, type CheckpointRef } from '../../src/tui/transcript/rehydrate';
+import { walEventsToUiMessages, relinkMsgIds, checkResumeConsistency, type CheckpointRef } from '../../src/tui/transcript/rehydrate';
 import { reduceTranscript } from '../../src/tui/transcript/reduce';
 import type { SessionEntry, UiMessage } from '../../src/tui/contracts';
 import type { CoreEvent } from '../../src/events/types';
@@ -131,5 +131,56 @@ describe('relinkMsgIds', () => {
   test('幂等:已带 msgId(新 WAL)→ 不改', () => {
     const msgs: UiMessage[] = [{ kind: 'user', text: 'q1', msgId: 'already' }];
     expect(relinkMsgIds(msgs, [cp('other')])).toEqual(msgs);
+  });
+});
+
+// ─── T1: checkResumeConsistency(raw 盘上行数 vs 解析事件数 —— 截断/损坏 WAL 时 ok=false)──
+describe('checkResumeConsistency', () => {
+  /** 把事件序列化成 JSONL(与 JsonlFileEventStore 同格式:每行一个 JSON,type 在首)。 */
+  const toJsonl = (evs: CoreEvent[]): string => evs.map((e) => JSON.stringify(e)).join('\n') + '\n';
+  const conv: CoreEvent[] = [
+    ev('session.start', { sessionId: 's' }),
+    ev('user_prompt.submit', { prompt: 'q1', turn: 0 }),
+    ev('assistant.message', { role: 'assistant', content: [{ type: 'text', text: 'a1' }] }),
+    ev('user_prompt.submit', { prompt: 'q2', turn: 1 }),
+    ev('assistant.message', { role: 'assistant', content: [{ type: 'text', text: 'a2' }] }),
+  ];
+
+  test('健康 WAL:盘上对话行数 == 解析事件数 → ok', () => {
+    const r = checkResumeConsistency(toJsonl(conv), conv);
+    expect(r).toEqual({ ok: true, rawCount: 4, parsedCount: 4 });
+  });
+
+  test('截断:盘上多一条 assistant 行、loader 丢了它 → ok=false(护栏触发)', () => {
+    // 原始文本含全部 4 条对话行,但传入的解析事件缺最后一条 assistant(模拟坏行被静默跳过)。
+    const raw = toJsonl(conv);
+    const parsedMissingLast = conv.slice(0, conv.length - 1); // 丢掉尾部 assistant.message
+    const r = checkResumeConsistency(raw, parsedMissingLast);
+    expect(r.ok).toBe(false);
+    expect(r.rawCount).toBe(4);
+    expect(r.parsedCount).toBe(3);
+  });
+
+  test('真截断(尾行被砍半):type 首字段仍在 → raw 计入、parse 丢弃 → ok=false', () => {
+    // 完整 4 行 + 一条被截断的 assistant.message(只落半行,含 "type":"assistant.message" 但 JSON 不闭合)。
+    const raw = toJsonl(conv) + '{"type":"assistant.message","payload":{"content":[{"typ';
+    // loader 侧只成功解析出前 4 条对话事件(截断行 JSON.parse 失败被跳过)。
+    const r = checkResumeConsistency(raw, conv);
+    expect(r.ok).toBe(false);
+    expect(r.rawCount).toBe(5); // 4 完整 + 1 截断行(子串命中)
+    expect(r.parsedCount).toBe(4);
+  });
+
+  test('rewind 遮蔽免疫:被遮蔽行仍是合法 JSON、两侧同计 → ok', () => {
+    const withRewind: CoreEvent[] = [
+      ...conv,
+      ev('rewind.applied', { rewindId: 'r1', keepUserTurns: 1 }),
+    ];
+    const r = checkResumeConsistency(toJsonl(withRewind), withRewind);
+    expect(r.ok).toBe(true); // 遮蔽不影响 raw/parsed 计数(都含被遮蔽行)
+  });
+
+  test('空 WAL → ok(0 == 0)', () => {
+    expect(checkResumeConsistency('', [])).toEqual({ ok: true, rawCount: 0, parsedCount: 0 });
   });
 });

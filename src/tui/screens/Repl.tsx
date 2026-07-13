@@ -48,6 +48,7 @@ import { useInputHistory } from '../providers/input-history';
 import { usePermissionQueue } from '../providers/permission';
 import { useQuestionQueue } from '../providers/question';
 import { useAgent } from '../driver/useAgent';
+import { useBootResume } from '../providers/boot-resume';
 import { resolveCommand } from '../commands/registry';
 import { createPasteAssembler } from '../input/pasteAssembler';
 import { shouldCollapsePaste, pastePlaceholder, expandPastes } from '../input/pasteText';
@@ -71,6 +72,8 @@ import type { RemoteOrigin, RemoteInboundMsg } from '../remote/controller';
 import { StatusLine } from '../components/StatusLine';
 import { ThinkingIndicator } from '../components/ThinkingIndicator';
 import { Queue } from '../components/Queue';
+import { Banner } from '../components/Banner';
+import { FORGEAX_CORE_VERSION } from '../../version';
 
 /** 一条待跑的轮:本地输入(origin 省略)或远端来源(带回复定址)。msgId=回退锚点(H-02)。 */
 type QueuedTurn = { prompt: string; origin?: RemoteOrigin; images?: ImageAttachment[]; msgId?: string };
@@ -391,6 +394,21 @@ export function Repl(): React.ReactElement {
     },
     [agent, session, replaceTranscript, history],
   );
+
+  // ── T1 boot rehydrate:启动带 --resume/--continue 且会话有 WAL 历史 → 首帧 mount 后
+  //   自动 doResume 一次(reseed 下一轮 LLM 历史 + 回灌 transcript)。此前 runTui 只把
+  //   sessionId 连上 WAL 追加、从不回放,续接后模型答「this is the start of our conversation」、
+  //   transcript 空白。这里补上 boot 触发。
+  //   · useRef 去重:只跑一次,绝不与用户随后手动 /resume 冲突(doResume 幂等,但避免重复回灌)。
+  //   · 走 mount effect 而非 runTui 同步执行:runTui 里组件尚未 mount,transcript 半边
+  //     (session.replaceAll)拿不到 provider state,必须等首帧挂载后。
+  const bootResumeId = useBootResume();
+  const bootResumedRef = useRef(false);
+  useEffect(() => {
+    if (bootResumedRef.current || !bootResumeId) return;
+    bootResumedRef.current = true;
+    void doResume(bootResumeId);
+  }, [bootResumeId, doResume]);
 
   // ── slash 命令上下文 ──
   const ctx = useMemo<CommandCtx>(
@@ -964,6 +982,19 @@ export function Repl(): React.ReactElement {
   });
 
   // ── 渲染 ───────────────────────────────────────────────────────────────────
+  // 欢迎横幅:经 Transcript header 挂进 <Static> 发射一次;/clear(redrawNonce bump)
+  //   重挂载时白得重现。数据全在手边(version/model/sessionId/cwd),无新接缝。
+  const banner = useMemo(
+    () => (
+      <Banner
+        version={FORGEAX_CORE_VERSION}
+        model={agent.model}
+        sessionId={agent.sessionId}
+        cwd={process.cwd()}
+      />
+    ),
+    [agent.model, agent.sessionId],
+  );
   return (
     <Box flexDirection="column">
       {/* 主体:transcript(owner 管 Static/live;工具卡走 toolMeta→views/tools)。 */}
@@ -975,6 +1006,7 @@ export function Repl(): React.ReactElement {
         redrawNonce={redrawNonce}
         streamingText={streamingText}
         streamingThinking={streamingThinking}
+        header={banner}
       />
 
       {/* 审批卡(受控浮层;查表前已由本屏经 toolMeta 解析 canonical)。 */}

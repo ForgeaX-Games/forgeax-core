@@ -5,13 +5,11 @@
  * 所有 provider 出站请求统一带上 forgeax-core 自己的 `User-Agent`,
  * 便于上游/网关侧识别与统计。
  *
- * 版本号与 CLI `--version` 保持一致(见 src/cli/main.ts)。
+ * 版本号 SSOT = src/version.ts(派生自 package.json)。
  */
+import { FORGEAX_CORE_VERSION } from '../version';
 
-/** forgeax-core 版本号(与 package.json / CLI --version 对齐)。 */
-export const FORGEAX_CORE_VERSION = '0.1.0';
-
-/** 出站 User-Agent,形如 `forgeax-core/0.1.0 (Bun/1.3.10; darwin arm64)`。 */
+/** 出站 User-Agent,形如 `forgeax-core/0.1.4 (Bun/1.3.10; darwin arm64)`。 */
 export const FORGEAX_USER_AGENT = buildUserAgent();
 
 function buildUserAgent(): string {

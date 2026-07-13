@@ -26,6 +26,7 @@ import { InputHistoryProvider } from './providers/input-history';
 import { PermissionProvider, usePermissionQueue } from './providers/permission';
 import { QuestionProvider, useQuestionQueue } from './providers/question';
 import { AgentProvider, createAgentDriver } from './driver/useAgent';
+import { BootResumeProvider } from './providers/boot-resume';
 import { RemoteProvider } from './providers/remote';
 import { createRemoteController, type ChannelFactory, type RemoteController } from './remote/controller';
 import { createFakeChannel } from './remote/fake-channel';
@@ -34,6 +35,7 @@ import type { AgentDriver } from './contracts';
 import { routes, defaultRoute, type RouteName } from './routes';
 import { installStderrGuard } from './stderr-guard';
 import { inkInstanceRef } from './ink-instance-ref';
+import { mostRecentSessionId, sessionHasHistory } from '../cli/resume-fold';
 
 // 触发各注册表的副作用注册(views/* 在自己文件内 registerX;commands 同)。
 import './views/messages/index';
@@ -57,6 +59,8 @@ export function App(props: {
   driver: AgentDriver;
   controller: RemoteController;
   route?: RouteName;
+  /** T1:启动续接的会话 id(已确认有 WAL 历史);undefined = 不续接。Repl 首帧 mount 后回灌一次。 */
+  bootResumeId?: string;
 }): React.ReactElement {
   const route = routes[props.route ?? defaultRoute];
   const Screen = route.screen;
@@ -69,9 +73,11 @@ export function App(props: {
               <QuestionProvider>
                 <AgentProvider driver={props.driver}>
                   <RemoteProvider controller={props.controller}>
-                    <HostBridge driver={props.driver}>
-                      <Screen />
-                    </HostBridge>
+                    <BootResumeProvider id={props.bootResumeId}>
+                      <HostBridge driver={props.driver}>
+                        <Screen />
+                      </HostBridge>
+                    </BootResumeProvider>
                   </RemoteProvider>
                 </AgentProvider>
               </QuestionProvider>
@@ -118,11 +124,18 @@ export interface TuiArgs extends HostContextArgs {
 /** main.ts 的 TUI 分支入口:装配 → 渲染 → 等退出 → 清理。返回退出码。 */
 export async function runTui(args: TuiArgs, providerOverride?: LLMProvider): Promise<number> {
   // 会话 id 解析:
-  //   --resume/--session <id> → 用指定 id;--continue → 续接「default」会话;
+  //   --resume/--session <id> → 用指定 id;--continue → 续接当前目录**最近活跃**会话
+  //   (H-04 SSOT,与 headless `-c` 及 `/continue` 命令同口径;此前 TUI 固定用 'default' 与之背离);
   //   否则**自动生成**一个新会话 id(时间戳),让普通交互也持久化 WAL,从而可被 /resume 列出。
   //   (此前未指定时 sessionId=undefined,host-context 不接 WAL → 永不落盘 → /resume 永远为空。)
-  const sessionId =
-    args.sessionId ?? (args.continueSession ? 'default' : newSessionId());
+  const continueId = args.continueSession ? mostRecentSessionId(args.sessionsDir) : undefined;
+  const explicitId = args.sessionId ?? continueId; // 用户明确要求续接的 id(resume/continue);新建则 undefined
+  const sessionId = explicitId ?? newSessionId();
+  // T1 boot rehydrate:仅当续接 id 对应会话**已有 WAL 历史**时才置 bootResumeId → Repl 首帧
+  //   mount 后 doResume 一次(reseed LLM 半边 + 替换 transcript 半边)。`--resume <新id>`
+  //   (合法的「以此 id 新建」)无历史 → 不续接、不误报「未找到会话」。
+  const bootResumeId =
+    explicitId && sessionHasHistory(explicitId, args.sessionsDir) ? explicitId : undefined;
   const hostArgs = {
     model: args.model,
     demo: args.demo,
@@ -149,7 +162,7 @@ export async function runTui(args: TuiArgs, providerOverride?: LLMProvider): Pro
   //   stock ink 的 patch-console 只接管 console.*,拦不住 core 的裸 stderr 写,会污染帧
   //   (输入框残影/重复)。详见 ./stderr-guard。⚠️ 只拦 stderr,ink 帧走 stdout 不可碰。
   const restoreStderr = installStderrGuard();
-  const instance = render(<App driver={driver} controller={controller} />);
+  const instance = render(<App driver={driver} controller={controller} bootResumeId={bootResumeId} />);
   // 暴露 Instance 给 resize 干净重绘用(Transcript 经 inkInstanceRef 调 resetStaticOutput)。
   inkInstanceRef.current = instance as unknown as typeof inkInstanceRef.current;
   try {

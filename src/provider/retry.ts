@@ -102,6 +102,28 @@ function getRetryAfterHeader(err: unknown): string | null {
   return null;
 }
 
+/** 取 retry-after 的毫秒值(供 onRetry 观测;无则 undefined)。 */
+export function getRetryAfterMs(err: unknown): number | undefined {
+  const e = asErrorLike(err);
+  if (typeof e.retryAfterMs === 'number' && Number.isFinite(e.retryAfterMs)) return e.retryAfterMs;
+  if (typeof e.retryAfterHeader === 'string') {
+    const s = parseInt(e.retryAfterHeader, 10);
+    if (!isNaN(s)) return s * 1000;
+  }
+  return undefined;
+}
+
+/** 人类可读的重试原因(供 onRetry / api_retry 观测):优先 HTTP status,其次 529 overloaded,
+ *  再其次网络 code,兜底 'unknown'。纯字符串派生,不影响重试决策。 */
+export function retryReason(err: unknown): string {
+  const status = getStatus(err);
+  if (status !== undefined) return String(status);
+  if (is529Error(err)) return 'overloaded';
+  const code = getErrorCode(err);
+  if (code) return code;
+  return 'unknown';
+}
+
 /** 终端 HTTP（不重试）。429 不在此列（限流可重试）。 */
 const TERMINAL_STATUSES = new Set([400, 401, 403, 404, 405, 422]);
 
@@ -144,6 +166,8 @@ export interface WithRetryOptions {
   initialConsecutive529Errors?: number;
   /** 等待 hook（可注入便于测试；默认真实 setTimeout）。 */
   sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
+  /** ★ T5 观测缝(可选;不传 = 零回归):每次即将重试(sleep 前)调用一次。 */
+  onRetry?: (info: import('./types').RetryInfo) => void;
 }
 
 function defaultSleep(ms: number, signal?: AbortSignal): Promise<void> {
@@ -220,6 +244,7 @@ export async function withRetry<T>(
       }
 
       const delayMs = getRetryDelay(attempt, getRetryAfterHeader(error));
+      options.onRetry?.({ attempt, reason: retryReason(error), retryAfterMs: getRetryAfterMs(error) });
       await sleep(delayMs, options.signal);
     }
   }

@@ -1,0 +1,146 @@
+/**
+ * T4 · TaskNotificationHub 单测(纯 HOST 层接线,core 不改)。
+ *
+ * 覆盖:
+ *  - 观察侧①:包装 BackgroundSpawnFn,后台 bash `exit` chunk → 入队,透传全部 chunk,
+ *    重复 exit 只入队一次(去重),累积有界输出尾。
+ *  - 观察侧②:BackgroundTasks.onDone(成功/失败)→ 入队。
+ *  - 注入侧:UserPromptSubmit publish 回执上挂 `<task_notification>` additionalContext,
+ *    入队即出队(drain 后清空),追加不覆盖既有 additionalContext,空队列不改回执。
+ */
+import { describe, expect, test } from 'bun:test';
+import { EventBus } from '../src/events/event-bus';
+import { CoreEventType } from '../src/events/events';
+import type { CoreEvent, HookControl } from '../src/events/types';
+import { BackgroundTasks } from '../src/agent/background';
+import type { SubagentResult } from '../src/agent/subagent';
+import type { Chunk } from '../src/inject/types';
+import type { BackgroundSpawnFn, BackgroundProcess } from '../src/capability/builtin-tools/shell-registry';
+import { TaskNotificationHub } from '../src/cli/task-notification';
+
+const NOOP_PROC: BackgroundProcess = { kill: () => {} };
+
+/** 一个可手动喂 chunk 的假 BackgroundSpawnFn:把 onChunk 暴露给测试驱动。 */
+function fakeSpawn(): { fn: BackgroundSpawnFn; emit: (c: Chunk) => void; seen: Chunk[] } {
+  const seen: Chunk[] = [];
+  let sink: ((c: Chunk) => void) | null = null;
+  const fn: BackgroundSpawnFn = (_cmd, _args, _opts, onChunk) => {
+    sink = (c: Chunk) => {
+      seen.push(c);
+      onChunk(c);
+    };
+    return NOOP_PROC;
+  };
+  return { fn, emit: (c) => sink?.(c), seen };
+}
+
+function upsReceipt(bus: EventBus): CoreEvent & { additionalContext?: string } {
+  return bus.publish({ type: CoreEventType.UserPromptSubmit, payload: { prompt: 'hi', turn: 0 }, ts: 0 }) as CoreEvent & {
+    additionalContext?: string;
+  };
+}
+
+describe('TaskNotificationHub', () => {
+  test('background bash exit → enqueues one notification, passes all chunks through', () => {
+    const hub = new TaskNotificationHub();
+    const { fn, emit, seen } = fakeSpawn();
+    const passthrough: Chunk[] = [];
+    const wrapped = hub.wrapBackgroundSpawn(fn);
+    wrapped('sh', ['-c', 'sleep 3 && echo done'], undefined, (c) => passthrough.push(c));
+
+    emit({ stream: 'stdout', data: 'done\n' });
+    emit({ stream: 'exit', data: '0' });
+
+    // 透传:原 onChunk 收到全部 chunk。
+    expect(passthrough.map((c) => c.stream)).toEqual(['stdout', 'exit']);
+    expect(seen.length).toBe(2);
+    // 入队一条,label = 命令末段,status = exit code,尾含 stdout。
+    expect(hub.size).toBe(1);
+  });
+
+  test('duplicate exit chunk only enqueues once (dedup)', () => {
+    const hub = new TaskNotificationHub();
+    const { fn, emit } = fakeSpawn();
+    const wrapped = hub.wrapBackgroundSpawn(fn);
+    wrapped('sh', ['-c', 'x'], undefined, () => {});
+    emit({ stream: 'exit', data: '0' });
+    emit({ stream: 'exit', data: '0' });
+    expect(hub.size).toBe(1);
+  });
+
+  test('UserPromptSubmit drains queue into <task_notification> additionalContext', () => {
+    const hub = new TaskNotificationHub();
+    const bus = new EventBus();
+    hub.subscribe(bus);
+    hub.enqueue({ label: 'sleep 3 && echo done', status: 'exit code 0', outputTail: 'done' });
+
+    const receipt = upsReceipt(bus);
+    expect(receipt.additionalContext).toContain('<task_notification>');
+    expect(receipt.additionalContext).toContain('sleep 3 && echo done');
+    expect(receipt.additionalContext).toContain('exit code 0');
+    expect(receipt.additionalContext).toContain('done');
+    // 入队即出队:drain 后清空,下一次不再注入。
+    expect(hub.size).toBe(0);
+    const receipt2 = upsReceipt(bus);
+    expect(receipt2.additionalContext).toBeUndefined();
+  });
+
+  test('multiple concurrent completions merge into one block, in order', () => {
+    const hub = new TaskNotificationHub();
+    const bus = new EventBus();
+    hub.subscribe(bus);
+    hub.enqueue({ label: 'task-a', status: 'exit code 0' });
+    hub.enqueue({ label: 'task-b', status: 'exit code 1' });
+    const receipt = upsReceipt(bus);
+    const ctx = receipt.additionalContext ?? '';
+    // 单个 <task_notification> 块,两条按序。
+    expect(ctx.match(/<task_notification>/g)?.length).toBe(1);
+    expect(ctx.indexOf('task-a')).toBeLessThan(ctx.indexOf('task-b'));
+  });
+
+  test('appends to (does not clobber) an existing additionalContext on the receipt', () => {
+    const hub = new TaskNotificationHub();
+    const bus = new EventBus();
+    // 前置订阅者(模拟 settings hook)先挂 additionalContext。
+    bus.subscribe(CoreEventType.UserPromptSubmit, (_e: CoreEvent, ctl: HookControl) => {
+      ctl.modify({ additionalContext: 'PRIOR-HOOK-CTX' } as Partial<CoreEvent>);
+    });
+    hub.subscribe(bus);
+    hub.enqueue({ label: 'task-x', status: 'exit code 0' });
+    const receipt = upsReceipt(bus);
+    const ctx = receipt.additionalContext ?? '';
+    expect(ctx).toContain('PRIOR-HOOK-CTX');
+    expect(ctx).toContain('<task_notification>');
+    expect(ctx.indexOf('PRIOR-HOOK-CTX')).toBeLessThan(ctx.indexOf('<task_notification>'));
+  });
+
+  test('empty queue leaves the receipt untouched', () => {
+    const hub = new TaskNotificationHub();
+    const bus = new EventBus();
+    hub.subscribe(bus);
+    const receipt = upsReceipt(bus);
+    expect(receipt.additionalContext).toBeUndefined();
+  });
+
+  test('subagent onDone (success + failure) enqueues notifications', () => {
+    const hub = new TaskNotificationHub();
+    const bg = new BackgroundTasks<SubagentResult>({ onDone: hub.onSubagentDone });
+    // 成功:result 携 text/terminalReason。
+    bg.start('explore', Promise.resolve({ text: 'found it', terminalReason: 'completed', turns: 2, toolCalls: 1 }));
+    // 失败:reject。
+    bg.start('build', Promise.reject(new Error('boom')));
+    return new Promise<void>((resolve) => {
+      setTimeout(() => {
+        expect(hub.size).toBe(2);
+        const bus = new EventBus();
+        hub.subscribe(bus);
+        const ctx = upsReceipt(bus).additionalContext ?? '';
+        expect(ctx).toContain('explore');
+        expect(ctx).toContain('found it');
+        expect(ctx).toContain('build');
+        expect(ctx).toContain('failed: boom');
+        resolve();
+      }, 10);
+    });
+  });
+});

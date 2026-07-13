@@ -23,6 +23,8 @@ import type {
   ForkExtractResult,
 } from '@forgeax/agent-runtime/contract';
 import { CoreAgent } from '../agent/agent';
+import { EventBus } from '../events/event-bus';
+import { CoreEventType } from '../events/events';
 import { runForkedAgent } from '../agent/forked-agent';
 import type { AgentContext, AgentEvent, TerminalReason } from '../agent/types';
 import type { AgentTool } from '../capability/types';
@@ -32,16 +34,18 @@ import { makeProviderCompactSummarize } from '../context/compaction-llm';
 import { makeRehydrateInjection } from '../context/post-compact-rehydrate';
 import { microCompact } from '../context/micro-compaction';
 import { contextWindowForModel } from '../context/model-window';
-import { makeTaskTool } from '../agent/subagent';
+import { makeTaskTool, runSubagent } from '../agent/subagent';
 import type { SubagentRegistry } from '../agent/subagent-registry';
 import { handoffTool } from '../capability/builtin-tools/message-tools';
-import { exitPlanModeTool } from '../capability/builtin-tools/plan-tools';
 import type { PermissionMode as NativePermissionMode } from '../permission/engine';
 import type { PermissionRuleSet } from '../permission/rules';
 import type { AskUserFn } from '../agent/dispatch';
 import type { ServerRequestDeps } from '../capability/mcp/server-requests';
 import type { TokenProvider } from '../capability/mcp/auth';
 import type { HandoffSink, AskQuestionFn } from '../inject/types';
+import type { EventStore } from '../inject/types';
+import { foldFromStore } from '../history/llm-fold-adapter';
+import type { CoreEvent } from '../events/types';
 import type { Observability } from '../observability/contract';
 import { NOOP_OBS, parentContextFromTraceparent } from '../observability/contract';
 import { cacheHitRate, promptTokens } from '../observability/usage';
@@ -174,6 +178,18 @@ export interface ForgeaxCoreKernelOptions {
    * 兜底(子拿全量 host 工具、固定 system 文案),零行为变化。
    */
   subagentRegistry?: SubagentRegistry;
+  /**
+   * ★ T6 子 agent 持久化/续聊接缝(additive):按 agentId 取子 loop transcript 的
+   * `EventStore`。注入后:
+   *   - 每次 Task 派子会生成**唯一 agentId** 并把子 transcript 落盘(经此工厂取的 store);
+   *     该 agentId 经 `x.subagent.*` 事件 / tool.result 透给 host,作续聊句柄。
+   *   - `resumeSubagent(agentId, prompt)` 用同一工厂取回该 agentId 的 store,fold 出历史
+   *     → 续跑(带上一次上下文)。
+   *   - **缺省 ⇒ 子 loop 仅内存、无对外可 resume 句柄(维持现状 byte-for-byte,零回归)**。
+   * host(serve)按 agentId 派生磁盘路径造 `JsonlFileEventStore` 注入 —— facade 不碰 node:fs
+   * (保 mechanism/facade 边界:store 是注入的 opaque 对象)。
+   */
+  subagentStore?: (agentId: string) => EventStore | undefined;
 }
 
 /** 契约中立 PermissionMode → engine 原生 PermissionMode(facade 翻译;spine 不说内核私有词汇)。
@@ -300,6 +316,37 @@ function subEventToKernel(ev: SubEvent): KernelEvent | null {
   }
 }
 
+/**
+ * T5:内部 `CompactionApplied` bus 事件 → `compact_boundary` KernelEvent(出墙观测)。
+ * 纯映射(loop 已在事件上带 preTokens/postTokens/trigger;老发布方缺这三字段时优雅降级为 undefined)。
+ */
+function compactionToKernel(payload: {
+  coveredFrom: number;
+  coveredTo: number;
+  preTokens?: number;
+  postTokens?: number;
+  trigger?: string;
+}): KernelEvent {
+  return {
+    kind: 'compact_boundary',
+    coveredFrom: payload.coveredFrom,
+    coveredTo: payload.coveredTo,
+    ...(payload.trigger !== undefined ? { trigger: payload.trigger } : {}),
+    ...(payload.preTokens !== undefined ? { preTokens: payload.preTokens } : {}),
+    ...(payload.postTokens !== undefined ? { postTokens: payload.postTokens } : {}),
+  };
+}
+
+/** T5:内部 `ApiRetry` bus 事件 → `api_retry` KernelEvent(出墙观测)。纯映射。 */
+function apiRetryToKernel(payload: { attempt: number; reason: string; retryAfterMs?: number }): KernelEvent {
+  return {
+    kind: 'api_retry',
+    attempt: payload.attempt,
+    reason: payload.reason,
+    ...(payload.retryAfterMs !== undefined ? { retryAfterMs: payload.retryAfterMs } : {}),
+  };
+}
+
 export class ForgeaxCoreKernel implements AgentKernel {
   readonly id = 'forgeax-core' as const;
   readonly capabilities = CAPS;
@@ -308,9 +355,22 @@ export class ForgeaxCoreKernel implements AgentKernel {
   /** 当前权限模式(engine 原生)。新轮 CoreAgent 以此构造;`setPermissionMode` 经
    *  translateNeutral 改活 agent 并存这里,使无 live handle 时新轮也带上新模式。 */
   private currentMode: NativePermissionMode;
+  /** 进入 plan 前的权限模式(仅 currentMode==='plan' 期间有意义)。每轮带给 CoreAgent,
+   *  ExitPlanMode 获批退出时恢复它;轮终从 agent 回读(applyMode/syncModeFromAgent 维护)。 */
+  private prePlanMode: NativePermissionMode | undefined;
   /** 当前模型(控制面 `setModel` 覆盖)。设了即**取代** req.model 作为新轮 + 活 agent 的
    *  权威模型源(与 currentMode 同语义:控制面 override 持久,直到再次 setModel)。 */
   private currentModel: string | undefined;
+
+  /**
+   * ★ T6 resume 上下文(agentId → 派子时的 model/tools/toolContext)。子 loop 的历史由
+   * `subagentStore` 持久化,但「用什么工具/模型续跑」是运行期配置 —— 派子时在此登记,
+   * `resumeSubagent` 取回复用(缺失时降级到默认模型 + 空工具:历史仍可续,§9 优雅降级)。
+   */
+  private readonly resumeCtx = new Map<
+    string,
+    { model: string; tools: AgentTool[]; toolContext: Record<string, unknown> }
+  >();
 
   /**
    * MCP server→client 反向请求 handler(M4 存储接缝;facade 不自调用)。host 在外部
@@ -333,11 +393,27 @@ export class ForgeaxCoreKernel implements AgentKernel {
     this.currentMode = opts.initialMode ?? 'default';
   }
 
+  /** 切换 kernel 级权限模式,同步维护 prePlanMode(进 plan 记录进入前模式、离开清掉)。
+   *  控制面 setPermissionMode 与 TurnRequest.permissionMode 两条入口共用(SSOT)。 */
+  private applyMode(native: NativePermissionMode): void {
+    if (native === 'plan' && this.currentMode !== 'plan') this.prePlanMode = this.currentMode;
+    else if (native !== 'plan') this.prePlanMode = undefined;
+    this.currentMode = native;
+  }
+
+  /** 轮终从 agent 回读模式状态。修复既有失同步:agent 内 ExitPlanMode 恢复模式后,
+   *  facade 若不回读,下一轮仍按旧模式(plan)构造新 agent,退出形同虚设。 */
+  private syncModeFromAgent(agent: CoreAgent): void {
+    this.currentMode = agent.getMode();
+    this.prePlanMode = agent.getPrePlanMode();
+  }
+
   /**
    * 应用 `TurnRequest.toolPolicy`(契约 contract.ts:184)到最终模型工具集。
    *
    * 为何在此:host 声明的 `req.tools` 是宿主可控的白名单,但 facade 会在其上**额外叠加**
-   * 内核内建编排工具(`Task` 子 agent / `Handoff` 团队交接 / plan 下的 `ExitPlanMode`)。
+   * 内核内建编排工具(`Task` 子 agent / `Handoff` 团队交接;plan 下的 `ExitPlanMode` 由
+   * CoreAgent loop 逐轮补注,不经此裁剪——它是模型走出 plan 的唯一缝,裁掉会把 plan 变死锁)。
    * 这些内建工具不在 host roster 里,若无条件注入,game-gen 等 profile 会**意外暴露**编排能力
    * (模型可能派子 agent、改变生成路径/产物归属,见验收报告 D.3)。`toolPolicy` 让宿主按
    * profile roster 精确裁剪:studio 侧对不打算开放编排的 profile 传 `deny:['Task','Handoff']`
@@ -427,13 +503,25 @@ export class ForgeaxCoreKernel implements AgentKernel {
     // 控制面 setModel 覆盖优先(持久),否则本轮 req.model,再否则默认。
     const model = this.currentModel ?? req.model ?? 'claude-opus-4-8';
     // P0:TurnRequest.permissionMode → 本轮起始模式(免一次 setPermissionMode 往返)。
-    //   控制面 setPermissionMode 仍可中途再改;此处把 req 的初始模式落到 currentMode。
-    if (req.permissionMode) this.currentMode = translateNeutral(req.permissionMode);
+    //   控制面 setPermissionMode 仍可中途再改;此处把 req 的初始模式落到 currentMode
+    //   (applyMode 顺带维护 prePlanMode)。
+    if (req.permissionMode) this.applyMode(translateNeutral(req.permissionMode));
     const hostTools = this.wrapTools(req);
     // ★ L5 observability:本轮 FIFO 队列,缓冲子 agent 生命周期回调投射出的 KernelEvent。
     //   onSubagentEvent 在 Task 工具 await 期间(即 agent.run 两次 yield 之间)同步推入,
     //   逐轮 drain 即可保 start→turn→tool→done 顺序排在父 tool.result 之前。
+    //   ★ T5:同一队列也承载 compact_boundary / api_retry —— 它们经内部 bus 订阅在 agent.run
+    //   执行(两次 yield 之间)同步推入,与子事件走同一逐轮 drain,顺序天然对齐本轮进度。
     const subQueue: KernelEvent[] = [];
+    // ★ T5:本轮内部事件 bus —— 传给 CoreAgent(替代其自建 bus),订阅两个观测事件后转成
+    //   KernelEvent 推进 subQueue。loop 其余事件对这两个订阅者是 no-op(按 type 过滤),零开销。
+    const turnBus = new EventBus();
+    const unsubCompact = turnBus.subscribe(CoreEventType.CompactionApplied, (e) => {
+      subQueue.push(compactionToKernel(e.payload as Parameters<typeof compactionToKernel>[0]));
+    });
+    const unsubRetry = turnBus.subscribe(CoreEventType.ApiRetry, (e) => {
+      subQueue.push(apiRetryToKernel(e.payload as Parameters<typeof apiRetryToKernel>[0]));
+    });
     // ★ subagent:facade 注入原生 Task,使 forgeax-core 作内环驱动聊天时也能派子 agent。
     //   子 agent 跑在 forgeax-core 内(隔离上下文,自压缩),子工具 = host 工具(经同一桥),
     //   **不含 Task**(防递归):Task 是内核内建子 agent 工具,非 host 声明。
@@ -457,14 +545,14 @@ export class ForgeaxCoreKernel implements AgentKernel {
       typeof this.o.handoff === 'function'
         ? this.o.handoff({ provider: this.o.provider, model, tools: hostTools })
         : this.o.handoff;
-    // plan 模式:把 ExitPlanMode 工具加进模型工具集(只在 plan 下可见——它是退出 plan 的唯一缝)。
-    const planTools = this.currentMode === 'plan' ? [exitPlanModeTool()] : [];
+    // plan 出口工具(ExitPlanMode)不在此注入:CoreAgent loop 是唯一注入点(007,SSOT)——
+    //   plan 模式的轮由 loop 逐轮补注,facade 与直连路径同源。
     // 内建编排工具(Task/Handoff)默认叠加;再经 req.toolPolicy 按 host roster 裁剪
     //   (缺省全放行 = 零行为变化;studio 对 game-gen profile deny Task/Handoff → 与 legacy 对齐,
     //   见 applyToolPolicy 与验收报告 D.3)。
     const assembled = handoffSink
-      ? [...hostTools, taskTool, handoffTool(), ...planTools]
-      : [...hostTools, taskTool, ...planTools];
+      ? [...hostTools, taskTool, handoffTool()]
+      : [...hostTools, taskTool];
     const tools = this.applyToolPolicy(assembled, req.toolPolicy);
     const context: AgentContext = {
       agentId: req.session.agentId,
@@ -484,9 +572,13 @@ export class ForgeaxCoreKernel implements AgentKernel {
     const agent = new CoreAgent({
       context,
       globalCacheEnabled: true,
+      // ★ T5:注入本轮 bus,使内部 CompactionApplied / ApiRetry 事件被 facade 订阅并出墙。
+      bus: turnBus,
       // ★ WS-C:把权限模式 / 规则 / askUser 透传给每轮 CoreAgent,使 facade 驱动的轮也
       //   honor 注入规则、并让 setPermissionMode 改活 agent 真生效(dispatch 读 currentMode)。
       mode: this.currentMode,
+      // 007:进入 plan 前的模式随轮带入,ExitPlanMode 获批退出时恢复它(轮终 syncModeFromAgent 回读)。
+      ...(this.prePlanMode !== undefined ? { prePlanMode: this.prePlanMode } : {}),
       ...(this.o.rules !== undefined ? { rules: this.o.rules } : {}),
       ...(this.o.askUser ? { askUser: this.o.askUser } : {}),
       // F6 生产路径也开压缩(auto + micro);长会话不至于撑爆上下文。
@@ -559,7 +651,13 @@ export class ForgeaxCoreKernel implements AgentKernel {
         if (s) yield s;
       }
     } finally {
+      // 007:轮终回读 agent 模式(ExitPlanMode 可能已在轮内恢复模式;不回读则下一轮
+      //   仍按 plan 构造新 agent,退出形同虚设——既有失同步 bug,顺带修复)。
+      this.syncModeFromAgent(agent);
       if (req.callId) this.handles.delete(req.callId);
+      // ★ T5:解订阅本轮 bus 观测事件(本轮结束即释放,不跨轮泄漏)。
+      unsubCompact();
+      unsubRetry();
     }
     // 防御:run 未吐 done(异常路径)也保证 usage-before 缺失不发生。
     if (!usageEmitted) {
@@ -612,6 +710,15 @@ export class ForgeaxCoreKernel implements AgentKernel {
     pushSub: (k: KernelEvent) => void,
   ): AgentTool {
     const registry = this.o.subagentRegistry;
+    // ★ T6:注入了 subagentStore ⇒ 包一层,在派子(工厂被调)时按 agentId 登记 resume 上下文
+    //   (本轮 model/hostTools/toolContext),供 resumeSubagent 续跑复用;再返回真实 store。
+    //   缺省 undefined ⇒ makeTaskTool 不启用持久化,零回归。
+    const subStore: ((agentId: string) => EventStore | undefined) | undefined = this.o.subagentStore
+      ? (agentId: string) => {
+          this.resumeCtx.set(agentId, { model, tools: hostTools, toolContext });
+          return this.o.subagentStore!(agentId);
+        }
+      : undefined;
     return makeTaskTool({
       provider: this.o.provider,
       model,
@@ -622,6 +729,7 @@ export class ForgeaxCoreKernel implements AgentKernel {
             resolveSystem: (t) => `You are a ${t ?? 'general'} subagent. Do the task and report the result concisely.`,
           }),
       toolContext,
+      ...(subStore ? { subagentStore: subStore } : {}),
       // subagent 自压缩(V2)+ 压后重挂(D-01)。
       compactionV2: { summarize: makeProviderCompactSummarize(this.o.provider, model), rehydrate: makeRehydrateInjection(toolContext) },
       contextWindow: contextWindowForModel(model),
@@ -671,6 +779,89 @@ export class ForgeaxCoreKernel implements AgentKernel {
       { provider: this.o.provider, toolContext, signal },
     );
     return { ok: result.terminalReason === 'completed', toolCalls: result.toolCalls, writtenPaths: result.writtenPaths };
+  }
+
+  /**
+   * ★ T6 有状态子 agent 续聊(契约 resumeSubagent)。按 `agentId` 取回该子 loop 之前落盘的
+   * transcript(经 `subagentStore`),`foldFromStore` fold 成历史 → 作 initialMessages seed,
+   * 用 `prompt` 续跑同一子 agent。续跑事件仍落回同一 store(append-only:一次 resume =
+   * 往事件流尾部 APPEND 一轮,不是恢复快照 → store 始终是唯一真相 SSOT)。
+   *
+   * 续跑用什么工具/模型:优先取派子时登记的 resumeCtx(model/tools/toolContext);缺失
+   * (如 sidecar 重启后 in-memory ctx 丢)→ 降级到 currentModel + 空工具集,历史仍可续
+   * (§9 优雅降级)。
+   *
+   * 流出:子生命周期 `x.subagent.*`(start→turn→tool→done)+ 最终结果作 `message.delta`
+   * + `turn.usage`/`turn.done`。找不到 store / 无历史 → 单条 `error` + `turn.done{error}`。
+   */
+  async *resumeSubagent(agentId: string, prompt: string, signal: AbortSignal): AsyncIterable<KernelEvent> {
+    const store = this.o.subagentStore?.(agentId);
+    if (!store) {
+      yield {
+        kind: 'error',
+        error: { code: 'kernel_unavailable', message: `subagent persistence not configured; cannot resume ${agentId}` },
+      };
+      yield { kind: 'turn.done', reason: 'error' };
+      return;
+    }
+    // fold 出历史(read 是可选能力;无 read / 空流 → 无历史)。
+    const events: CoreEvent[] = [];
+    if (store.read) {
+      for await (const e of store.read()) events.push(e);
+    }
+    const initialMessages = foldFromStore(events);
+    if (initialMessages.length === 0) {
+      yield {
+        kind: 'error',
+        error: { code: 'kernel_unavailable', message: `no persisted history for subagent ${agentId}` },
+      };
+      yield { kind: 'turn.done', reason: 'error' };
+      return;
+    }
+
+    const ctx = this.resumeCtx.get(agentId);
+    const model = ctx?.model ?? this.currentModel ?? 'claude-opus-4-8';
+    const tools = ctx?.tools ?? [];
+    const toolContext = ctx?.toolContext ?? { ...(this.o.toolContext ?? {}) };
+
+    // 子生命周期回调 → x.subagent.* 事件缓冲(runSubagent await 期间同步推入,await 后一次性 drain)。
+    const subQueue: KernelEvent[] = [];
+    const result = await runSubagent(
+      {
+        input: prompt,
+        agentId,
+        leadingSystemText:
+          'You are a subagent resuming a prior task. Use your earlier context and continue; report the result concisely.',
+        model,
+        tools,
+        initialMessages,
+        eventStore: store,
+        // 子自压缩(V2)+ 压后重挂(与 runTurn 一致)。
+        compactionV2: {
+          summarize: makeProviderCompactSummarize(this.o.provider, model),
+          rehydrate: makeRehydrateInjection(toolContext),
+        },
+        contextWindow: contextWindowForModel(model),
+      },
+      {
+        provider: this.o.provider,
+        toolContext,
+        ...(this.o.rules !== undefined ? { rules: this.o.rules } : {}),
+        mode: this.currentMode,
+        ...(this.o.askUser ? { askUser: this.o.askUser } : {}),
+        signal,
+        onSubagentEvent: (ev) => {
+          const k = subEventToKernel(ev);
+          if (k) subQueue.push(k);
+        },
+      },
+    );
+
+    // 先出子生命周期事件(start→…→done),再出最终结果文本,最后 usage/done。
+    for (const k of subQueue) yield k;
+    if (result.text) yield { kind: 'message.delta', role: 'assistant', text: result.text };
+    yield { kind: 'turn.usage', inputTokens: 0, outputTokens: 0, cacheRead: 0, cacheCreation: 0 };
+    yield { kind: 'turn.done', reason: mapReason(result.terminalReason) };
   }
 
   /** AgentEvent → KernelEvent(累计 usage / streamed 副作用)。返回 null = 不映射(内部阶段事件)。
@@ -742,8 +933,9 @@ export class ForgeaxCoreKernel implements AgentKernel {
     const agent = this.handles.get(callId);
     const setMode = (mode: PermissionMode): void => {
       const native = translateNeutral(mode);
-      // 存到 kernel(让无 live handle / 下一轮新 agent 也带上),并改活当前 agent(本轮即生效)。
-      this.currentMode = native;
+      // 存到 kernel(applyMode 顺带维护 prePlanMode;让无 live handle / 下一轮新 agent 也带上),
+      // 并改活当前 agent(本轮即生效;agent.setMode 同步维护自己的 prePlanMode)。
+      this.applyMode(native);
       agent?.setMode(native);
     };
     // 与 setMode 同语义的外层箭头闭包(捕获 kernel 的 this;返回对象里的方法 this 是 TurnHandle)。

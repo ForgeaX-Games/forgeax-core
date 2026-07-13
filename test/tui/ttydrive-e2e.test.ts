@@ -12,7 +12,7 @@
  * Boundary(HOST/test 层):node: + Bun + 相对路径。
  */
 import { test, expect, describe } from 'bun:test';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -44,9 +44,11 @@ async function drive(spec: DriveSpec, rows = 30, cols = 100): Promise<string> {
       JSON.stringify({
         cmd: ['bun', 'src/cli/main.ts', '--demo', '--no-memory'],
         // 隔离会话/记忆到临时目录;清掉 key 证明真免网络;FORGEAX_NO_TUI 必须空(否则不进 TUI)。
+        // FORGEAX_SKIP_TRUST=1:跳过首启信任门(CI 逃生口;信任门自身的 PTY 覆盖见下方专项)。
         env: {
           ANTHROPIC_API_KEY: '',
           FORGEAX_NO_TUI: '',
+          FORGEAX_SKIP_TRUST: '1',
           FORGEAX_SESSIONS_DIR: join(dir, 'sessions'),
           ...spec.env,
         },
@@ -123,6 +125,61 @@ describe.skipIf(!hasPython)('TUI PTY e2e (real Ink TUI under a pseudo-terminal)'
       });
       // 召回后输入框里应再次出现 first-msg(InputHistoryProvider 的 prev())。
       expect(screen).toContain('first-msg');
+    },
+    60_000,
+  );
+
+  test(
+    'welcome banner renders on boot (version + model + cwd via <Static>)',
+    async () => {
+      const screen = await drive({ steps: [] });
+      // 横幅三要素:产品名+版本、模型、cwd(可能被头部截断,断言尾部)。
+      expect(screen).toContain('forgeax-core v');
+      expect(screen).toContain('claude-opus-4-8');
+      expect(screen).toContain('packages/core');
+    },
+    60_000,
+  );
+
+  test(
+    'first boot in an untrusted dir shows the trust dialog (gate before assembly)',
+    async () => {
+      const cfg = mkdtempSync(join(tmpdir(), 'forgeax-trust-cfg-'));
+      try {
+        const screen = await drive({
+          // 打开信任门(SKIP 置空)+ 隔离 trust 存储到临时 config 根(不碰真 ~/.forgeax)。
+          env: { FORGEAX_SKIP_TRUST: '', FORGEAX_CONFIG_DIR: cfg },
+          steps: [],
+        });
+        expect(screen).toContain('Do you trust the files in this folder?');
+        expect(screen).toContain('Yes, I trust this folder');
+        expect(screen).toContain('No, exit');
+      } finally {
+        rmSync(cfg, { recursive: true, force: true });
+      }
+    },
+    60_000,
+  );
+
+  test(
+    'accepting the trust dialog enters the REPL and persists (banner appears)',
+    async () => {
+      const cfg = mkdtempSync(join(tmpdir(), 'forgeax-trust-cfg-'));
+      try {
+        const screen = await drive({
+          env: { FORGEAX_SKIP_TRUST: '', FORGEAX_CONFIG_DIR: cfg },
+          steps: [{ send: '<CR>', then_ms: 2500 }], // Enter = 默认选中 Yes
+        });
+        expect(screen).toContain('forgeax-core v'); // 已进 REPL(横幅出现)
+        expect(screen).toContain('/help'); // 输入框 chrome 在
+        // 接受已落盘(下次启动不再弹)。
+        const persisted = JSON.parse(
+          readFileSync(join(cfg, 'projects.json'), 'utf8'),
+        ) as { projects: Record<string, { trusted: boolean }> };
+        expect(Object.values(persisted.projects)[0]?.trusted).toBe(true);
+      } finally {
+        rmSync(cfg, { recursive: true, force: true });
+      }
     },
     60_000,
   );

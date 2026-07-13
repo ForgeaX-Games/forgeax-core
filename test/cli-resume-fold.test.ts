@@ -14,7 +14,7 @@ import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { JsonlFileEventStore } from '../src/cli/event-store-fs';
-import { foldSessionHistory, listSessions, foldSessionById, readSessionEvents } from '../src/cli/resume-fold';
+import { foldSessionHistory, listSessions, foldSessionById, readSessionEvents, sessionHasHistory } from '../src/cli/resume-fold';
 import { CoreEventType } from '../src/events/events';
 import type { CoreEvent } from '../src/events/types';
 
@@ -126,5 +126,28 @@ describe('foldSessionById — 按 id 打开会话 WAL 并 fold', () => {
   test('不存在的会话 id → undefined', async () => {
     const root = tmpRoot('byid-miss');
     expect(await foldSessionById('ghost', root)).toBeUndefined();
+  });
+});
+
+describe('sessionHasHistory — T1 boot rehydrate 的会话历史门禁', () => {
+  test('已有 events.jsonl(非空)→ true', async () => {
+    const root = tmpRoot('has-hist');
+    await seedSession(root, 'sess', 'Ruibin');
+    expect(sessionHasHistory('sess', root)).toBe(true);
+  });
+
+  test('不存在的会话 id → false(--resume <新id> 不误触发续接)', () => {
+    const root = tmpRoot('has-hist-miss');
+    expect(sessionHasHistory('ghost', root)).toBe(false);
+  });
+
+  test('目录/文件缺失 → false(fail-soft,不抛)', () => {
+    expect(sessionHasHistory('any', join(tmpdir(), `fxc-nohist-${process.pid}-${Date.now()}`))).toBe(false);
+  });
+
+  test('空 events.jsonl(0 字节)→ false', () => {
+    const root = tmpRoot('has-hist-empty');
+    new JsonlFileEventStore(join(root, 'sess', 'events.jsonl')); // 建目录+空文件,不写事件
+    expect(sessionHasHistory('sess', root)).toBe(false);
   });
 });

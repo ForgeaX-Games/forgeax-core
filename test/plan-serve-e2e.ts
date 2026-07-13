@@ -12,6 +12,9 @@
  *   plan 模式在核内 deny 非只读工具(engine.ts:246)→ 文件**不应被创建**,且若模型确有尝试,
  *   应见到一条 tool.result(ok:false)。
  *
+ *   幕 2(007 出口人类闸):host 实现 `askUser` RPC(应答 granted:true)→ 提示模型
+ *   ExitPlanMode 退出后写文件 → serve 必先经 askUser 咨询宿主,获批后模式恢复、写落盘。
+ *
  * Boundary:本文件在 test/ 下(不受 core src 边界 lint 约束),仅 import core-local rpc.ts +
  * agent-runtime 契约 + node:,与 src 同源线协议。
  */
@@ -56,13 +59,13 @@ async function connectRetry(sock: string, deadlineMs = 10000): Promise<RpcConnec
   }
 }
 
-function turnReq(callId: string, prompt: string): TurnRequest {
+function turnReq(callId: string, prompt: string, tools: Array<Record<string, unknown>> = []): TurnRequest {
   return {
     session: { threadId: callId, agentId: 'forge' },
     callId,
     input: { text: prompt },
     systemPrompt: { charter: 'You are a terse test agent. Use tools when asked.', persona: '' },
-    tools: [],
+    tools,
     budget: { maxTurns: 6 },
     model: MODEL,
     hostSessionId: 'sid-plan-e2e',
@@ -92,7 +95,14 @@ async function main(): Promise<void> {
   const callId = `c-plan-${Date.now()}`;
   try {
     const conn = await connectRetry(sock);
-    conn.setRequestHandler(async (method) => {
+    // 007 出口人类闸:host 应答 askUser(granted 按幕设定);其余 host 桥请求仍视为异常。
+    let askUserGrant = false;
+    const askUserSeen: Array<Record<string, unknown>> = [];
+    conn.setRequestHandler(async (method, params) => {
+      if (method === 'askUser') {
+        askUserSeen.push(params as Record<string, unknown>);
+        return { granted: askUserGrant };
+      }
       // plan 模式应在写工具执行前就 deny —— 正常情况下 host 桥不会被写工具触达。
       throw Object.assign(new Error(`unexpected hostTool in plan mode: ${method}`), { code: -32601 });
     });
@@ -111,7 +121,6 @@ async function main(): Promise<void> {
           `Do it now with the tool.`,
       ),
     );
-    conn.close();
 
     const kinds = events.map((e) => e.kind);
     // 主断言:plan 只读强制 → 文件没被创建。
@@ -126,6 +135,40 @@ async function main(): Promise<void> {
     check('父轮正常收口(turn.done)', kinds.includes('turn.done'), kinds);
     // 没有写工具触达 host 桥(plan 在核内就 deny 了)。
     check('写工具未触达 host 桥', !events.some((e) => e.kind === 'tool.result' && e.ok === true && /write/i.test(JSON.stringify(e))), kinds);
+
+    // ─── 幕 2(007 出口人类闸):host approve → ExitPlanMode 获批 → 模式恢复 → 写落盘 ───
+    console.log('\nE2E · 007 出口人类闸:askUser RPC 获批 → 退出 plan → 写落盘');
+    askUserGrant = true;
+    const exitTarget = join(workdir, 'exit_test.txt');
+    const writeSpec = {
+      name: 'write_file',
+      delivery: 'local', // serve 的 builtin 本地实现直跑(写落在 cwd=workdir)
+      inputSchema: {
+        type: 'object',
+        properties: { file_path: { type: 'string' }, content: { type: 'string' } },
+        required: ['file_path', 'content'],
+      },
+    };
+    await conn.request(
+      'runTurn',
+      turnReq(
+        `${callId}-exit`,
+        `First call the ExitPlanMode tool (plan: "write exit_test.txt"). ` +
+          `After it succeeds, use the write_file tool to create "exit_test.txt" with the content "ok".`,
+        [writeSpec],
+      ),
+    );
+    conn.close();
+
+    // 出口必经人类闸:serve 一定向宿主发了 askUser 请求。
+    check('serve 经 askUser RPC 咨询宿主(出口人类闸生效)', askUserSeen.length > 0, askUserSeen);
+    check(
+      'askUser 载荷指向 ExitPlanMode',
+      askUserSeen.some((p) => String(p.toolName ?? '') === 'ExitPlanMode'),
+      askUserSeen,
+    );
+    // 获批退出后模式恢复,写真的落盘。
+    check('获批退出后写落盘(exit_test.txt 存在)', existsSync(exitTarget), { exitTarget });
   } catch (e) {
     check('E2E 未抛异常', false, (e as Error).message);
   } finally {

@@ -9,6 +9,7 @@ import { test, expect, describe, beforeAll, afterAll } from 'bun:test';
 import { mkdtempSync, rmSync, existsSync, readFileSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { FORGEAX_CORE_VERSION } from '../src/version';
 
 const MAIN = join(import.meta.dir, '..', 'src', 'cli', 'main.ts');
 
@@ -148,7 +149,7 @@ describe('CLI e2e — real binary against mock Anthropic', () => {
       expect(h.out).toContain('-p, --print');
       const v = await runCli(['--version'], cwd);
       expect(v.code).toBe(0);
-      expect(v.out).toContain('forgeax-core 0.1.0');
+      expect(v.out).toContain(`forgeax-core ${FORGEAX_CORE_VERSION}`);
     } finally {
       rmSync(cwd, { recursive: true, force: true });
     }

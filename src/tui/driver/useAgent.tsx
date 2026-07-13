@@ -41,9 +41,9 @@ import { type Usage, EMPTY_USAGE } from '../../provider/types';
 import { summarizeUsage, contextStats } from '../../context/usage-stats';
 import { inspectMcpServers, type InspectMcpOptions } from '../../capability/mcp/inspect';
 import { getPermissionRules } from '../../permission/inspect';
-import { listSessions, foldSessionById, readSessionEvents, foldSessionHistory } from '../../cli/resume-fold';
+import { listSessions, foldSessionById, readSessionEvents, foldSessionHistory, readSessionRaw } from '../../cli/resume-fold';
 import { foldFromStore } from '../../history/llm-fold-adapter';
-import { walEventsToUiMessages, relinkMsgIds } from '../transcript/rehydrate';
+import { walEventsToUiMessages, relinkMsgIds, checkResumeConsistency } from '../transcript/rehydrate';
 import { inspectAgents } from '../../capability/agent/inspect';
 import { listMemory } from '../../capability/memory/inspect';
 import { listSkills, listPlugins, listHooks } from '../../capability/extensions-inspect';
@@ -52,6 +52,7 @@ import { runDoctor } from '../../cli/doctor';
 import { triggerCompact as runManualCompact } from '../../context/manual-compact';
 import { runInitProject } from '../../cli/init-project';
 import { computeWatermarksFromModel } from '../../context/watermarks';
+import { estimateTokens } from '../../context/deterministic-compact';
 import { lookupModelContext } from '../../context/model-context-table';
 import { makeStdioMcpFactory } from '../../cli/mcp-stdio';
 import { makeEnvTokenProvider } from '../../cli/mcp-token';
@@ -435,7 +436,18 @@ export function createAgentDriver(opts: DriverOptions, initial: HostContext): Ag
       }
       // H-02:新 WAL 的 user 轮已带 msgId;旧 WAL 无 → 用 checkpoints.jsonl 按 ordinal fallback
       //   回填(数量不一致则保守放弃),使历史轮的文件回退在 RewindPanel 里可用(hasCode)。
-      return relinkMsgIds(walEventsToUiMessages(events), checkpoints.list());
+      const uiMsgs = relinkMsgIds(walEventsToUiMessages(events), checkpoints.list());
+      // T1 一致性探针:盘上原始 WAL 的对话记录行数应 == 成功解析出的对话事件数;不一致 =
+      //   有对话行被 loader 静默丢弃(WAL 截断/损坏)→ 重放历史不全 → warn(低成本回归护栏,
+      //   不阻断续接,graceful)。console.warn 走 stderr,由 stderr-guard 缓冲、还屏后 flush,不污染 TUI 帧。
+      const probe = checkResumeConsistency(readSessionRaw(id, opts.sessionsDir), events);
+      if (!probe.ok) {
+        console.warn(
+          `[forgeax-core] resume 一致性探针:会话 ${id} 盘上对话记录行数=${probe.rawCount},` +
+            `成功解析=${probe.parsedCount}(不一致 → WAL 可能被截断/损坏,历史回放不完整)。`,
+        );
+      }
+      return uiMsgs;
     },
 
     listAgents() {
@@ -481,21 +493,76 @@ export function createAgentDriver(opts: DriverOptions, initial: HostContext): Ag
     async triggerCompact(instructions?: string): Promise<{ compacted: boolean; usedLLM: boolean }> {
       // `/compact <侧重指令>` 透传:instructions 经 makeProviderCompactSummarize →
       // getCompactPrompt(scenario, instructions) 追加进压缩 prompt(不再静默丢弃)。
-      const history = convo;
+      //
+      // 04.4(manual 压缩进 WAL):此前只 splice driver 内存态 convo、不发任何事件——
+      // 违反「事件流是真相」(§6.1),/resume 的 fold 会丢这次压缩、回放出未压缩全史。
+      // 现改为:在 **WAL fold 出的正史**(含工具轮,与 resume 同坐标系)上压,并把
+      // PreCompact(manual)/CompactionApplied/PostCompact 发进 host.bus → connectStore
+      // 落 events.jsonl,与 loop 自动压同口径(coveredFrom/coveredTo = 会话消息下标,
+      // foldFromStore 会改写成 byEventId)。fold 不可用(store 缺/读失败)→ 回退旧行为:
+      // 压 convo 但**不写 WAL**——convo 是无工具轮的文本级重建,坐标系不对齐,写了反而毒化 resume。
+      const folded = await safeFold(host.store);
+      const walBacked = !!folded && folded.length > 0;
+      const history = walBacked ? folded : convo;
       if (!history.length) return { compacted: false, usedLLM: false };
+      const busEv = (type: string, payload: unknown): void => {
+        // WAL/hook 是加固,发事件异常绝不阻断压缩本身(与 rewind 的 fail-soft 口径一致)。
+        try {
+          host.bus.publish({ type, payload, ts: Date.now(), source: 'tui-compact' });
+        } catch {
+          /* ignore */
+        }
+      };
       try {
         const marks = computeWatermarksFromModel(lookupModelContext(model));
         const summarize = makeProviderCompactSummarize(host.provider, model, instructions);
+        // PreCompact(manual,可阻断):对齐 loop 的 hook 语义(E-I5)——用户配置的
+        //   PreCompact hook 对 /compact 同样生效。publish 异常 fail-soft(不阻断)。
+        let blocked = false;
+        try {
+          const pre = host.bus.publish({
+            type: CoreEventType.PreCompact,
+            payload: { trigger: 'manual', tokenCount: estimateTokens(history) },
+            ts: Date.now(),
+            source: 'tui-compact',
+          }) as { blocked?: boolean };
+          blocked = pre.blocked === true;
+        } catch {
+          /* ignore */
+        }
+        if (blocked) {
+          busEv(CoreEventType.CompactionSkipped, { reason: 'hook-blocked', trigger: 'manual' });
+          return { compacted: false, usedLLM: false };
+        }
         const res = await runManualCompact({ history, marks, summarize, now: Date.now() });
         const count = res.coveredTo - res.coveredFrom + 1;
         if (count > 0) {
           convo = [...history.slice(0, res.coveredFrom), res.replacement, ...history.slice(res.coveredTo + 1)];
           agent = null; // 下一轮用压缩后历史 reseed
           pendingHistory = convo.slice();
+          if (walBacked) {
+            busEv(CoreEventType.CompactionApplied, {
+              coveredFrom: res.coveredFrom,
+              coveredTo: res.coveredTo,
+              replacement: res.replacement,
+            });
+            busEv(CoreEventType.PostCompact, {
+              coveredFrom: res.coveredFrom,
+              coveredTo: res.coveredTo,
+              usedLLM: res.usedLLM,
+            });
+          }
         }
         return { compacted: count > 0, usedLLM: res.usedLLM };
-      } catch {
-        // 历史不足以压缩(管线 throw "Not enough messages")→ 视作未压缩。
+      } catch (e) {
+        // 历史不足以压缩(管线 throw "Not enough messages")→ 视作未压缩(skipped);
+        // 其它异常(summarize 失败等)→ CompactionFailed。均不冒泡断 /compact 命令。
+        const msg = e instanceof Error ? e.message : String(e);
+        if (/not enough messages/i.test(msg)) {
+          busEv(CoreEventType.CompactionSkipped, { reason: 'nothing-to-compact', trigger: 'manual' });
+        } else {
+          busEv(CoreEventType.CompactionFailed, { error: msg, trigger: 'manual' });
+        }
         return { compacted: false, usedLLM: false };
       }
     },

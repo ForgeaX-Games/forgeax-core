@@ -22,6 +22,7 @@ import type { AgentTool, ToolContext } from '../capability/types';
 import type { PermissionRuleSet } from '../permission/rules';
 import { hasPermissionsToUseTool, safeReadOnly } from '../permission/engine';
 import { MCP_PROTOCOL_VERSION, type MCPTool, type MCPToolResult } from '../capability/mcp/client';
+import { FORGEAX_CORE_VERSION } from '../version';
 
 /** mcp-serve 处理一条请求所需的装配依赖(纯,供测试直接驱动)。 */
 export interface McpServeDeps {
@@ -34,7 +35,7 @@ export interface McpServeDeps {
   allowMutations: boolean;
 }
 
-const SERVER_INFO = { name: 'forgeax-core', version: '0.1.0' } as const;
+const SERVER_INFO = { name: 'forgeax-core', version: FORGEAX_CORE_VERSION } as const;
 
 /** 带 JSON-RPC error code 的错误(runMcpServe 据 `.code` 包 error 帧)。 */
 class RpcError extends Error {

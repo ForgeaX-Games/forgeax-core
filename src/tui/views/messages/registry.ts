@@ -16,6 +16,9 @@ export interface MessageViewProps {
   item: Extract<TranscriptItem, { kind: 'user' } | { kind: 'assistant' } | { kind: 'notice' }>;
   theme: ThemeTokens;
   expanded?: boolean;
+  /** committed 的 user 条目在真 TTY 下带 OSC 133 shell-integration 标记(仅 UserView 消费;
+   *  live 区绝不发 —— 见 Transcript / shell-marks.ts)。默认/false = 不发。 */
+  shellMarks?: boolean;
 }
 export type MessageView = (p: MessageViewProps) => React.ReactNode;
 
