@@ -10,7 +10,7 @@
 import { test, expect, describe } from 'bun:test';
 import type { Key } from '../../src/tui/contracts';
 import { commandMenuReducer } from '../../src/tui/overlays/CommandMenu';
-import { modelPickerReducer, modelList, KNOWN_MODELS } from '../../src/tui/overlays/ModelPicker';
+import { modelPickerReducer, modelList, KNOWN_MODELS, fetchRemoteModels, compareModelId } from '../../src/tui/overlays/ModelPicker';
 import { rewindReducer } from '../../src/tui/overlays/RewindPanel';
 import { resumeReducer, filterSessions, formatRelTime, initialResumeIndex } from '../../src/tui/overlays/ResumePicker';
 import type { SessionSummary } from '../../src/tui/contracts';
@@ -71,6 +71,105 @@ describe('ModelPicker.modelList', () => {
     const out = modelList('my-custom-model');
     expect(out[0]).toBe('my-custom-model');
     expect(out).toContain(KNOWN_MODELS[0]);
+  });
+  test('remote list wins over KNOWN_MODELS', () => {
+    const out = modelList('r-b', ['r-a', 'r-b']);
+    expect(out).toEqual(['r-a', 'r-b']);
+  });
+  test('current not in remote → prepended to remote', () => {
+    expect(modelList('mine', ['r-a'])).toEqual(['mine', 'r-a']);
+  });
+  test('empty remote → fallback to KNOWN_MODELS', () => {
+    expect(modelList(KNOWN_MODELS[0]!, [])).toEqual(KNOWN_MODELS);
+  });
+});
+
+describe('ModelPicker.compareModelId', () => {
+  test('名字字母升序 + 版本号降序', () => {
+    const ids = [
+      'gpt-5',
+      'claude-opus-4-6',
+      'gemini-2.5-pro',
+      'claude-sonnet-4-6',
+      'claude-opus-4-8',
+      'codex-5.3',
+      'claude-opus-4-7',
+      'gemini-3.1-flash',
+    ];
+    expect([...ids].sort(compareModelId)).toEqual([
+      'claude-opus-4-8',
+      'claude-opus-4-7',
+      'claude-opus-4-6',
+      'claude-sonnet-4-6',
+      'codex-5.3',
+      'gemini-3.1-flash',
+      'gemini-2.5-pro',
+      'gpt-5',
+    ]);
+  });
+  test('小数点版本按数值比(5.10 > 5.3;5.1 > 5;3.5 > 3)', () => {
+    expect(['codex-5.3', 'codex-5.10'].sort(compareModelId)).toEqual(['codex-5.10', 'codex-5.3']);
+    expect(['glm-5', 'glm-5.1'].sort(compareModelId)).toEqual(['glm-5.1', 'glm-5']);
+    expect(['gemini-3-pro-image', 'gemini-3.5-flash'].sort(compareModelId)).toEqual([
+      'gemini-3.5-flash',
+      'gemini-3-pro-image',
+    ]);
+  });
+  test('全等前缀 → 基础名在前(短的在前)', () => {
+    expect(['claude-sonnet-4-6-20260320', 'claude-sonnet-4-6'].sort(compareModelId)).toEqual([
+      'claude-sonnet-4-6',
+      'claude-sonnet-4-6-20260320',
+    ]);
+  });
+});
+
+describe('ModelPicker.fetchRemoteModels', () => {
+  const env = { ANTHROPIC_API_KEY: 'sk-test', ANTHROPIC_BASE_URL: 'https://proxy.example.com' };
+  const okFetch = (payload: unknown): typeof fetch =>
+    (async () => new Response(JSON.stringify(payload), { status: 200 })) as unknown as typeof fetch;
+
+  test('hits {base}/v1/models with Bearer + x-api-key, parses data[].id', async () => {
+    let seenUrl = '';
+    let seenHeaders: Record<string, string> = {};
+    const fetchFn = (async (url: unknown, init?: RequestInit) => {
+      seenUrl = String(url);
+      seenHeaders = (init?.headers ?? {}) as Record<string, string>;
+      return new Response(JSON.stringify({ data: [{ id: 'm-1' }, { id: 'm-2' }, { id: 'm-1' }] }), { status: 200 });
+    }) as unknown as typeof fetch;
+    const out = await fetchRemoteModels({ env, fetchFn });
+    expect(seenUrl).toBe('https://proxy.example.com/v1/models');
+    expect(seenHeaders.Authorization).toBe('Bearer sk-test');
+    expect(seenHeaders['x-api-key']).toBe('sk-test');
+    expect(out).toEqual(['m-2', 'm-1']); // 去重 + 版本号降序
+  });
+
+  test('base already ends with /v1 → no double /v1', async () => {
+    let seenUrl = '';
+    const fetchFn = (async (url: unknown) => {
+      seenUrl = String(url);
+      return new Response(JSON.stringify({ data: [] }), { status: 200 });
+    }) as unknown as typeof fetch;
+    await fetchRemoteModels({ env: { ...env, ANTHROPIC_BASE_URL: 'https://proxy.example.com/v1/' }, fetchFn });
+    expect(seenUrl).toBe('https://proxy.example.com/v1/models');
+  });
+
+  test('missing key/base → [] without fetching', async () => {
+    const boom = (async () => {
+      throw new Error('should not fetch');
+    }) as unknown as typeof fetch;
+    expect(await fetchRemoteModels({ env: {}, fetchFn: boom })).toEqual([]);
+    expect(await fetchRemoteModels({ env: { ANTHROPIC_API_KEY: 'k' }, fetchFn: boom })).toEqual([]);
+  });
+
+  test('non-2xx / network error / malformed body → [] (never throws)', async () => {
+    const err401 = (async () => new Response('{"error":"nope"}', { status: 401 })) as unknown as typeof fetch;
+    expect(await fetchRemoteModels({ env, fetchFn: err401 })).toEqual([]);
+    const netErr = (async () => {
+      throw new Error('ECONNREFUSED');
+    }) as unknown as typeof fetch;
+    expect(await fetchRemoteModels({ env, fetchFn: netErr })).toEqual([]);
+    expect(await fetchRemoteModels({ env, fetchFn: okFetch({ nope: 1 }) })).toEqual([]);
+    expect(await fetchRemoteModels({ env, fetchFn: okFetch({ data: [{ id: 42 }, {}] }) })).toEqual([]);
   });
 });
 

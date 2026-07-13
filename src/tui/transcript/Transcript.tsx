@@ -21,10 +21,11 @@
  *
  * Boundary(HOST 层):react + ink + 相对 import。
  */
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Box, Static } from 'ink';
 import type { TranscriptItem, SessionEntry } from './items';
 import { reduceTranscript, safeFlushBoundary } from './reduce';
+import { tailStartIndex } from './redraw-window';
 import { useTheme } from '../providers/theme';
 import type { ThemeTokens } from '../contracts';
 import { resolveToolByMeta } from '../views/tools/registry';
@@ -32,6 +33,7 @@ import { resolveMessageByItem, type MessageViewProps } from '../views/messages/r
 import { ThinkingView, thinkingText } from '../views/messages/Thinking';
 import { LiveThinking } from '../components/LiveThinking';
 import { useResizeRedraw } from '../use-resize-redraw';
+import { termWidth } from '../text-width';
 
 /** driver.toolMeta 的最小形状(查工具卡只需 canonical;别名在此被吃掉)。 */
 type ToolMetaFn = (name: string) => { canonical: string; displayName: string };
@@ -109,11 +111,31 @@ export function Transcript(props: TranscriptProps): React.ReactElement {
     [log, flushed],
   );
 
+  // ── resize 重灌窗口:resize(staticKey 变)触发的 <Static> 重挂载只回放末尾 ~3 屏
+  //   (redraw-window.ts;重灌 O(屏幕) 而非 O(会话),根治长会话切 tab 时的滚动风暴 +
+  //   视口不落底)。/resume(redrawNonce 变)保持全量回放——恢复完整历史是它的语义。
+  //   窗口起点只在重挂载瞬间重算并冻结:<Static> 内部按「已渲染条数」记账,窗口若在
+  //   两次 remount 之间漂移,记账错位会导致条目漏发/复灌。
+  const windowRef = useRef({ staticKey, redrawNonce, tailStart: 0 });
+  if (windowRef.current.staticKey !== staticKey || windowRef.current.redrawNonce !== redrawNonce) {
+    const resumeReplaced = windowRef.current.redrawNonce !== redrawNonce;
+    windowRef.current = {
+      staticKey,
+      redrawNonce,
+      tailStart: resumeReplaced
+        ? 0
+        : tailStartIndex(committed, termWidth(), process.stdout.rows ?? 24),
+    };
+  }
+  const staticItems =
+    windowRef.current.tailStart > 0 ? committed.slice(windowRef.current.tailStart) : committed;
+
   return (
     <Box flexDirection="column">
-      {/* committed:Ink <Static> 只渲染新增条目;key=staticKey 让 resize 时整体重挂载重画。
+      {/* committed:Ink <Static> 只渲染新增条目;key=staticRenderKey 让 resize / /resume 时
+          整体重挂载重画(resize 只回放尾部窗口,见上方 windowRef)。
           每块上方留一行(marginTop=1)给透气感。 */}
-      <Static key={staticRenderKey} items={committed}>
+      <Static key={staticRenderKey} items={staticItems}>
         {(item) => (
           <Box key={item.id} flexDirection="column" marginTop={1}>
             {renderItem(item, theme, toolMeta, expanded)}

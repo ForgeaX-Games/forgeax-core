@@ -58,7 +58,7 @@ import { Transcript } from '../transcript/Transcript';
 import { useStreamingText, extractStreamTextDelta, extractStreamThinkingDelta, streamingEnabled } from '../transcript/useStreamingText';
 import { PromptInput } from '../input/PromptInput';
 import { CommandMenu, filterCommands } from '../overlays/CommandMenu';
-import { ModelPicker, modelList } from '../overlays/ModelPicker';
+import { ModelPicker, modelList, fetchRemoteModels } from '../overlays/ModelPicker';
 import { ResumePicker, filterSessions, initialResumeIndex } from '../overlays/ResumePicker';
 import { RewindPanel, type Checkpoint, type RewindStage, type RewindAction } from '../overlays/RewindPanel';
 import type { DiffStats, PendingRewindView } from '../contracts';
@@ -141,6 +141,8 @@ export function Repl(): React.ReactElement {
   const [rewindPick, setRewindPick] = useState<{ cp: Checkpoint; diff: DiffStats | null } | null>(null);
   const [pendingView, setPendingView] = useState<PendingRewindView | null>(null);
   const [showModelPicker, setShowModelPicker] = useState(false);
+  // 远端模型表(/v1/models):null=未拉过;[]=拉过但失败/空(modelList 退 KNOWN_MODELS 兜底)。
+  const [remoteModels, setRemoteModels] = useState<string[] | null>(null);
   const [showResumePicker, setShowResumePicker] = useState(false);
   const [showRemoteControl, setShowRemoteControl] = useState(false);
   const [sessions, setSessions] = useState<SessionSummary[]>([]); // /resume 打开时快照
@@ -196,7 +198,23 @@ export function Repl(): React.ReactElement {
     () => (showCommandMenu ? filterCommands(prompt.value.slice(1)) : []),
     [showCommandMenu, prompt.value],
   );
-  const models = useMemo(() => modelList(agent.model), [agent.model]);
+  // 远端表未返回前列表为空(浮层只显 loading,不闪默认表);返回后失败/空才退 KNOWN_MODELS 兜底。
+  const modelsLoading = remoteModels === null;
+  const models = useMemo(
+    () => (remoteModels === null ? [] : modelList(agent.model, remoteModels)),
+    [agent.model, remoteModels],
+  );
+  // 首次打开 /model 时懒拉远端模型表(key/base 取 env;失败落 [] 不重试,退静态兜底)。
+  useEffect(() => {
+    if (!showModelPicker || remoteModels !== null) return;
+    let alive = true;
+    void fetchRemoteModels().then((ids) => {
+      if (alive) setRemoteModels(ids);
+    });
+    return () => {
+      alive = false;
+    };
+  }, [showModelPicker, remoteModels]);
   const checkpoints = useMemo(() => {
     const codeMsgIds = new Set(agent.listCheckpoints().filter((e) => e.hasCode).map((e) => e.msgId));
     return buildCheckpoints(session.messages, codeMsgIds);
@@ -249,7 +267,7 @@ export function Repl(): React.ReactElement {
     }
     setOverlayIndex(0);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mode, menuCommands.length, filteredSessions.length, q?.id, q?.cursor]);
+  }, [mode, menuCommands.length, models.length, filteredSessions.length, q?.id, q?.cursor]);
 
   // 某账号「新近转 online」时:① 往 transcript 推一条「已连接」提示(否则扫码后直接回输入框,
   //   用户不知是否连上);② 自动收起远端控制面板,焦点交回聊天界面。
@@ -1000,7 +1018,7 @@ export function Repl(): React.ReactElement {
       ) : null}
 
       {/* 模型选择页(/model 无参拉起)。 */}
-      {showModelPicker ? <ModelPicker models={models} current={agent.model} index={overlayIndex} /> : null}
+      {showModelPicker ? <ModelPicker models={models} current={agent.model} index={overlayIndex} loading={modelsLoading} /> : null}
 
       {/* 远端控制面板(/remote-control 无参拉起):扫码连接微信 + 已连接状态。 */}
       {showRemoteControl ? <RemoteControl accounts={remote.accounts} index={safeOverlayIndex} /> : null}
