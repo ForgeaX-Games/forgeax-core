@@ -14,6 +14,8 @@
  * Boundary(HOST 层):可 import 机制层 `../permission/rules` + 同层 `./settings`。
  */
 import { parseRuleString, type PermissionRule, type PermissionRuleSet } from '../permission/rules';
+import { coercePermissionMode } from '../permission/inspect';
+import type { PermissionMode } from '../permission/engine';
 import { getMergedSettings } from './settings';
 
 /** 三个规则桶(即 behavior);顺序即 engine 读取顺序,仅用于遍历。 */
@@ -47,4 +49,32 @@ export function rulesFromPermissionsSetting(perms: unknown): PermissionRuleSet {
  */
 export function loadPermissionRulesFromSettings(cwd: string = process.cwd()): PermissionRuleSet {
   return rulesFromPermissionsSetting(getMergedSettings(cwd).permissions);
+}
+
+// ── settings.permissions.defaultMode(同名同语义:启动初始权限模式)──
+
+/** defaultMode 解析结果的三态:未配置(安静回退 default)/ 合法 / 配置了但非法
+ *  (由 CLI 启动 boundary 决定是否警告后回退;本模块不打印)。 */
+export type DefaultPermissionModeSetting =
+  | { kind: 'unset' }
+  | { kind: 'valid'; mode: PermissionMode }
+  | { kind: 'invalid'; value: unknown };
+
+/**
+ * 解析 settings 的 `permissions.defaultMode`(未知形状 → 结构化三态)。纯函数,永不抛。
+ * 校验复用 `coercePermissionMode`(与 /permissions、--permission-mode 同一份合法值真相)。
+ */
+export function parseDefaultModeFromPermissionsSetting(perms: unknown): DefaultPermissionModeSetting {
+  if (!perms || typeof perms !== 'object' || Array.isArray(perms)) return { kind: 'unset' };
+  const obj = perms as Record<string, unknown>;
+  if (!('defaultMode' in obj)) return { kind: 'unset' };
+  const mode = coercePermissionMode(obj.defaultMode);
+  return mode ? { kind: 'valid', mode } : { kind: 'invalid', value: obj.defaultMode };
+}
+
+/** 从分层合并的 settings 读出 defaultMode(user<project<local,与规则桶同口径)。 */
+export function loadDefaultPermissionModeFromSettings(
+  cwd: string = process.cwd(),
+): DefaultPermissionModeSetting {
+  return parseDefaultModeFromPermissionsSetting(getMergedSettings(cwd).permissions);
 }

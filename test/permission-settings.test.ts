@@ -11,7 +11,10 @@ import { join } from 'node:path';
 import {
   rulesFromPermissionsSetting,
   loadPermissionRulesFromSettings,
+  parseDefaultModeFromPermissionsSetting,
+  loadDefaultPermissionModeFromSettings,
 } from '../src/cli/permission-settings';
+import { PERMISSION_MODES } from '../src/permission/inspect';
 import { resetSettingsCache } from '../src/cli/settings';
 import { hasPermissionsToUseTool } from '../src/permission/engine';
 import { buildTool, type ToolContext, type PermissionResult } from '../src/capability/types';
@@ -101,6 +104,48 @@ describe('loadPermissionRulesFromSettings — 分层落盘', () => {
     const ws = mkdtempSync(join(tmpdir(), 'fx-046-empty-'));
     resetSettingsCache();
     expect(loadPermissionRulesFromSettings(ws)).toEqual({ deny: [], ask: [], allow: [] });
+  });
+});
+
+describe('permissions.defaultMode — 三态解析', () => {
+  test('未配置(无 permissions / 无 defaultMode 键 / 非对象)→ unset', () => {
+    expect(parseDefaultModeFromPermissionsSetting(undefined)).toEqual({ kind: 'unset' });
+    expect(parseDefaultModeFromPermissionsSetting(null)).toEqual({ kind: 'unset' });
+    expect(parseDefaultModeFromPermissionsSetting('plan')).toEqual({ kind: 'unset' });
+    expect(parseDefaultModeFromPermissionsSetting(['plan'])).toEqual({ kind: 'unset' });
+    expect(parseDefaultModeFromPermissionsSetting({ deny: ['Write'] })).toEqual({ kind: 'unset' });
+  });
+
+  test('全部合法模式 → valid', () => {
+    for (const m of PERMISSION_MODES) {
+      expect(parseDefaultModeFromPermissionsSetting({ defaultMode: m })).toEqual({ kind: 'valid', mode: m });
+    }
+  });
+
+  test('配置了但非法(大小写错 / 未知串 / null / 数字)→ invalid,原值透出', () => {
+    for (const bad of ['DEFAULT', 'bogus', '', null, 42]) {
+      expect(parseDefaultModeFromPermissionsSetting({ defaultMode: bad })).toEqual({ kind: 'invalid', value: bad });
+    }
+  });
+
+  test('分层落盘:local 的 defaultMode 覆盖 project(标量覆盖语义)', () => {
+    const ws = tmpWorkspace(
+      { permissions: { defaultMode: 'plan' } },
+      { permissions: { defaultMode: 'acceptEdits' } },
+    );
+    expect(loadDefaultPermissionModeFromSettings(ws)).toEqual({ kind: 'valid', mode: 'acceptEdits' });
+  });
+
+  test('defaultMode 与规则桶互不影响(同一 permissions 段)', () => {
+    const ws = tmpWorkspace({ permissions: { defaultMode: 'plan', deny: ['Bash(rm -rf *)'] } });
+    expect(loadDefaultPermissionModeFromSettings(ws)).toEqual({ kind: 'valid', mode: 'plan' });
+    expect(loadPermissionRulesFromSettings(ws).deny.map((r) => r.content)).toEqual(['rm -rf *']);
+  });
+
+  test('无 settings 文件 → unset(不抛)', () => {
+    const ws = mkdtempSync(join(tmpdir(), 'fx-defaultmode-empty-'));
+    resetSettingsCache();
+    expect(loadDefaultPermissionModeFromSettings(ws)).toEqual({ kind: 'unset' });
   });
 });
 

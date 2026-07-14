@@ -66,6 +66,7 @@ class NodeFsSandbox implements SandboxFs {
   readdirSync(): string[] | DirEnt[] {
     return [];
   }
+  async *readDir(): AsyncIterable<DirEnt> {}
   async readText(p: string): Promise<string> {
     return readFileSync(p, 'utf8');
   }

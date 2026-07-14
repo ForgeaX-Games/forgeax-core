@@ -146,6 +146,7 @@ function parseEventStreamHeaders(buf: Uint8Array): Record<string, string> {
  */
 export async function* decodeBedrockEventStream(
   body: ReadableStream<Uint8Array>,
+  signal?: AbortSignal,
 ): AsyncGenerator<{ event?: string; data: string }> {
   const reader = body.getReader();
   const idleMs = providerStreamIdleMs(); // 空闲看门狗:Bedrock 二进制流与 SSE 系共用同一阈值/实现
@@ -159,7 +160,7 @@ export async function* decodeBedrockEventStream(
   };
   try {
     while (true) {
-      const { done, value } = idleMs > 0 ? await readWithIdleTimeout(reader, idleMs) : await reader.read();
+      const { done, value } = await readWithIdleTimeout(reader, idleMs, signal);
       if (value) buf = append(buf, value);
       while (buf.byteLength >= 12) {
         const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
@@ -238,7 +239,7 @@ export const createBedrockProvider: ProviderFactory = (opts: ProviderFactoryOpts
         const text = res.body ? await res.text() : '';
         throw new Error(`bedrock-anthropic ${res.status}: ${text.slice(0, 500)}`);
       }
-      yield* normalizeAnthropicStream(decodeBedrockEventStream(res.body), { signal: callOpts.signal });
+      yield* normalizeAnthropicStream(decodeBedrockEventStream(res.body, callOpts.signal), { signal: callOpts.signal });
     },
   };
 };

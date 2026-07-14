@@ -98,6 +98,9 @@ function fakeFs(seed: Record<string, FakeFile> = {}): SandboxFs & { dump(): Reco
       }
       return [...children.keys()];
     },
+    async *readDir(path) {
+      for (const ent of ctx.readdirSync(path, { withFileTypes: true }) as DirEnt[]) yield ent;
+    },
     async readText(path) {
       return ctx.readTextSync(path);
     },

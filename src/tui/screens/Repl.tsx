@@ -68,16 +68,31 @@ import { Question } from '../overlays/Question';
 import { RemoteControl, remoteControlLength } from '../overlays/RemoteControl';
 import { useRemote } from '../providers/remote';
 import { appendAssistantText } from '../remote/reply';
+import {
+  formatPermissionPrompt,
+  formatQuestionPrompt,
+  parseApprovalReply,
+  shortApprovalId,
+  chunkReply,
+  decisionLabel,
+} from '../remote/approval';
 import type { RemoteOrigin, RemoteInboundMsg } from '../remote/controller';
 import { StatusLine } from '../components/StatusLine';
 import { ThinkingIndicator } from '../components/ThinkingIndicator';
 import { Queue } from '../components/Queue';
 import { Banner } from '../components/Banner';
+import { PermissionModeIndicator } from '../components/PermissionModeIndicator';
+import { nextPermissionMode } from '../../permission/inspect';
+import type { PermissionMode } from '../../permission/engine';
+import { guardBypassMode } from '../../cli/escalation-guard';
 import { FORGEAX_CORE_VERSION } from '../../version';
 import { renderTaskNotification } from '../../cli/task-notification';
 
-/** 一条待跑的轮:本地输入(origin 省略)或远端来源(带回复定址)。msgId=回退锚点(H-02)。 */
-type QueuedTurn = { prompt: string; origin?: RemoteOrigin; images?: ImageAttachment[]; msgId?: string };
+/** 一条待跑的轮:本地输入(origin 省略)或远端来源(带回复定址)。
+ *  display=transcript 展示文本(折叠占位/微信标注/斜杠命令原文),prompt=喂模型的展开文本。
+ *  ⚠️ user 条目与回退锚点(msgId)**不在入队时定格**——统一延迟到队列消费(轮到它跑)时,
+ *  否则条目插在上一轮回复之前,transcript 的 user↔assistant 配对错乱。 */
+type QueuedTurn = { prompt: string; display: string; origin?: RemoteOrigin; images?: ImageAttachment[]; pastes?: string[] };
 
 // ─── UiMessage[] → SessionEntry[](梁② reduce 的输入,无损映射)─────────────────
 function toSessionLog(msgs: UiMessage[]): SessionEntry[] {
@@ -164,6 +179,18 @@ export function Repl(): React.ReactElement {
   const [expanded, setExpanded] = useState(false);
   const [redrawNonce, setRedrawNonce] = useState(0); // /resume 整体替换 transcript 时自增 → 强制 <Static> 重绘
 
+  // ── 权限模式展示态(indicator 渲染用;执行语义真相在 driver/CoreAgent)──
+  //   所有 TUI 主动切换(shift+tab / /permissions / /plan)统一走 applyPermissionMode;
+  //   每轮收尾再从 driver 对齐一次,吸收 ExitPlanMode 在轮内的自动恢复。
+  const [permissionMode, setPermissionModeState] = useState<PermissionMode>(() => agent.getMode());
+  const applyPermissionMode = useCallback(
+    (m: PermissionMode) => {
+      agent.setMode(m);
+      setPermissionModeState(agent.getMode());
+    },
+    [agent],
+  );
+
   // ── 队列 / 取消 / esc 计时 ──
   const [queued, setQueued] = useState<QueuedTurn[]>([]);
   const busyRef = useRef(false);
@@ -175,6 +202,8 @@ export function Repl(): React.ReactElement {
   const escArmedRef = useRef(false);
   const escTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const interruptedRef = useRef(false);
+  // ESC 命中后立刻给可见回执;不能等 provider/driver 完成 abort 后的 done 事件才反馈。
+  const [interruptRequested, setInterruptRequested] = useState(false);
   // ── 粘贴图片:待提交的图片附件 + 在飞的异步读取(submit 前须 await,防「粘图后立刻回车」丢图)。
   const pendingImagesRef = useRef<ImageAttachment[]>([]);
   const pendingReadsRef = useRef<Promise<void>[]>([]);
@@ -314,9 +343,44 @@ export function Repl(): React.ReactElement {
   }, [stdout]);
 
   // ── 跑一轮:把 AgentEvent reduce 进 session(有序日志)+ 更新状态栏 ──
+  // 远端确认转发的定址真相:
+  //   activeOriginRef = 在飞轮的远端来源(本地轮为 null);lastOriginRef = 最近一个远端
+  //   入站对端。确认(权限/提问)转发目标 = activeOrigin ?? lastOrigin —— 远端轮的确认
+  //   必达其来源;本地轮的确认广播给最近远端对端(/remote-control 开启后远端全程可答)。
+  const activeOriginRef = useRef<RemoteOrigin | null>(null);
+  const lastOriginRef = useRef<RemoteOrigin | null>(null);
+
+  // 远端出站(唯一闸门):分条(chunkReply)+ 每条重试 1 次;仍失败 → transcript 显性提示
+  //   (loud degrade,不再静默吞——「回复没到微信」必须可感知)。
+  const sendRemote = useCallback(
+    async (origin: RemoteOrigin, text: string): Promise<void> => {
+      for (const chunk of chunkReply(text)) {
+        let lastErr: unknown = null;
+        for (let attempt = 0; attempt < 2; attempt++) {
+          try {
+            await remote.controller.send(origin, chunk);
+            lastErr = null;
+            break;
+          } catch (err) {
+            lastErr = err;
+            await new Promise((r) => setTimeout(r, 800));
+          }
+        }
+        if (lastErr) {
+          session.push(
+            noticeMsg(`⚠️ 回发远端失败(${origin.peer.name}):${String((lastErr as Error)?.message ?? lastErr)}`),
+          );
+          return; // 同批后续 chunk 大概率同样失败,不重复刷屏
+        }
+      }
+    },
+    [remote, session],
+  );
+
   const runTurn = useCallback(
     async (text: string, origin?: RemoteOrigin, images?: ImageAttachment[], msgId?: string) => {
       busyRef.current = true;
+      activeOriginRef.current = origin ?? null; // 本轮确认转发的定址依据
       status.set({ busy: true, model: agent.model }); // 墙钟耗时由 StatusLineProvider 据 busy 自走(SSOT)
       tokenTickRef.current = 0;
       streamReset(); // 新一轮:清掉上一轮可能残留的在写文本
@@ -365,12 +429,15 @@ export function Repl(): React.ReactElement {
         }, images, msgId);
       } finally {
         busyRef.current = false;
+        activeOriginRef.current = null;
         status.set({ busy: false, tokens: agent.getContextTokens() }); // elapsedMs 由 provider 在 busy 收尾时定格
-        // 远端中转出站:把回复发回来源对端(best-effort,失败不抛断本地)。
-        if (origin && replyAcc.trim()) void remote.controller.send(origin, replyAcc);
+        // 权限模式对齐:ExitPlanMode 在轮内经人类闸恢复模式时只改 core/driver,展示态在此跟上。
+        setPermissionModeState(agent.getMode());
+        // 远端中转出站:把回复发回来源对端(分条 + 重试 + 失败显性提示,见 sendRemote)。
+        if (origin && replyAcc.trim()) void sendRemote(origin, replyAcc);
       }
     },
-    [agent, session, status, remote, streamFeed, streamFinalize, streamReset, thinkFeed, thinkFinalize, thinkReset, streamOn],
+    [agent, session, status, sendRemote, streamFeed, streamFinalize, streamReset, thinkFeed, thinkFinalize, thinkReset, streamOn],
   );
 
   // ── transcript 整体替换/截短的唯一闸门(SSOT)──
@@ -453,8 +520,8 @@ export function Repl(): React.ReactElement {
       listMcp: () => agent.listMcp(),
       getPermissionRules: () => agent.getPermissionRules(),
       setPermissionMode: (m) => {
-        agent.setMode(m);
-        status.set({ model: agent.model });
+        // 统一切换口:driver + 展示态一起更新(shift+tab / /permissions / /plan 同源)。
+        applyPermissionMode(m);
       },
       listSessions: () => agent.listSessions(),
       resume: (id) => agent.resume(id),
@@ -469,7 +536,7 @@ export function Repl(): React.ReactElement {
       triggerCompact: (instr) => agent.triggerCompact(instr),
       runInit: (force) => agent.runInit(force),
     }),
-    [session, exit, agent, status, doResume, replaceTranscript],
+    [session, exit, agent, status, doResume, replaceTranscript, applyPermissionMode],
   );
 
   // ── 提交:slash 命令分发 / 普通消息入轮或排队 ──
@@ -520,13 +587,14 @@ export function Repl(): React.ReactElement {
         if (cmd.source === 'file' && cmd.expand) {
           setPendingView(null);
           wakeChainRef.current = 0; // T4.5:用户输入重置自动唤醒链深
-          const msgId = agent.checkpointTurn() ?? undefined;
-          session.push({ kind: 'user', text, msgId });
           const expanded = cmd.expand(arg);
+          // busy → 整轮入队;user 条目/锚点延迟到消费时落(见队列消费 effect)。
           if (busyRef.current) {
-            setQueued((q) => [...q, { prompt: expanded, msgId }]);
+            setQueued((q) => [...q, { prompt: expanded, display: text }]);
             return;
           }
+          const msgId = agent.checkpointTurn() ?? undefined;
+          session.push({ kind: 'user', text, msgId });
           await runTurn(expanded, undefined, undefined, msgId);
           return;
         }
@@ -547,20 +615,21 @@ export function Repl(): React.ReactElement {
       pendingPastesRef.current = [];
       const modelText = expandPastes(text, pastes);
 
-      // 新用户消息到达 → 定格上一个挂起的回退点(此后不可 Redo),并对 cwd 拍快照作本轮锚点。
-      //   ⚠️ busy 排队路径下,快照时刻早于该消息真正入轮,锚点轻微偏早(可接受,见 plan 非目标)。
-      agent.finalizeRewind();
       setPendingView(null);
       wakeChainRef.current = 0; // T4.5:用户输入重置自动唤醒链深
-      const msgId = agent.checkpointTurn() ?? undefined;
       history.add(text);
-      session.push({ kind: 'user', text, msgId, images, pastes });
 
       // turn 进行中 → 排队(turn 结束后顺序发)。本地输入 origin 省略。喂模型用展开文本。
+      //   user 条目/回退锚点不在此定格——延迟到队列消费时,否则条目插在上一轮回复之前。
       if (busyRef.current) {
-        setQueued((q) => [...q, { prompt: modelText, images, msgId }]);
+        setQueued((q) => [...q, { prompt: modelText, display: text, images, pastes }]);
         return;
       }
+
+      // 新用户消息入轮 → 定格上一个挂起的回退点(此后不可 Redo),并对 cwd 拍快照作本轮锚点。
+      agent.finalizeRewind();
+      const msgId = agent.checkpointTurn() ?? undefined;
+      session.push({ kind: 'user', text, msgId, images, pastes });
       await runTurn(modelText, undefined, images, msgId);
     },
     [history, session, ctx, runTurn, agent],
@@ -628,23 +697,55 @@ export function Repl(): React.ReactElement {
 
   // ── 远端入站中转:微信消息 → 本地 transcript 标注 + 入轮/排队(带回复定址 origin)。
   //   sink 由 controller 持有(单一);用 ref 让它始终调到最新逻辑,避免 stale 闭包。
+  //   确认优先:先把文本按确认回复(y p1 / q1 2)解析,命中在挂确认 → 灌回与本地浮层
+  //   同一条 resolve 路径(decide/answer,先决者胜),**不**作为聊天轮喂模型。
   const relayInbound = useCallback(
     (m: RemoteInboundMsg) => {
       const origin: RemoteOrigin = { remoteId: m.remoteId, peer: m.peer };
-      const display = `[微信:${m.peer.name}] ${m.text}`;
-      agent.finalizeRewind();
-      setPendingView(null);
-      wakeChainRef.current = 0; // T4.5:远端用户输入同样重置自动唤醒链深
-      const msgId = agent.checkpointTurn() ?? undefined;
-      session.push({ kind: 'user', text: display, msgId });
-      // turn 在飞 → 排队(带 origin);否则即跑。跑的是原文 m.text,显示用标注 display。
-      if (busyRef.current) {
-        setQueued((q) => [...q, { prompt: m.text, origin, msgId }]);
+      lastOriginRef.current = origin; // 最近远端对端 = 本地轮确认的转发目标
+      // ① 确认回复路径(权限/提问)。
+      const reply = parseApprovalReply(m.text);
+      if (reply) {
+        if (reply.kind === 'permission') {
+          const pp = permissions.pending[0];
+          if (pp && shortApprovalId(pp.id) === reply.shortId) {
+            session.push(noticeMsg(`📱 远端(${m.peer.name})决策:${decisionLabel(reply.decision)} ${pp.use.name}`));
+            if (reply.decision === 'allow-always') agent.allowAlways(pp.use.name);
+            permissions.decide(pp.id, reply.decision !== 'deny');
+            void sendRemote(origin, `✅ 已${decisionLabel(reply.decision)}:${pp.use.name}`);
+          } else {
+            // 迟到/失配:本地已决或 id 不符 → 回执告知,绝不落入聊天轮。
+            void sendRemote(origin, `⚠️ 确认 ${reply.shortId} 已失效(可能已在本机处理)`);
+          }
+          return;
+        }
+        // question
+        const qq = questions.pending[0];
+        if (qq && shortApprovalId(qq.id) === reply.shortId) {
+          const nums = (reply.optionNums ?? []).map((n) => n - 1); // 1-based → 0-based
+          session.push(noticeMsg(`📱 远端(${m.peer.name})回答了提问 ${reply.shortId}`));
+          questions.answer(qq.id, { options: nums, other: reply.otherText });
+          void sendRemote(origin, `✅ 已记录回答(${reply.shortId})`);
+        } else {
+          void sendRemote(origin, `⚠️ 提问 ${reply.shortId} 已失效(可能已在本机回答)`);
+        }
         return;
       }
+      // ② 普通聊天轮。
+      const display = `[微信:${m.peer.name}] ${m.text}`;
+      setPendingView(null);
+      wakeChainRef.current = 0; // T4.5:远端用户输入同样重置自动唤醒链深
+      // turn 在飞 → 排队(带 origin;user 条目/锚点延迟到消费时落)。跑原文 m.text,显示用标注 display。
+      if (busyRef.current) {
+        setQueued((q) => [...q, { prompt: m.text, display, origin }]);
+        return;
+      }
+      agent.finalizeRewind();
+      const msgId = agent.checkpointTurn() ?? undefined;
+      session.push({ kind: 'user', text: display, msgId });
       void runTurn(m.text, origin, undefined, msgId);
     },
-    [agent, session, runTurn],
+    [agent, session, runTurn, permissions, questions, sendRemote],
   );
   const relayRef = useRef(relayInbound);
   relayRef.current = relayInbound;
@@ -653,14 +754,52 @@ export function Repl(): React.ReactElement {
     return () => remote.controller.setInbound(() => {});
   }, [remote.controller]);
 
-  // ── 队列消费:turn 空闲且队列非空 → 取队首跑(连同其 origin)。 ──
+  // ── 确认转发出站:pending 权限 / 提问(含逐题推进)→ 发到远端对端。
+  //   去重键:权限 = pending id;提问 = id:cursor(推进一题发下一题)。转发目标 =
+  //   在飞轮的远端来源 ?? 最近远端对端;两者皆无(纯本地、从未有远端入站)→ 不发。
+  //   与本地浮层并行竞争同一 resolve(先决者胜):本地键盘决策后 pending 出队,远端
+  //   迟到回复走上面「已失效」回执。 ──
+  const forwardedApprovalsRef = useRef(new Set<string>());
+  useEffect(() => {
+    // 确认全清空 → 清 dedup 集(id 单调递增不复用,清空安全且防长会话无界增长)。
+    if (!pending && !q) {
+      forwardedApprovalsRef.current.clear();
+      return;
+    }
+    const target = activeOriginRef.current ?? lastOriginRef.current;
+    if (!target) return;
+    const onlineIds = new Set(remote.accounts.filter((a) => a.status === 'online').map((a) => a.id));
+    if (!onlineIds.has(target.remoteId)) return;
+    if (pending) {
+      const key = `perm:${pending.id}`;
+      if (!forwardedApprovalsRef.current.has(key)) {
+        forwardedApprovalsRef.current.add(key);
+        const { canonical } = agent.toolMeta(pending.use.name);
+        void sendRemote(target, formatPermissionPrompt(pending, canonical));
+      }
+    }
+    if (q) {
+      const key = `q:${q.id}:${q.cursor}`;
+      if (!forwardedApprovalsRef.current.has(key)) {
+        forwardedApprovalsRef.current.add(key);
+        void sendRemote(target, formatQuestionPrompt(q));
+      }
+    }
+  }, [pending, q, remote.accounts, agent, sendRemote]);
+
+  // ── 队列消费:turn 空闲且队列非空 → 取队首跑(连同其 origin)。
+  //   user 条目 + 回退锚点在**此刻**落(而非入队时)——保证 transcript 逐轮 user→回复 配对,
+  //   且 cwd 快照锚在该轮真正开跑的时点(入队时定格会插在上一轮回复之前)。 ──
   useEffect(() => {
     if (busyRef.current || status.busy) return;
     if (queued.length === 0) return;
     const [next, ...rest] = queued;
     setQueued(rest);
-    void runTurn(next!.prompt, next!.origin, next!.images, next!.msgId);
-  }, [status.busy, queued, runTurn]);
+    agent.finalizeRewind();
+    const msgId = agent.checkpointTurn() ?? undefined;
+    session.push({ kind: 'user', text: next!.display, msgId, images: next!.images, pastes: next!.pastes });
+    void runTurn(next!.prompt, next!.origin, next!.images, msgId);
+  }, [status.busy, queued, runTurn, agent, session]);
 
   // ── T4.5:hub 活动信号接线。三件事:① 任务完成 → **即时**上屏一条完成 notice(带命令与
   //   退出态,不等唤醒轮——busy/打字时用户也第一时间看到);② 刷新状态栏「后台 N」常驻计数
@@ -701,7 +840,10 @@ export function Repl(): React.ReactElement {
 
   // turn 结束后复位 interrupt 标记,允许下一轮再 abort。
   useEffect(() => {
-    if (!status.busy) interruptedRef.current = false;
+    if (!status.busy) {
+      interruptedRef.current = false;
+      setInterruptRequested(false);
+    }
   }, [status.busy]);
 
   // ── 浮层选中处理(router 产出 overlay-select 后按 mode 执行)──
@@ -892,11 +1034,13 @@ export function Repl(): React.ReactElement {
     else if (m === 'question' && q) questions.cancel(q.id); // esc = 跳过整组提问(每题空选)
   }, [pending, permissions, q, questions, rewindStage]);
 
-  // ── 中断 / 退出(ctrl-c / esc 在 prompt busy 时打断在飞 turn)──
+  // ── 中断 / 退出(ctrl-c / esc 在普通菜单、浮层或 prompt 的 busy 态打断在飞 turn)──
   const interrupt = useCallback(() => {
     if (busyRef.current) {
       if (!interruptedRef.current) {
         interruptedRef.current = true;
+        // 同一输入 tick 先渲染回执再请求 abort;终局「已中断」仍由 done 事件单产。
+        setInterruptRequested(true);
         agent.abort('user interrupt');
       }
       return;
@@ -1010,6 +1154,13 @@ export function Repl(): React.ReactElement {
         case 'interrupt':
           interrupt();
           return;
+        case 'cycle-permission-mode': {
+          // shift+tab 循环:default → acceptEdits → plan → [bypass,过 host 护栏] → default。
+          //   每次现算 gate(root / settings killswitch),不可用时循环自动跳过 bypass。
+          const bypassAvailable = guardBypassMode().allowed;
+          applyPermissionMode(nextPermissionMode(agent.getMode(), { bypassAvailable }));
+          return;
+        }
         case 'paste-image-probe':
           // 空 bracketed paste(Cmd+V 图片)→ 异步读系统剪贴板(读到则入 pending + 占位)。
           handleImageProbe();
@@ -1020,7 +1171,7 @@ export function Repl(): React.ReactElement {
           return;
       }
     },
-    [mode, safeOverlayIndex, overlayLength, submit, history, interrupt, selectOverlay, completeOverlay, closeOverlay, questions, q, tryIngestImagePaths, ingestPastedText, handleImageProbe],
+    [mode, safeOverlayIndex, overlayLength, submit, history, interrupt, selectOverlay, completeOverlay, closeOverlay, questions, q, tryIngestImagePaths, ingestPastedText, handleImageProbe, agent, applyPermissionMode],
   );
 
   // ── 唯一 useInput(梁③:整 TUI 单一输入 owner)────────────────────────────────
@@ -1120,8 +1271,8 @@ export function Repl(): React.ReactElement {
         <CommandMenu filter={prompt.value.slice(1)} commands={menuCommands} index={safeOverlayIndex} />
       ) : null}
 
-      {/* 排队中的下一条(远端来源标注来源对端)。 */}
-      <Queue items={queued.map((t) => (t.origin ? `[微信:${t.origin.peer.name}] ${t.prompt}` : t.prompt))} />
+      {/* 排队中的下一条(display 已含微信来源标注/斜杠命令原文/折叠占位)。 */}
+      <Queue items={queued.map((t) => t.display)} />
 
       {/* 输入框:prompt / command-menu / resume-picker 都显示(后两者是「编辑+导航」混合态,需边敲边过滤);
           纯浮层/审批挂起时才让位(键已交给浮层 nav)。resume-picker 时输入框即搜索框。 */}
@@ -1135,9 +1286,16 @@ export function Repl(): React.ReactElement {
         </Box>
       ) : null}
 
+      {/* 权限模式指示条(default 不渲染;独立组件,不动 StatusLine 极简三项约定)。 */}
+      <PermissionModeIndicator mode={permissionMode} theme={theme} />
+
       {/* 状态栏(边框外,缩进对齐):只显示 token | 耗时 | 模型,其余提示一律不渲染(用户要求极简)。 */}
       <Box flexDirection="column" paddingX={1}>
-        <ThinkingIndicator busy={status.busy} bgShells={status.bgShells} />
+        {interruptRequested ? (
+          <Text color={theme.warning}>正在中断…</Text>
+        ) : (
+          <ThinkingIndicator busy={status.busy} bgShells={status.bgShells} />
+        )}
         <StatusLine />
       </Box>
     </Box>

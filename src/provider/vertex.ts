@@ -69,7 +69,7 @@ export const createVertexProvider: ProviderFactory = (opts: ProviderFactoryOpts)
         throw new Error(`vertex-anthropic ${res.status}: ${text.slice(0, 500)}`);
       }
       const requestId = res.headers.get('x-request-id') ?? undefined;
-      yield* normalizeAnthropicStream(parseSSE(res.body), { requestId, signal: callOpts.signal });
+      yield* normalizeAnthropicStream(parseSSE(res.body, undefined, callOpts.signal), { requestId, signal: callOpts.signal });
     },
   };
 };

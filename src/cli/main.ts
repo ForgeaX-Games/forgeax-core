@@ -59,6 +59,10 @@ import type { PermissionRuleSet } from '../permission/rules';
 import { demoProvider } from './demo-provider';
 import { buildHostContext, resolveHostProvider, pickApi, DEFAULT_MODEL, DEFAULT_LEADING, DEFAULT_MAIN_MAX_TURNS } from './host-context';
 import { getMergedSettings } from './settings';
+import { coercePermissionMode, PERMISSION_MODES } from '../permission/inspect';
+import type { PermissionMode } from '../permission/engine';
+import { loadDefaultPermissionModeFromSettings } from './permission-settings';
+import { guardBypassMode } from './escalation-guard';
 import { FORGEAX_CORE_VERSION } from '../version';
 import { trustGate } from './trust';
 import { discoverSkillDirs, discoverCommandDirs, discoverAgentDirs } from './locations';
@@ -90,6 +94,8 @@ export interface CliArgs {
   searchUrl?: string;
   /** 交互式权限:全部放行(否则 'ask' fail-closed deny)。 */
   yes?: boolean;
+  /** 初始权限模式(仅显式 `--permission-mode`;settings.permissions.defaultMode 由 runCli 合成)。 */
+  permissionMode?: PermissionMode;
   /** serve 模式:在 --sock 指定的 unix-sock 上起双向 JSON-RPC(供 sidecar 托管)。 */
   serve?: boolean;
   /** serve 模式监听的 per-session unix-sock 路径。 */
@@ -164,6 +170,18 @@ export function parseArgs(argv: string[]): CliArgs {
     else if (t === '-c' || t === '--continue') a.continueSession = true;
     else if (t === '--sessions-dir') a.sessionsDir = argv[++i];
     else if (t === '--yes') a.yes = true;
+    else if (t === '--permission-mode') {
+      // 唯一 fail-fast 的 flag:权限姿态写错就静默回 default 是安全反模式(用户以为在 plan/
+      //   bypass 实际不在)。缺值/非法 → 抛 usage error(runCli 捕获 → stderr + exit 1)。
+      const v = argv[++i];
+      const m = coercePermissionMode(v);
+      if (!m) {
+        throw new Error(
+          `--permission-mode 需要合法模式(收到 ${v === undefined ? '空' : JSON.stringify(v)});可选:${PERMISSION_MODES.join(' / ')}`,
+        );
+      }
+      a.permissionMode = m;
+    }
     else if (t === '--no-tui') a.noTui = true;
     else if (t === '--sandbox') a.sandbox = true;
     else if (t === '--no-sandbox') a.sandbox = false;
@@ -284,6 +302,9 @@ export interface RunTurnOpts {
   outputFormat?: 'text' | 'json' | 'stream-json';
   /** A-01:json result 里回填的 session id(供机器消费方关联)。 */
   sessionId?: string;
+  /** 初始权限模式(P2:flag > settings.permissions.defaultMode > default;runCli 解析后传入)。
+   *  print / 管道 / readline 每轮共用同一启动值——不记忆进程内临时切换。 */
+  mode?: PermissionMode;
 }
 
 /** 跑一轮,把渲染结果写到 out(默认 stdout)。返回终态 reason。 */
@@ -300,6 +321,8 @@ export async function runTurn(
     // 权限规则(楔子1 · 046):settings.permissions.{deny,ask,allow} 载出的规则集
     //   (runCli 经 host.rules 传入);engine ① deny > ② ask > ⑦ allow 生效。
     ...(opts.rules ? { rules: opts.rules } : {}),
+    // 初始权限模式(P2):缺省不传 = CoreAgent 默认 'default',零变化。
+    ...(opts.mode ? { mode: opts.mode } : {}),
     // CLI 独立形态自管权限:开 core 内置受保护路径检查,保护本机 .git/.forgeax/shell-rc。
     enableSafetyCheck: true,
     autoMemory: opts.autoMemory,
@@ -390,6 +413,7 @@ flags:
   -c, --continue         resume the most recently active session in this dir (new if none)
   --sessions-dir <dir>   session WAL root (default ./.forgeax/sessions)
   --yes                  ⚠ DANGER: auto-approve ALL permission prompts (full access; = --dangerously-skip-permissions). Refused as root.
+  --permission-mode <m>  initial permission mode: default | acceptEdits | plan | bypassPermissions (also settings permissions.defaultMode; bypass refused as root / when disabled by settings)
   --no-tui               force readline REPL (disable Ink TUI)
   --sandbox / --no-sandbox  OS sandbox for Bash (macOS Seatbelt / Linux bwrap); else env FORGEAX_SANDBOX / settings.sandbox.enabled
   -h, --help             this help
@@ -437,7 +461,19 @@ export async function runCli(argv: string[], providerOverride?: LLMProvider): Pr
   if (argv[0] === 'mcp-serve') {
     const sub = argv.slice(1);
     const allowMutations = sub.includes('--allow-writes') || process.env.FORGEAX_MCP_ALLOW_WRITES === '1';
-    const context = buildContext(parseArgs(sub.filter((a) => a !== '--allow-writes')), providerOverride);
+    let subArgs: CliArgs;
+    try {
+      subArgs = parseArgs(sub.filter((a) => a !== '--allow-writes'));
+    } catch (e) {
+      process.stderr.write(`[forgeax-core] ${e instanceof Error ? e.message : String(e)}\n`);
+      return 1;
+    }
+    // mcp-serve 不创建 agent(只暴露工具集),没有权限模式可设——显式 flag 静默无效是安全反模式,拒绝。
+    if (subArgs.permissionMode) {
+      process.stderr.write('[forgeax-core] mcp-serve 不接受 --permission-mode(该形态不创建 agent,无权限模式)。\n');
+      return 1;
+    }
+    const context = buildContext(subArgs, providerOverride);
     const { loadPermissionRulesFromSettings } = await import('./permission-settings');
     const { runMcpServe } = await import('./mcp-serve');
     return await runMcpServe({
@@ -448,7 +484,13 @@ export async function runCli(argv: string[], providerOverride?: LLMProvider): Pr
     });
   }
 
-  const args = parseArgs(argv);
+  let args: CliArgs;
+  try {
+    args = parseArgs(argv);
+  } catch (e) {
+    process.stderr.write(`[forgeax-core] ${e instanceof Error ? e.message : String(e)}\n`);
+    return 1;
+  }
   if (args.help) {
     process.stdout.write(HELP + '\n');
     return 0;
@@ -469,6 +511,12 @@ export async function runCli(argv: string[], providerOverride?: LLMProvider): Pr
 
   // serve 模式:起 RPC server 托管本内核,常驻直到 sidecar SIGTERM(不返回)。
   if (args.serve) {
+    // serve 的权限模式由 setPermissionMode RPC / TurnRequest.permissionMode 控制;
+    //   显式 flag 看似接受实则无效 → 拒绝(settings.defaultMode 不在此列,不创建即不消费)。
+    if (args.permissionMode) {
+      process.stderr.write('[forgeax-core] --serve 不接受 --permission-mode(权限模式经 setPermissionMode RPC / TurnRequest.permissionMode 控制)。\n');
+      return 1;
+    }
     const sock = args.sock ?? process.env.FORGEAX_CORE_SOCK;
     if (!sock) {
       process.stderr.write('forgeax-core --serve 需要 --sock <path>(或 FORGEAX_CORE_SOCK)。\n');
@@ -485,6 +533,30 @@ export async function runCli(argv: string[], providerOverride?: LLMProvider): Pr
   // A-01:json/stream-json 模式下,stdout 必须是纯净的机器可读流 —— 诊断/提示行改走 stderr。
   const jsonMode = args.outputFormat === 'json' || args.outputFormat === 'stream-json';
   const info = (s: string): void => void (jsonMode ? process.stderr.write(s) : write(s));
+
+  // ── 初始权限模式(P2):flag > settings.permissions.defaultMode > default。
+  //    非法 settings 值仅在无显式 flag 时警告(有 flag 时低优先级坏值不制造噪音);
+  //    warning 恒走 stderr,不污染 json/stream-json 的 stdout。
+  let initialMode: PermissionMode = 'default';
+  if (args.permissionMode) {
+    initialMode = args.permissionMode;
+  } else {
+    const dm = loadDefaultPermissionModeFromSettings();
+    if (dm.kind === 'valid') initialMode = dm.mode;
+    else if (dm.kind === 'invalid') {
+      process.stderr.write(
+        `[forgeax-core] settings.permissions.defaultMode 非法(${JSON.stringify(dm.value)}),已回退 default。可选:${PERMISSION_MODES.join(' / ')}。\n`,
+      );
+    }
+  }
+  // E-05:启动即 bypass 是危险姿态 —— root / settings killswitch 下拒绝启动(与 /permissions 切换同一护栏)。
+  if (initialMode === 'bypassPermissions') {
+    const v = guardBypassMode();
+    if (!v.allowed) {
+      process.stderr.write(`[forgeax-core] ${v.reason}\n`);
+      return 1;
+    }
+  }
 
   // ── TUI 分支(PRD §0-C / R9):裸跑 + TTY + 无 -p/--serve + 非 FORGEAX_NO_TUI/--no-tui
   //    → 起 Ink TUI(进程内 embed CoreAgent,原生 askUser 弹卡)。否则维持原 headless /
@@ -522,7 +594,7 @@ export async function runCli(argv: string[], providerOverride?: LLMProvider): Pr
   if (wantTui) {
     try {
       const { runTui } = await import('../tui/app');
-      return await runTui(args, providerOverride);
+      return await runTui({ ...args, initialMode }, providerOverride);
     } catch (e) {
       // ink 不可用 / TUI 起不来 → 回落 readline REPL(不阻断交互)。
       process.stderr.write(`[forgeax-core] TUI 不可用,回落 readline REPL: ${e instanceof Error ? e.message : String(e)}\n`);
@@ -623,6 +695,7 @@ export async function runCli(argv: string[], providerOverride?: LLMProvider): Pr
     store,
     rules,
     persistToolResult,
+    mode: initialMode,
     ...(args.outputFormat ? { outputFormat: args.outputFormat } : {}),
     ...(sessionId ? { sessionId } : {}),
     ...(host.coordinatorInbox ? { inbox: host.coordinatorInbox } : {}),

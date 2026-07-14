@@ -196,6 +196,7 @@ export interface SandboxFs {
   renameSync(from: string, to: string): void;
   statSync(path: string): StatResult;
   readdirSync(path: string, opts?: { withFileTypes?: boolean }): string[] | DirEnt[];
+  readDir(path: string): AsyncIterable<DirEnt>;
   readText(path: string): Promise<string>;
   writeText(path: string, content: string): Promise<void>;
   readBytes(path: string, offset?: number, limit?: number): Promise<Uint8Array>;

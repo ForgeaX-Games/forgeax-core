@@ -200,7 +200,9 @@ export interface Key {
     // 空 bracketed paste(ESC[200~ESC[201~,中间无内容):Cmd+V 图片的唯一信号 →
     // 触发主动读系统剪贴板(normalize 产,Repl 消费,见 input/imagePaste.ts §0 根因)。
     | 'paste-image-probe'
-    | 'tab';
+    | 'tab'
+    // 终端 backtab(ESC[Z,ink 报 {tab,shift}):prompt 模式循环切换权限模式;其余模式吞掉。
+    | 'shift-tab';
   /** kind==='char'|'paste' 时的文本载荷。 */
   text?: string;
   /** 连按合并时的重复计数(如退格 ×3);拆不出时省略(见 §9 R4)。 */
@@ -347,6 +349,10 @@ export interface QuestionQueue {
   /** 确认当前题:highlightIndex === options.length 即选中自填项(取自填文本);
    *  单选取高亮项、多选取已勾选集 + 非空自填;推进下一题,末题组装 answers 并 resolve。 */
   confirm(id: string, highlightIndex: number): void;
+  /** 一次性回答当前题(远端中转用):options = 选项下标(0-based,单选题只取首个),
+   *  other = 自填文本;原子写入选择并推进/收尾——不同于「toggle 再 confirm」的两步键盘路径
+   *  (跨 setState 读 stale 快照会丢选择)。 */
+  answer(id: string, a: { options?: number[]; other?: string }): void;
   /** 跳过/取消整组提问:以「每题空选」resolve(对齐 cc 的「declined to answer」)。 */
   cancel(id: string): void;
 }
@@ -393,6 +399,9 @@ export interface AgentDriver {
   /** 透传权限模式给下一轮 CoreAgent(喂 CoreAgentOptions.mode)。025 起放开到全 PermissionMode
    *  (含 'plan' 只读规划 / 'acceptEdits'),供 /permissions /plan 命令切换。 */
   setMode(mode: PermissionMode): void;
+  /** 当前权限模式(shift+tab 循环「读当前 + 1」/ 指示条 / /status 同源)。driveTurn 收尾会从
+   *  活 CoreAgent 回读,故 ExitPlanMode 在轮内恢复模式后这里也跟上(不再漂移停在 plan)。 */
+  getMode(): PermissionMode;
 
   // ── 命令补齐批次(025)能力:真实现读 host/opts/rules/mode,经 ctx 委派给命令 ──
   /** 累计 usage 摘要(token + 估费;driver 从 stream 事件累积,跨 model 切换不清零)。 */

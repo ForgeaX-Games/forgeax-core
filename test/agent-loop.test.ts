@@ -157,6 +157,33 @@ describe('LOOP interrupt scenario', () => {
     const last = events.at(-1)!;
     expect(last.type === 'done' && last.terminal.reason).toBe('aborted_streaming');
   });
+
+  test('rejects a result yielded after abort by a provider that ignores signal', async () => {
+    let release!: () => void;
+    let markEntered!: () => void;
+    const blocked = new Promise<void>((resolve) => (release = resolve));
+    const entered = new Promise<void>((resolve) => (markEntered = resolve));
+    const provider: LLMProvider = {
+      api: 'ignores-abort',
+      async *stream() {
+        markEntered();
+        await blocked;
+        yield asstText('must-not-be-accepted');
+      },
+    };
+    const agent = new CoreAgent({ context: ctx([], provider) });
+    const running = collect(agent, { input: { type: 'user', payload: 'hi', ts: 0 } });
+    await entered;
+    agent.abort('test');
+    release();
+
+    const events = await running;
+    expect(events.some((e) => e.type === 'stream')).toBe(false);
+    expect(events.some((e) => e.type === 'assistant')).toBe(false);
+    expect(events.some((e) => e.type === 'turn_aborted')).toBe(true);
+    const last = events.at(-1)!;
+    expect(last.type === 'done' && last.terminal.reason).toBe('aborted_streaming');
+  });
 });
 
 describe('LOOP agent_command scenario — trust channel', () => {

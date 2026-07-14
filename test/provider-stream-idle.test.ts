@@ -5,8 +5,9 @@
  *   ② readWithIdleTimeout 在无字节超时时抛 StreamIdleError 且 cancel reader,正常到达则原样返回不 cancel。
  */
 import { test, expect, describe, afterEach } from 'bun:test';
-import { providerStreamIdleMs, readWithIdleTimeout } from '../src/provider/anthropic';
-import { StreamIdleError } from '../src/provider/types';
+import { parseSSE, providerStreamIdleMs, readWithIdleTimeout } from '../src/provider/anthropic';
+import { StreamIdleError, type ProviderStreamEvent } from '../src/provider/types';
+import { demoProvider } from '../src/cli/demo-provider';
 
 const ENV = 'FORGEAX_PROVIDER_IDLE_MS';
 const savedEnv = process.env[ENV];
@@ -65,5 +66,59 @@ describe('readWithIdleTimeout', () => {
     const r = await readWithIdleTimeout(reader, 1000);
     expect(r).toEqual({ done: false, value: chunk });
     expect(canceled).toBe(false);
+  });
+
+  test('abort settles a stalled read promptly and cancels reader', async () => {
+    let canceled = false;
+    const reader = {
+      read: () => new Promise<{ done: boolean; value?: Uint8Array }>(() => {}),
+      cancel: async () => void (canceled = true),
+    };
+    const ac = new AbortController();
+    const pending = readWithIdleTimeout(reader, 60_000, ac.signal);
+    ac.abort('stop');
+    await expect(pending).rejects.toMatchObject({ name: 'AbortError' });
+    expect(canceled).toBe(true);
+  });
+});
+
+describe('parseSSE cancellation cleanup', () => {
+  test('abort cancels a stalled stream and releases its reader lock', async () => {
+    let canceled = false;
+    const body = new ReadableStream<Uint8Array>({
+      pull: () => new Promise<void>(() => {}),
+      cancel: () => void (canceled = true),
+    });
+    const ac = new AbortController();
+    const iterator = parseSSE(body, 60_000, ac.signal);
+    const pending = iterator.next();
+    ac.abort('stop');
+    await expect(pending).rejects.toMatchObject({ name: 'AbortError' });
+    expect(canceled).toBe(true);
+    expect(body.locked).toBe(false);
+  });
+});
+
+describe('demo provider cancellation', () => {
+  test('abort interrupts the configured inter-chunk delay', async () => {
+    const previous = process.env.FORGEAX_DEMO_STREAM_DELAY_MS;
+    process.env.FORGEAX_DEMO_STREAM_DELAY_MS = '60000';
+    const ac = new AbortController();
+    const events: ProviderStreamEvent[] = [];
+    try {
+      const pending = (async () => {
+        for await (const event of demoProvider().stream(
+          { model: 'demo', system: [], tools: [], messages: [{ role: 'user', content: 'hi' }] },
+          { signal: ac.signal },
+        )) events.push(event);
+      })();
+      await Promise.resolve();
+      ac.abort('stop');
+      await expect(pending).rejects.toMatchObject({ name: 'AbortError' });
+      expect(events.some((event) => event.type === 'assistant')).toBe(false);
+    } finally {
+      if (previous === undefined) delete process.env.FORGEAX_DEMO_STREAM_DELAY_MS;
+      else process.env.FORGEAX_DEMO_STREAM_DELAY_MS = previous;
+    }
   });
 });

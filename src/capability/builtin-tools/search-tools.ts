@@ -4,7 +4,7 @@
  * 二者皆 **只读 + 并发安全**。
  *
  * grep/glob 常见实现直接 spawn ripgrep / fast-glob；core ② **不**直接 spawn(boundary)，
- * 也不依赖外部包——改为经注入的 `SandboxFs`(inject C3 §4.5) 用同步 readdir 递归遍历
+ * 也不依赖外部包——改为经注入的 `SandboxFs`(inject C3 §4.5) 异步、有界地遍历
  * 文件树，自带 glob→RegExp 转换 + 内容正则匹配。功能子集覆盖常用形态(pattern/
  * path/glob/output_mode/head_limit)，重活(ripgrep 全部 flag) 留给 host 覆盖实现。
  *
@@ -17,8 +17,8 @@ import { buildTool, type AgentTool, type ToolContext } from '../types';
 import { requireSandboxFs } from './file-tools';
 
 const DEFAULT_HEAD_LIMIT = 250;
-/** 遍历守卫：避免病态目录树打爆遍历(纯内存遍历，无 ripgrep 的智能跳过)。 */
-const MAX_WALK_FILES = 20_000;
+/** 遍历守卫：按访问条目数封顶，零命中目录树也必须有确定上界。 */
+export const MAX_WALK_ENTRIES = 20_000;
 /** 总是跳过的目录(对齐 ripgrep 默认忽略的重目录)。 */
 const SKIP_DIRS = new Set(['.git', 'node_modules', '.hg', '.svn']);
 
@@ -54,7 +54,7 @@ export function globToRegExp(glob: string): RegExp {
   return new RegExp('^' + compiled + '$');
 }
 
-// ─── 递归遍历(经 SandboxFs.readdirSync) ──────────────────────────────────────
+// ─── 递归遍历(经 SandboxFs.readDir) ─────────────────────────────────────────
 
 interface WalkHit {
   /** 相对 root 的 posix 路径。 */
@@ -63,42 +63,87 @@ interface WalkHit {
   abs: string;
 }
 
+interface WalkResult {
+  hits: WalkHit[];
+  /** 达到访问条目上限，目录树只扫描了一部分。 */
+  truncated: boolean;
+}
+
 function joinPath(a: string, b: string): string {
   if (a === '') return b;
   return a.endsWith('/') ? a + b : a + '/' + b;
 }
 
-/** 同步深度遍历；filterRel 决定一个相对路径是否收集(为 null=全收)。 */
-function walkFiles(
+function abortError(): Error {
+  const error = new Error('search aborted');
+  error.name = 'AbortError';
+  return error;
+}
+
+function throwIfAborted(signal: AbortSignal): void {
+  if (signal.aborted) throw abortError();
+}
+
+/** 等待异步 IO 时也响应取消；底层 IO 可自行收尾，但工具调用不再被它拖住。 */
+function abortable<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  throwIfAborted(signal);
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => reject(abortError());
+    signal.addEventListener('abort', onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener('abort', onAbort);
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener('abort', onAbort);
+        reject(error);
+      },
+    );
+  });
+}
+
+/** 异步深度遍历；按访问条目数封顶，filterRel 仅决定是否收集。 */
+async function walkFiles(
   fs: SandboxFs,
   root: string,
   filterRel: ((rel: string) => boolean) | null,
-): WalkHit[] {
+  signal: AbortSignal,
+): Promise<WalkResult> {
   const hits: WalkHit[] = [];
   const stack: string[] = [''];
+  let visitedEntries = 0;
+
   while (stack.length > 0) {
-    if (hits.length >= MAX_WALK_FILES) break;
+    throwIfAborted(signal);
+    if (visitedEntries >= MAX_WALK_ENTRIES) return { hits, truncated: true };
     const relDir = stack.pop() as string;
     const absDir = relDir === '' ? root : joinPath(root, relDir);
-    let entries: DirEnt[];
+    if (typeof fs.readDir !== 'function') throw new Error('search: sandboxFs.readDir is missing');
+    const iterator = fs.readDir(absDir)[Symbol.asyncIterator]();
     try {
-      entries = fs.readdirSync(absDir, { withFileTypes: true }) as DirEnt[];
-    } catch {
-      continue; // 不可读目录 → 跳过(只读工具不应炸)
-    }
-    for (const ent of entries) {
-      const childRel = joinPath(relDir, ent.name);
-      if (ent.isDir) {
-        if (SKIP_DIRS.has(ent.name)) continue;
-        stack.push(childRel);
-      } else if (ent.isFile) {
-        if (filterRel === null || filterRel(childRel)) {
+      while (true) {
+        const next = await abortable(Promise.resolve(iterator.next()), signal);
+        if (next.done) break;
+        if (visitedEntries >= MAX_WALK_ENTRIES) return { hits, truncated: true };
+        const ent = next.value;
+        visitedEntries++;
+        const childRel = joinPath(relDir, ent.name);
+        if (ent.isDir) {
+          if (SKIP_DIRS.has(ent.name)) continue;
+          stack.push(childRel);
+        } else if (ent.isFile && (filterRel === null || filterRel(childRel))) {
           hits.push({ rel: childRel, abs: joinPath(root, childRel) });
         }
       }
+    } catch (error) {
+      throwIfAborted(signal);
+      continue; // 不可读目录 → 跳过(只读工具不应炸)
+    } finally {
+      if (iterator.return) void Promise.resolve(iterator.return()).catch(() => {});
     }
   }
-  return hits;
+  return { hits, truncated: false };
 }
 
 function resolveRoot(ctx: ToolContext, path?: string): string {
@@ -152,6 +197,7 @@ export function globTool(): AgentTool<GlobInput, GlobOutput> {
     maxResultSizeChars: 100_000,
     isReadOnly: () => true,
     isConcurrencySafe: () => true,
+    interruptBehavior: () => 'cancel',
     async call(input, ctx): Promise<{ data: GlobOutput }> {
       const fs = requireSandboxFs(ctx);
       if (typeof input.pattern !== 'string' || input.pattern === '') {
@@ -159,10 +205,10 @@ export function globTool(): AgentTool<GlobInput, GlobOutput> {
       }
       const root = resolveRoot(ctx, input.path);
       const re = globToRegExp(input.pattern);
-      const hits = walkFiles(fs, root, (rel) => re.test(rel));
-      const all = hits.map((h) => h.abs).sort();
+      const walked = await walkFiles(fs, root, (rel) => re.test(rel), ctx.signal);
+      const all = walked.hits.map((h) => h.abs).sort();
       const files = clampHead(all, input.head_limit);
-      return { data: { files, truncated: files.length < all.length } };
+      return { data: { files, truncated: walked.truncated || files.length < all.length } };
     },
     mapResult(output, toolUseId): CoreEvent {
       return {
@@ -264,6 +310,7 @@ export function grepTool(): AgentTool<GrepInput, GrepOutput> {
     maxResultSizeChars: 20_000,
     isReadOnly: () => true,
     isConcurrencySafe: () => true,
+    interruptBehavior: () => 'cancel',
     async call(input, ctx): Promise<{ data: GrepOutput }> {
       const fs = requireSandboxFs(ctx);
       if (typeof input.pattern !== 'string' || input.pattern === '') {
@@ -292,16 +339,24 @@ export function grepTool(): AgentTool<GrepInput, GrepOutput> {
       // 解析搜索目标：单文件 vs 目录树。
       const root = resolveRoot(ctx, input.path);
       let targets: WalkHit[];
+      let walkTruncated = false;
       if (input.path && input.path !== '' && fs.existsSync(input.path) && fs.statSync(input.path).isFile) {
         targets = [{ rel: input.path, abs: input.path }];
       } else {
         const globRe = input.glob ? globToRegExp(input.glob) : null;
-        targets = walkFiles(fs, root, (rel) => {
-          if (!globRe) return true;
-          // glob 既匹配整相对路径，也匹配 basename(常见 "*.ts" 写法)。
-          const base = rel.split('/').pop() as string;
-          return globRe.test(rel) || globRe.test(base);
-        });
+        const walked = await walkFiles(
+          fs,
+          root,
+          (rel) => {
+            if (!globRe) return true;
+            // glob 既匹配整相对路径，也匹配 basename(常见 "*.ts" 写法)。
+            const base = rel.split('/').pop() as string;
+            return globRe.test(rel) || globRe.test(base);
+          },
+          ctx.signal,
+        );
+        targets = walked.hits;
+        walkTruncated = walked.truncated;
       }
 
       const contentMatches: GrepContentLine[] = [];
@@ -309,15 +364,18 @@ export function grepTool(): AgentTool<GrepInput, GrepOutput> {
       const counts: Array<{ file: string; count: number }> = [];
 
       for (const t of targets) {
+        throwIfAborted(ctx.signal);
         let text: string;
         try {
-          text = await fs.readText(t.abs);
+          text = await abortable(fs.readText(t.abs), ctx.signal);
         } catch {
+          throwIfAborted(ctx.signal);
           continue; // 二进制/不可读 → 跳过
         }
         const lines = text.split('\n');
         let fileCount = 0;
         for (let i = 0; i < lines.length; i++) {
+          if (i % 1_000 === 0) throwIfAborted(ctx.signal);
           // 每行独立测试(non-global regex，避免 lastIndex 状态)。
           if (re.test(lines[i])) {
             fileCount++;
@@ -335,17 +393,19 @@ export function grepTool(): AgentTool<GrepInput, GrepOutput> {
       if (mode === 'content') {
         const clamped = clampHead(contentMatches, input.head_limit);
         void showLineNumbers; // 行号始终在结构化结果里(showLineNumbers 仅影响渲染)
-        return { data: { mode, matches: clamped, truncated: clamped.length < contentMatches.length } };
+        return {
+          data: { mode, matches: clamped, truncated: walkTruncated || clamped.length < contentMatches.length },
+        };
       }
       if (mode === 'count') {
         const sorted = counts.sort((a, b) => a.file.localeCompare(b.file));
         const clamped = clampHead(sorted, input.head_limit);
-        return { data: { mode, counts: clamped, truncated: clamped.length < sorted.length } };
+        return { data: { mode, counts: clamped, truncated: walkTruncated || clamped.length < sorted.length } };
       }
       const sortedFiles = fileSet.sort();
       const clampedFiles = clampHead(sortedFiles, input.head_limit);
       return {
-        data: { mode, files: clampedFiles, truncated: clampedFiles.length < sortedFiles.length },
+        data: { mode, files: clampedFiles, truncated: walkTruncated || clampedFiles.length < sortedFiles.length },
       };
     },
     mapResult(output, toolUseId): CoreEvent {

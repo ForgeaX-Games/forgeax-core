@@ -50,7 +50,7 @@ async function submit(app: AppHandle, text: string): Promise<void> {
 }
 
 /** 可控慢 provider:每次 stream 记一次调用;卡在 release 闸门直到外部放行,abort 则抛。 */
-function makeControllableProvider(): {
+function makeControllableProvider(abortSettleMs = 0): {
   provider: LLMProvider;
   calls: () => number;
   aborts: () => number;
@@ -70,7 +70,8 @@ function makeControllableProvider(): {
       await new Promise<void>((resolve, reject) => {
         const onAbort = () => {
           abortCount++;
-          reject(new Error('aborted'));
+          if (abortSettleMs > 0) setTimeout(() => reject(new Error('aborted')), abortSettleMs);
+          else reject(new Error('aborted'));
         };
         if (opts.signal.aborted) return onAbort();
         opts.signal.addEventListener('abort', onAbort, { once: true });
@@ -178,6 +179,30 @@ describe('03-轮次生命周期与队列 (real App + controllable slow provider)
       app.stdin.write(ESC); // 标记已复位 → 第二轮同样可打断
       await sleep(200);
       expect(c.aborts()).toBe(2);
+    } finally {
+      c.releaseAll();
+      app.unmount();
+    }
+  }, 30_000);
+
+  test('busy 普通菜单内 esc 不被浮层吞掉,立即显示中断回执并 abort', async () => {
+    // 延迟 provider 的 abort 收尾,把「按键已接收」与终局 done 拉开,证明回执不是终局事件带来的。
+    const c = makeControllableProvider(400);
+    const app = await mountApp(c.provider);
+    try {
+      await sleep(150);
+      await submit(app, 'turn');
+      expect(c.calls()).toBe(1);
+
+      app.stdin.write('/'); // busy 时仍可打开 command-menu
+      await sleep(80);
+      expect(app.frame()).toContain('/agents');
+
+      app.stdin.write(ESC);
+      await sleep(80);
+      expect(c.aborts()).toBe(1);
+      expect(app.frame()).toContain('正在中断');
+      expect(app.frame()).not.toContain('已中断'); // provider 尚未 settle,终局 notice 还未到
     } finally {
       c.releaseAll();
       app.unmount();

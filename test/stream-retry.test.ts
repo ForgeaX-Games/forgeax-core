@@ -117,4 +117,30 @@ describe('streamWithRetry', () => {
     await expect(drain(streamWithRetry(provider, req, { signal: new AbortController().signal }, { sleep: noSleep, maxRetries: 5 }))).rejects.toThrow('bad');
     expect(n).toBe(1);
   });
+
+  test('abort settles a stalled retry delay without another attempt', async () => {
+    let n = 0;
+    let sleepStarted!: () => void;
+    const sleeping = new Promise<void>((resolve) => (sleepStarted = resolve));
+    const provider: LLMProvider = {
+      api: 'x',
+      async *stream() {
+        n++;
+        throw Object.assign(new Error('retry me'), { status: 503 });
+      },
+    };
+    const ac = new AbortController();
+    const pending = drain(
+      streamWithRetry(provider, req, { signal: ac.signal }, {
+        sleep: () => {
+          sleepStarted();
+          return new Promise<void>(() => {});
+        },
+      }),
+    );
+    await sleeping;
+    ac.abort('stop');
+    await expect(pending).rejects.toMatchObject({ name: 'AbortError' });
+    expect(n).toBe(1);
+  });
 });

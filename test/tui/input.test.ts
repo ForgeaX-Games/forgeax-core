@@ -88,6 +88,12 @@ describe('normalizeKey — R4 实测形状', () => {
     expect(normalizeKey('\r', mkKey({ return: true }))).toEqual([{ kind: 'enter' }]);
   });
 
+  test('shift+tab(终端 backtab ESC[Z,ink 报 {tab,shift})→ shift-tab', () => {
+    expect(normalizeKey('', mkKey({ tab: true, shift: true }))).toEqual([{ kind: 'shift-tab' }]);
+    // 普通 tab 不受影响(回归)。
+    expect(normalizeKey('', mkKey({ tab: true, shift: false }))).toEqual([{ kind: 'tab' }]);
+  });
+
   test('单字符 → char;多字符整块 → paste', () => {
     expect(normalizeKey('a', mkKey())).toEqual([{ kind: 'char', text: 'a' }]);
     expect(normalizeKey('hello world', mkKey())).toEqual([{ kind: 'paste', text: 'hello world' }]);

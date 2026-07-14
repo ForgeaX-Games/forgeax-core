@@ -50,7 +50,9 @@ export function normalizeKey(input: string, raw: InkKey): Key[] {
   // esc 与 meta 同时置位(实测),必须先判 escape,避免被当 meta 组合吞掉。
   if (raw.escape) return [{ kind: 'esc' }];
   if (raw.return) return [{ kind: 'enter' }];
-  if (raw.tab) return [{ kind: 'tab' }];
+  // shift+tab(终端 backtab ESC[Z,ink 解析为 {tab:true, shift:true})→ 独立 kind,
+  // 供权限模式循环;普通 tab 语义不变。
+  if (raw.tab) return [{ kind: raw.shift ? 'shift-tab' : 'tab' }];
   if (raw.upArrow) return [{ kind: 'up' }];
   if (raw.downArrow) return [{ kind: 'down' }];
   if (raw.leftArrow) return [{ kind: 'left' }];

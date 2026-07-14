@@ -21,11 +21,12 @@
  *
  * Boundary(HOST 层):react + ink + 相对 import。
  */
-import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { Box, Static } from 'ink';
+import React, { useMemo, useRef } from 'react';
+import { Box, Static, Text } from 'ink';
 import type { TranscriptItem, SessionEntry } from './items';
 import { reduceTranscript, safeFlushBoundary } from './reduce';
 import { tailStartIndex } from './redraw-window';
+import { clipStreamTail, streamTailBudget } from './stream-tail';
 import { useTheme } from '../providers/theme';
 import type { ThemeTokens } from '../contracts';
 import { resolveToolByMeta } from '../views/tools/registry';
@@ -104,17 +105,16 @@ export function Transcript(props: TranscriptProps): React.ReactElement {
   //   往上滚就被弹回、滚不到底。改为:
   //     ① 随日志推进到 safeFlushBoundary(所有已出现工具均已配对的最大前缀),单调不退;
   //        live 动态区只剩「仍在 running 的工具卡 + 其后尾巴」,恒压在一屏内。
-  //     ② turn 结束(!busy)再兜底全量提交(含被 abort 的 running 卡 —— 其 result 永不再来,
+  //     ② turn 结束(!busy)兜底全量提交(含被 abort 的 running 卡 —— 其 result 永不再来,
   //        已是 terminal,可安全冻结)。
   //     ③ 日志缩短(rewind/clear)时把 flushed 夹回,避免越界 / committed 与 live 重复。
-  const [flushed, setFlushed] = useState(0);
+  //   推进必须在**渲染期同步**算(ref 派生,不走 useState+useEffect):effect 在 paint 之后,
+  //   刚落日志的长 assistant 条目会先在 live 动态区画一帧 —— 超视口时顶部行滚进
+  //   scrollback 永远擦不掉,留下一整份残影拷贝(ttydrive-ghost-e2e 抓的就是它)。
+  const flushedRef = useRef(0);
   const boundary = useMemo(() => safeFlushBoundary(log), [log]);
-  useEffect(() => {
-    setFlushed((f) => (f > log.length ? log.length : Math.max(f, boundary)));
-  }, [boundary, log.length]);
-  useEffect(() => {
-    if (!busy) setFlushed(log.length);
-  }, [busy, log.length]);
+  const flushed = Math.min(busy ? Math.max(flushedRef.current, boundary) : log.length, log.length);
+  flushedRef.current = flushed;
 
   // 先按 log 下标切,再各自 reduce(保证跨边界的 call/result 不被切散)。
   const committed = useMemo<TranscriptItem[]>(
@@ -150,6 +150,16 @@ export function Transcript(props: TranscriptProps): React.ReactElement {
   const staticItems: StaticEntry[] =
     header != null ? [{ kind: 'banner', id: -2, node: header }, ...tail] : tail;
 
+  // ── 在写文本的尾部视口裁剪:整段流式文本渲染在动态区,一旦高过终端视口,Ink 每帧
+  //   擦不掉溢出顶部的行 → scrollback 每帧积一份残影(resize 清屏才消)。按视觉行
+  //   (CJK 感知折行)只保留末尾预算内的行,与 LiveThinking 的 MAX_LINES 同思路;
+  //   收口后 durable 条目仍是全文,被裁的开头本来也早滚出视口。见 stream-tail.ts。
+  const streamTail = useMemo(
+    () =>
+      clipStreamTail(streamingText, termWidth(), streamTailBudget(process.stdout.rows ?? 24)),
+    [streamingText],
+  );
+
   return (
     <Box flexDirection="column">
       {/* committed:Ink <Static> 只渲染新增条目;key=staticRenderKey 让 resize / /resume 时
@@ -181,10 +191,13 @@ export function Transcript(props: TranscriptProps): React.ReactElement {
       ) : null}
 
       {/* 在写文本(流式,节流后):live 尾部渲染合成 assistant 条目;`assistant` 事件到达即
-          清空(streamingText 归 '') → 由上面 live 里的 durable 条目接管,视觉零跳变。 */}
+          清空(streamingText 归 '') → 由上面 live 里的 durable 条目接管,视觉零跳变。
+          超视口预算时只渲染末尾窗口(clipStreamTail),前部以 `…` 标记 —— 否则动态区
+          高过终端,Ink 每帧擦不净溢出行,scrollback 积残影。 */}
       {streamingText ? (
         <Box key="streaming" flexDirection="column" marginTop={1}>
-          {renderItem(streamingItem(streamingText), theme, toolMeta, expanded)}
+          {streamTail.clipped ? <Text color={theme.dim}>{'…'}</Text> : null}
+          {renderItem(streamingItem(streamTail.text), theme, toolMeta, expanded)}
         </Box>
       ) : null}
     </Box>

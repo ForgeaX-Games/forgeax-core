@@ -50,6 +50,8 @@ async function drive(spec: DriveSpec, rows = 30, cols = 100): Promise<string> {
           FORGEAX_NO_TUI: '',
           FORGEAX_SKIP_TRUST: '1',
           FORGEAX_SESSIONS_DIR: join(dir, 'sessions'),
+          // Hermetic: model/status assertions must not read real ~/.forgeax/settings.json.
+          FORGEAX_CONFIG_DIR: join(dir, 'config'),
           ...spec.env,
         },
         boot_ms: spec.boot_ms ?? 2500,

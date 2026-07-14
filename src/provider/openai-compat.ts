@@ -536,7 +536,7 @@ export function createOpenAICompatLikeProvider(
       }
       const requestId =
         res.headers.get('x-request-id') ?? res.headers.get('request-id') ?? undefined;
-      yield* normalizeOpenAIStream(parseSSE(res.body), {
+      yield* normalizeOpenAIStream(parseSSE(res.body, undefined, callOpts.signal), {
         requestId,
         signal: callOpts.signal,
         extractReasoning: config.extractReasoning,

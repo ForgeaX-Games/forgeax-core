@@ -33,4 +33,18 @@ describe('Transcript streamingText', () => {
     const frame = lastFrame() ?? '';
     expect(frame).toContain('partial answer being written');
   });
+
+  test('over-budget streamingText is tail-clipped with … marker (anti-ghosting)', () => {
+    // 40 条短行远超预算(测试环境 rows 未知 → 24 − 预留 12 = 12 行):动态区若整段
+    // 渲染会高过终端视口,Ink 擦不净溢出行 → scrollback 残影。断言只剩尾窗 + `…`。
+    const lines = Array.from({ length: 40 }, (_, i) => `stream-line-${i}`);
+    const { lastFrame } = render(
+      <Transcript log={[]} busy toolMeta={toolMeta} streamingText={lines.join('\n')} />,
+    );
+    const frame = lastFrame() ?? '';
+    expect(frame).toContain('…');
+    expect(frame).toContain('stream-line-39'); // 末尾可见
+    expect(frame).not.toContain('stream-line-0\n'); // 开头被裁
+    expect(frame).not.toContain('stream-line-10'); // 窗口外(40−12=28 起才可见)
+  });
 });

@@ -1007,6 +1007,9 @@ export class CoreAgent implements Agent {
           },
           this.o.retry,
         )) {
+          // Provider 合同要求响应 signal，但 loop 仍在消费边界 fail-closed：即使错误实现
+          // 在 abort 后继续 yield，也绝不把该结果提交为 stream/assistant/tool call。
+          if (signal.aborted) break;
           yield { type: 'stream', event: sev };
           if (sev.type === 'assistant') {
             assistantMessage = sev.message;
@@ -1051,6 +1054,13 @@ export class CoreAgent implements Agent {
           return;
         }
         yield done('model_error', { error: e });
+        return;
+      }
+      // Provider 也可能忽略 signal 并正常结束（没有异常可进 catch）；在接纳任何聚合结果前
+      // 再次检查，维持当前 streaming 阶段的终态语义。
+      if (signal.aborted) {
+        yield { type: 'turn_aborted', turn };
+        yield done('aborted_streaming');
         return;
       }
       // token 预算:累加本轮 output token(taskBudget 缺省 → spentTokens 仅记账不参与判定)。

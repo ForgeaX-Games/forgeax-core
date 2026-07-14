@@ -25,10 +25,17 @@ rows, cols = int(sys.argv[1]), int(sys.argv[2])
 spec = json.load(open(sys.argv[3]))
 
 # ── rendering tier: pyte (2D screen) if available, else raw+ANSI-strip ────────
+# step.json 可选 "history": N → pyte.HistoryScreen 记录 N 行 scrollback,输出多一段
+# ==== SCROLLBACK ==== (视口上方滚走的行)。用于断言「滚出视口的内容只出现一次」
+# (Ink 动态区超视口残影类 bug 的证据只在 scrollback 里,视口断言看不见)。
+HISTORY = int(spec.get("history", 0) or 0)
 try:
     import pyte  # type: ignore
 
-    _screen = pyte.Screen(cols, rows)
+    if HISTORY > 0:
+        _screen = pyte.HistoryScreen(cols, rows, history=HISTORY)
+    else:
+        _screen = pyte.Screen(cols, rows)
     _stream = pyte.ByteStream(_screen)
     USING_PYTE = True
 
@@ -37,6 +44,14 @@ try:
 
     def render_lines():
         return [line.rstrip() for line in _screen.display]
+
+    def render_scrollback():
+        if HISTORY <= 0:
+            return []
+        out = []
+        for line in _screen.history.top:  # 最老 → 最新
+            out.append("".join(line[x].data for x in range(cols)).rstrip())
+        return out
 
 except ImportError:
     # pyte absent *or* installed-but-broken → degrade rather than abort (§9).
@@ -61,6 +76,9 @@ except ImportError:
                 blank = 0
             out.append(ln)
         return out
+
+    def render_scrollback():
+        return []  # raw 档无屏幕模型,给不出 scrollback(调用方 skip)
 
 env = dict(os.environ)
 env.update(spec.get("env", {}))
@@ -120,6 +138,11 @@ pump(spec.get("settle_ms", 500))
 
 # dump visible screen (uniform markers across both fidelity tiers)
 tier = "pyte" if USING_PYTE else "raw"
+if HISTORY > 0 and USING_PYTE:
+    print("==== SCROLLBACK (%d lines kept) ====" % HISTORY)
+    for line in render_scrollback():
+        print(line)
+    print("==== END SCROLLBACK ====")
 print("==== SCREEN (%dx%d %s) ====" % (rows, cols, tier))
 for line in render_lines():
     print(line)

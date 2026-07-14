@@ -15,9 +15,11 @@
  *     (modelPickerReducer / 等),产出 move/select/close/none。
  *   - scroll → 视口滚动(todo-001 插槽);本期出 scroll action 占位,P6 可暂忽略。
  *
- * esc 语义集中一处:有浮层 → 关浮层(回 prompt);prompt 模式 esc-esc → 空则拉 rewind,
- * 非空则清空输入。单次 esc 在 prompt 且非空 → 记一次「待清」,200ms 内第二次 esc 才清(由 P6
- * 持双击计时;router 只产出 prompt-esc action,是否清由 P6 据 escArmed 决定)。
+ * esc 语义集中一处:turn 在飞时,除 permission/question 两种阻塞闸仍保留 deny/cancel 外,
+ * 单次 esc 在任何普通菜单/浮层/prompt 都优先中断,不让当前 mode 吞键;空闲时有浮层 → 关浮层
+ * (回 prompt),prompt 模式 esc-esc → 空则拉 rewind,非空则清空输入。单次 esc 在空闲 prompt
+ * 且非空 → 记一次「待清」,600ms 内第二次 esc 才清(由 P6 持双击计时;router 只产出
+ * prompt-esc action,是否清由 P6 据 escArmed 决定)。
  *
  * Boundary(HOST 层):仅 core 类型 + 相对 import(无 react/ink runtime)。
  */
@@ -69,6 +71,9 @@ export type InputAction =
   | { kind: 'scroll'; delta: number }
   // ctrl-c(P6:空则退出,非空则清空/打断)。
   | { kind: 'interrupt' }
+  // shift+tab 在 prompt:循环切换权限模式(P6 读当前 mode + bypass gate 后调 driver.setMode)。
+  //   仅 prompt 模式产出;浮层/菜单/审批下吞掉(审批卡内切换留 P3)。
+  | { kind: 'cycle-permission-mode' }
   // 无操作(吞掉、不改状态)。
   | { kind: 'none' };
 
@@ -113,6 +118,9 @@ function routePrompt(ctx: RouterCtx, key: Key): InputAction {
       return { kind: 'none' }; // 留给 P6(展开/折叠思考等),router 不预设语义。
     case 'tab':
       return { kind: 'none' };
+    case 'shift-tab':
+      // 循环切换权限模式(cycleMode 语义;busy 亦可切,影响后续 dispatch)。
+      return { kind: 'cycle-permission-mode' };
     case 'char': {
       // 在空输入处敲 '/' → 开命令菜单(同时把 '/' 插进去,filter 由 value 派生)。
       if (key.text === '/' && prompt.value.length === 0) {
@@ -255,6 +263,12 @@ function routeQuestion(ctx: RouterCtx, key: Key): InputAction {
 export function routeKey(ctx: RouterCtx, key: Key): InputAction {
   // ctrl-c 在任何模式都先走中断语义(P6 决定退出/打断)。
   if (key.kind === 'ctrl-c') return { kind: 'interrupt' };
+
+  // turn 在飞时,普通菜单/浮层不得吞掉 esc:单击立即中断。permission/question 是阻塞闸,
+  // 其 esc 仍须走各自 overlay-close → deny/cancel,否则 abort 会留下未决 Promise。
+  if (key.kind === 'esc' && ctx.busy && ctx.mode !== 'permission' && ctx.mode !== 'question') {
+    return { kind: 'interrupt' };
+  }
 
   // command-menu / resume-picker 是「编辑 + 导航」混合态,先于纯浮层分发(它们不在 OVERLAY_MODES)。
   if (ctx.mode === 'command-menu') return routeCommandMenu(ctx, key);

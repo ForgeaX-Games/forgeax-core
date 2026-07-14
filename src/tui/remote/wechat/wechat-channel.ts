@@ -234,24 +234,22 @@ export function createWechatChannel(opts: WechatChannelOptions = {}): RemoteChan
     qr: () => qr,
 
     async send(peer: RemotePeer, text: string): Promise<void> {
-      if (!api) return;
+      if (!api) throw new Error('微信通道未连接(api=null)');
       const replier = repliers.get(peer.id);
       const toUserId = replier?.toUserId ?? peer.id;
-      try {
-        await api.sendMessage({
-          msg: {
-            from_user_id: '',
-            to_user_id: toUserId,
-            client_id: `forgeax-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-            message_type: 2, // BOT
-            message_state: 2, // FINISH
-            context_token: replier?.contextToken,
-            item_list: [{ type: WechatMessageItemType.TEXT, text_item: { text } }],
-          },
-        });
-      } catch {
-        /* 发送失败静默放弃,避免打断主循环 */
-      }
+      // 发送失败向上抛(loud degrade):由调用方(Repl.sendRemote)重试并在 transcript 提示,
+      //   静默吞错会让「回复没到微信」完全不可感知。
+      await api.sendMessage({
+        msg: {
+          from_user_id: '',
+          to_user_id: toUserId,
+          client_id: `forgeax-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          message_type: 2, // BOT
+          message_state: 2, // FINISH
+          context_token: replier?.contextToken,
+          item_list: [{ type: WechatMessageItemType.TEXT, text_item: { text } }],
+        },
+      });
     },
 
     async dispose(): Promise<void> {

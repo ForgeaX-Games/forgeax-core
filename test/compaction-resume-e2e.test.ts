@@ -58,7 +58,13 @@ async function seedAndResume(
   const { file, estTokens } = seedSession({ sessionsDir, sessionId, turns: 20 });
   const proc = Bun.spawn(['bun', MAIN, '--demo', '--no-memory', '--sessions-dir', sessionsDir, '--resume', sessionId, '-p', '继续'], {
     cwd: join(import.meta.dir, '..'),
-    env: { ...process.env, ANTHROPIC_API_KEY: '', ...extraEnv },
+    env: {
+      ...process.env,
+      ANTHROPIC_API_KEY: '',
+      // Hermetic: do not let the developer's persisted model/settings alter watermarks.
+      FORGEAX_CONFIG_DIR: join(dir, 'config'),
+      ...extraEnv,
+    },
     stdout: 'pipe',
     stderr: 'pipe',
   });

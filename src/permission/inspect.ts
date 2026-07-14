@@ -34,6 +34,26 @@ export const PERMISSION_MODES = [
   'bypassPermissions',
 ] as const satisfies readonly PermissionMode[];
 
+/**
+ * 权限模式循环的单一真相。bypass 是否可进入由 host 按运行环境/策略算好后注入，
+ * permission 层不反向依赖 CLI 的 root/settings 护栏。
+ */
+export function nextPermissionMode(
+  current: PermissionMode,
+  opts: { bypassAvailable: boolean },
+): PermissionMode {
+  switch (current) {
+    case 'default':
+      return 'acceptEdits';
+    case 'acceptEdits':
+      return 'plan';
+    case 'plan':
+      return opts.bypassAvailable ? 'bypassPermissions' : 'default';
+    case 'bypassPermissions':
+      return 'default';
+  }
+}
+
 /** 一条规则的可渲染视图:原始规则 + 还原成 `Tool(content)` / `Tool` 的展示串。 */
 export interface PermissionRuleView {
   /** 原始规则(供调用方按需取字段)。 */

@@ -9,6 +9,7 @@ import {
   getPermissionRules,
   isPermissionMode,
   coercePermissionMode,
+  nextPermissionMode,
   PERMISSION_MODES,
 } from '../src/permission/inspect';
 import { parseRuleString, type PermissionRuleSet } from '../src/permission/rules';
@@ -82,6 +83,34 @@ describe('coercePermissionMode / isPermissionMode — 模式校验适配器', ()
     for (const bad of ['', 'bogus', 'DEFAULT', 42, null, undefined, {}, ['default']]) {
       expect(coercePermissionMode(bad)).toBeNull();
       expect(isPermissionMode(bad)).toBe(false);
+    }
+  });
+});
+
+describe('nextPermissionMode — shift+tab 循环(带 bypass gate)', () => {
+  test('bypass 可用:default → acceptEdits → plan → bypassPermissions → default 四态闭环', () => {
+    const gate = { bypassAvailable: true };
+    expect(nextPermissionMode('default', gate)).toBe('acceptEdits');
+    expect(nextPermissionMode('acceptEdits', gate)).toBe('plan');
+    expect(nextPermissionMode('plan', gate)).toBe('bypassPermissions');
+    expect(nextPermissionMode('bypassPermissions', gate)).toBe('default');
+  });
+
+  test('bypass 不可用(root / killswitch):plan → default 三态闭环', () => {
+    const gate = { bypassAvailable: false };
+    expect(nextPermissionMode('default', gate)).toBe('acceptEdits');
+    expect(nextPermissionMode('acceptEdits', gate)).toBe('plan');
+    expect(nextPermissionMode('plan', gate)).toBe('default');
+  });
+
+  test('已在 bypass 时下一态恒回 default(即便 gate 中途翻不可用)', () => {
+    expect(nextPermissionMode('bypassPermissions', { bypassAvailable: false })).toBe('default');
+  });
+
+  test('全模式清单每个值都有定义的下一态(循环无死路)', () => {
+    for (const m of PERMISSION_MODES) {
+      const next = nextPermissionMode(m, { bypassAvailable: true });
+      expect((PERMISSION_MODES as readonly string[]).includes(next)).toBe(true);
     }
   });
 });

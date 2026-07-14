@@ -18,6 +18,7 @@
 import React from 'react';
 import { render } from 'ink';
 import type { LLMProvider } from '../provider/types';
+import type { PermissionMode } from '../permission/engine';
 import { buildHostContext, type HostContextArgs } from '../cli/host-context';
 import { ThemeProvider } from './providers/theme';
 import { SessionProvider } from './providers/session';
@@ -119,6 +120,9 @@ function newSessionId(): string {
 export interface TuiArgs extends HostContextArgs {
   /** --continue:续接「default」会话(= --resume default 的快捷)。 */
   continueSession?: boolean;
+  /** 初始权限模式(runCli 按 flag > settings.permissions.defaultMode > default 解析后传入,
+   *  bypass 护栏已在 CLI 启动 boundary 过;缺省 default)。 */
+  initialMode?: PermissionMode;
 }
 
 /** main.ts 的 TUI 分支入口:装配 → 渲染 → 等退出 → 清理。返回退出码。 */
@@ -154,7 +158,7 @@ export async function runTui(args: TuiArgs, providerOverride?: LLMProvider): Pro
   //   provider 现取 → 热更新;给了 --skills/--commands 只用 flag,否则自动发现两层。
   registerFileCommands(args.skillDirs, args.commandDirs);
   const host = await buildHostContext(hostArgs, providerOverride);
-  const driver = createAgentDriver({ ...hostArgs, providerOverride }, host);
+  const driver = createAgentDriver({ ...hostArgs, providerOverride, initialMode: args.initialMode }, host);
   // 远端控制(/remote-control):controller 持有微信/桩通道,中转消息进 TUI 轮路径。
   const controller = createRemoteController(makeChannelFactory(!!args.demo));
 
@@ -172,6 +176,12 @@ export async function runTui(args: TuiArgs, providerOverride?: LLMProvider): Pro
     await controller.dispose(); // 登出 / 关闭全部远端通道(wechaty bot.stop 等)。
     await driver.dispose();
     restoreStderr(); // ink 已卸载、终端已还屏,此时 flush 缓冲不污染画面。
+  }
+  // 退出提示:会话**真有 WAL 历史**才提示怎么续接(空会话续无可续,不打扰)。
+  //   id 取 driver 的活值——/clear、/resume 中途换会话后,提示的是**退出时**所在的那条。
+  const endId = driver.sessionId ?? sessionId;
+  if (sessionHasHistory(endId, args.sessionsDir)) {
+    process.stdout.write(`\nResume this session with:\n  forgeax --resume ${endId}\n`);
   }
   return 0;
 }

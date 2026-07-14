@@ -512,7 +512,7 @@ export const createOpenAIResponseProvider: ProviderFactory = (
       }
       const requestId =
         res.headers.get('x-request-id') ?? res.headers.get('request-id') ?? undefined;
-      yield* normalizeResponsesStream(parseSSE(res.body), {
+      yield* normalizeResponsesStream(parseSSE(res.body, undefined, callOpts.signal), {
         requestId,
         signal: callOpts.signal,
         model: req.model,

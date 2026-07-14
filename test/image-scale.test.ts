@@ -145,6 +145,7 @@ class MemFs implements SandboxFs {
   async writeBytes(): Promise<void> {}
   readStream(): ReadableStream<Uint8Array> { throw new Error('not used'); }
   writeStream(): WritableStream<Uint8Array> { throw new Error('not used'); }
+  async *readDir(): AsyncIterable<DirEnt> {}
 }
 
 function ctxWith(extra: Record<string, unknown>): ToolContext {

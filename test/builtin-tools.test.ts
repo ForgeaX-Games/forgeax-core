@@ -17,6 +17,7 @@ import {
   grepTool,
   globTool,
   globToRegExp,
+  MAX_WALK_ENTRIES,
 } from '../src/capability/builtin-tools/index';
 
 // ─── stub SandboxFs (内存树) ─────────────────────────────────────────────────
@@ -90,6 +91,9 @@ class MemFs implements SandboxFs {
     if (opts?.withFileTypes) return ents;
     return ents.map((e) => e.name);
   }
+  async *readDir(path: string): AsyncIterable<DirEnt> {
+    for (const ent of this.readdirSync(path, { withFileTypes: true }) as DirEnt[]) yield ent;
+  }
   async readText(path: string): Promise<string> {
     return this.readTextSync(path);
   }
@@ -111,6 +115,25 @@ class MemFs implements SandboxFs {
 }
 
 // ─── stub TerminalManager ────────────────────────────────────────────────────
+
+class WideFs extends MemFs {
+  readDirCalls = 0;
+  yieldedEntries = 0;
+
+  override async *readDir(): AsyncIterable<DirEnt> {
+    this.readDirCalls++;
+    for (let i = 0; i < MAX_WALK_ENTRIES + 1; i++) {
+      this.yieldedEntries++;
+      yield { name: `entry-${i}.txt`, isFile: true, isDir: false, isSymlink: false };
+    }
+  }
+}
+
+class HangingFs extends MemFs {
+  override async *readDir(): AsyncIterable<DirEnt> {
+    await new Promise<void>(() => {});
+  }
+}
 
 class StubTerminal implements TerminalManager {
   lastRun?: { cmd: string; args: string[]; opts?: RunOpts };
@@ -293,6 +316,34 @@ describe('edit_file', () => {
     expect(fs.files.get('/c.txt')).toBe('foo BAR baz');
   });
 
+  test('matches LF input against CRLF file and preserves CRLF in replacement', async () => {
+    const fs = new MemFs({ '/crlf.ts': 'const a = 1;\r\nconst b = 2;\r\n' });
+    const t = editFileTool();
+    const { data } = await t.call(
+      {
+        file_path: '/crlf.ts',
+        old_string: 'const a = 1;\nconst b = 2;',
+        new_string: 'const a = 1;\nconst b = 3;\nconst c = 4;',
+      },
+      ctxWith({ sandboxFs: fs }),
+    );
+    expect(data.replacements).toBe(1);
+    expect(fs.files.get('/crlf.ts')).toBe(
+      'const a = 1;\r\nconst b = 3;\r\nconst c = 4;\r\n',
+    );
+  });
+
+  test('preserves pure CRLF when a single-line match inserts multiple lines', async () => {
+    const fs = new MemFs({ '/crlf.ts': 'before\r\nmarker\r\nafter\r\n' });
+    await editFileTool().call(
+      { file_path: '/crlf.ts', old_string: 'marker', new_string: 'first\nsecond' },
+      ctxWith({ sandboxFs: fs }),
+    );
+    const updated = fs.files.get('/crlf.ts') as string;
+    expect(updated).toBe('before\r\nfirst\r\nsecond\r\nafter\r\n');
+    expect(updated.replace(/\r\n/g, '')).not.toContain('\n');
+  });
+
   test('throws when old_string not found', async () => {
     const fs = new MemFs({ '/c.txt': 'abc' });
     const t = editFileTool();
@@ -393,10 +444,11 @@ describe('bash', () => {
 // ─── glob ────────────────────────────────────────────────────────────────────
 
 describe('glob', () => {
-  test('predicates: read-only + concurrency-safe', () => {
+  test('predicates: read-only + concurrency-safe + interrupt=cancel', () => {
     const t = globTool();
     expect(t.isReadOnly({ pattern: '*' })).toBe(true);
     expect(t.isConcurrencySafe({ pattern: '*' })).toBe(true);
+    expect(t.interruptBehavior?.()).toBe('cancel');
   });
 
   test('globToRegExp matches segments and **', () => {
@@ -436,6 +488,37 @@ describe('glob', () => {
     expect(data.truncated).toBe(true);
   });
 
+  test('caps visited entries even when the glob has zero hits', async () => {
+    const fs = new WideFs();
+    const { data } = await globTool().call(
+      { pattern: '*.ts', path: '/wide' },
+      ctxWith({ sandboxFs: fs }),
+    );
+    expect(fs.readDirCalls).toBe(1);
+    expect(fs.yieldedEntries).toBe(MAX_WALK_ENTRIES + 1);
+    expect(data.files).toEqual([]);
+    expect(data.truncated).toBe(true);
+  });
+
+  test('abort releases a pending asynchronous directory read', async () => {
+    const fs = new HangingFs();
+    const controller = new AbortController();
+    const pending = globTool().call(
+      { pattern: '*.ts', path: '/slow' },
+      ctxWith({ sandboxFs: fs }, controller.signal),
+    );
+    controller.abort();
+    await expect(pending).rejects.toMatchObject({ name: 'AbortError' });
+  });
+
+  test('fails loud when the injected filesystem lacks streaming directory reads', async () => {
+    const fs = new MemFs() as unknown as Record<string, unknown>;
+    fs.readDir = undefined;
+    await expect(
+      globTool().call({ pattern: '*.ts', path: '/broken' }, ctxWith({ sandboxFs: fs as unknown as SandboxFs })),
+    ).rejects.toThrow(/sandboxFs\.readDir is missing/);
+  });
+
   test('mapResult shape', async () => {
     const fs = new MemFs({ '/p/a.ts': '' });
     const t = globTool();
@@ -449,10 +532,11 @@ describe('glob', () => {
 // ─── grep ────────────────────────────────────────────────────────────────────
 
 describe('grep', () => {
-  test('predicates: read-only + concurrency-safe', () => {
+  test('predicates: read-only + concurrency-safe + interrupt=cancel', () => {
     const t = grepTool();
     expect(t.isReadOnly({ pattern: 'x' })).toBe(true);
     expect(t.isConcurrencySafe({ pattern: 'x' })).toBe(true);
+    expect(t.interruptBehavior?.()).toBe('cancel');
   });
 
   test('default mode files_with_matches', async () => {
@@ -519,6 +603,16 @@ describe('grep', () => {
     );
     expect(data.matches).toHaveLength(1);
     expect(data.matches?.[0].file).toBe('/p/only.txt');
+  });
+
+  test('propagates walk truncation in every output mode', async () => {
+    for (const output_mode of ['files_with_matches', 'content', 'count'] as const) {
+      const { data } = await grepTool().call(
+        { pattern: 'never', path: '/wide', output_mode },
+        ctxWith({ sandboxFs: new WideFs() }),
+      );
+      expect(data.truncated).toBe(true);
+    }
   });
 
   test('invalid regex soft-fails (no throw) with degraded annotation', async () => {

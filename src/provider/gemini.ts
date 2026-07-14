@@ -419,7 +419,7 @@ export const createGeminiProvider: ProviderFactory = (
         throwHttpError(res, text, req.model);
       }
       const requestId = res.headers.get('x-request-id') ?? undefined;
-      yield* normalizeGeminiStream(parseSSE(res.body), {
+      yield* normalizeGeminiStream(parseSSE(res.body, undefined, callOpts.signal), {
         requestId,
         signal: callOpts.signal,
       });

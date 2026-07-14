@@ -118,6 +118,18 @@ describe('NodeSandboxFs — sync text/dir/stat (real temp dir)', () => {
     expect(byName['sub'].isDir).toBe(true);
     expect(byName['sub'].isSymlink).toBe(false);
   });
+
+  test('readDir asynchronously streams DirEnt with file/dir flags', async () => {
+    const dir = join(ROOT, 'listdir-async');
+    fs.mkdirSync(join(dir, 'sub'), { recursive: true });
+    fs.writeTextSync(join(dir, 'file.txt'), 'f');
+    const ents: DirEnt[] = [];
+    for await (const ent of fs.readDir(dir)) ents.push(ent);
+    const byName = Object.fromEntries(ents.map((e) => [e.name, e]));
+    expect(byName['file.txt'].isFile).toBe(true);
+    expect(byName['sub'].isDir).toBe(true);
+    expect(byName['sub'].isSymlink).toBe(false);
+  });
 });
 
 describe('NodeSandboxFs — async text/bytes (real temp dir)', () => {
@@ -450,5 +462,134 @@ describe('runCli — return codes', () => {
     const p = join(ROOT, 'direct.txt');
     new NodeSandboxFs().writeTextSync(p, 'direct');
     expect(readFileSync(p, 'utf8')).toBe('direct');
+  });
+});
+
+// ─── 初始权限模式(P2:--permission-mode / settings.permissions.defaultMode)────────
+
+/** 脚本化 provider:首轮发一个 write 工具调用,次轮收文本(验证 plan 拦写)。 */
+function writeThenDoneProvider(): LLMProvider {
+  let call = 0;
+  const turns: ProviderStreamEvent[][] = [
+    [
+      {
+        type: 'assistant',
+        message: {
+          role: 'assistant',
+          content: [{ type: 'tool_use', id: 'w1', name: 'write_file', input: { file_path: join(ROOT, 'plan-denied.txt'), content: 'x' } }],
+        },
+        usage: EMPTY_USAGE as Usage,
+        stopReason: 'tool_use',
+      },
+    ],
+    [
+      {
+        type: 'assistant',
+        message: { role: 'assistant', content: [{ type: 'text', text: 'done' }] },
+        usage: EMPTY_USAGE as Usage,
+        stopReason: 'end_turn',
+      },
+    ],
+  ];
+  return {
+    api: 'stub',
+    async *stream(): AsyncIterable<ProviderStreamEvent> {
+      const turn = turns[Math.min(call, turns.length - 1)];
+      call++;
+      for (const ev of turn) yield ev;
+    },
+  };
+}
+
+/** 把 user settings 指到临时目录并写入内容;返回恢复函数(finally 调用)。 */
+function withUserSettings(content: unknown): () => void {
+  const dir = join(ROOT, `perm-settings-${Math.random().toString(36).slice(2, 8)}`);
+  const saved = process.env.FORGEAX_CONFIG_DIR;
+  process.env.FORGEAX_CONFIG_DIR = dir;
+  resetSettingsCache();
+  expect(updateUserSettings(content as Record<string, unknown>).error).toBeNull();
+  return () => {
+    if (saved == null) delete process.env.FORGEAX_CONFIG_DIR;
+    else process.env.FORGEAX_CONFIG_DIR = saved;
+    resetSettingsCache();
+  };
+}
+
+describe('parseArgs — --permission-mode(唯一 fail-fast flag)', () => {
+  test('四个合法模式全部直通', () => {
+    for (const m of ['default', 'acceptEdits', 'plan', 'bypassPermissions'] as const) {
+      expect(parseArgs(['--permission-mode', m]).permissionMode).toBe(m);
+    }
+  });
+  test('缺省不设(undefined,由 runCli 合成 settings/default)', () => {
+    expect(parseArgs([]).permissionMode).toBeUndefined();
+  });
+  test('非法值 → 抛 usage error 并列出合法值(权限姿态写错不静默降级)', () => {
+    expect(() => parseArgs(['--permission-mode', 'bogus'])).toThrow(/bypassPermissions/);
+    expect(() => parseArgs(['--permission-mode', 'PLAN'])).toThrow(/plan/);
+  });
+  test('缺值 → 抛 usage error', () => {
+    expect(() => parseArgs(['--permission-mode'])).toThrow(/--permission-mode/);
+  });
+});
+
+describe('runTurn / runCli — 初始权限模式生效与护栏', () => {
+  test('runTurn opts.mode=plan → 写工具被 plan 拦(headless 初始模式真生效)', async () => {
+    const ctx = buildContext({ model: 'm', demo: true, help: false, version: false }, writeThenDoneProvider());
+    let out = '';
+    const reason = await runTurn(ctx, 'go', (s) => (out += s), { mode: 'plan' });
+    expect(out).toContain('plan mode'); // engine ②.5 的拒绝文案经 renderEvent 落 stdout
+    expect(reason).toBe('completed');
+  });
+
+  test('runTurn 不传 mode → 同一脚本写工具不被 plan 拦(回归:缺省行为不变)', async () => {
+    const ctx = buildContext({ model: 'm', demo: true, help: false, version: false }, writeThenDoneProvider());
+    let out = '';
+    await runTurn(ctx, 'go', (s) => (out += s));
+    expect(out).not.toContain('plan mode');
+  });
+
+  test('runCli 非法 --permission-mode → exit 1(fail fast,不进装配)', async () => {
+    expect(await runCli(['--permission-mode', 'bogus', '-p', 'hi'], textProvider('ok'))).toBe(1);
+  });
+
+  test('settings.permissions.defaultMode=bypassPermissions + killswitch → 启动拒绝 exit 1', async () => {
+    const restore = withUserSettings({
+      permissions: { defaultMode: 'bypassPermissions', disableBypassPermissionsMode: true },
+    });
+    try {
+      expect(await runCli(['--demo', '-p', 'x', '--no-memory'])).toBe(1);
+    } finally {
+      restore();
+    }
+  });
+
+  test('显式 --permission-mode 覆盖 settings defaultMode(flag > settings)', async () => {
+    // settings 要求 bypass 且被 killswitch 拦;显式 flag 切 plan → 不再触发 bypass 护栏,正常跑完。
+    const restore = withUserSettings({
+      permissions: { defaultMode: 'bypassPermissions', disableBypassPermissionsMode: true },
+    });
+    try {
+      expect(await runCli(['--demo', '-p', 'x', '--no-memory', '--permission-mode', 'plan'])).toBe(0);
+    } finally {
+      restore();
+    }
+  });
+
+  test('非法 settings defaultMode → 警告后回退 default,exit 0(低优先级坏值不阻断)', async () => {
+    const restore = withUserSettings({ permissions: { defaultMode: 'BOGUS' } });
+    try {
+      expect(await runCli(['--demo', '-p', 'x', '--no-memory'])).toBe(0);
+    } finally {
+      restore();
+    }
+  });
+
+  test('--serve 组合显式 --permission-mode → exit 1(模式经 RPC 控制,拒绝看似接受实则无效)', async () => {
+    expect(await runCli(['--serve', '--sock', join(ROOT, 'never.sock'), '--permission-mode', 'plan'])).toBe(1);
+  });
+
+  test('mcp-serve 组合显式 --permission-mode → exit 1(该形态不创建 agent)', async () => {
+    expect(await runCli(['mcp-serve', '--permission-mode', 'plan'], textProvider('ok'))).toBe(1);
   });
 });

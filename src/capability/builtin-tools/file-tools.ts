@@ -370,7 +370,17 @@ export function editFileTool(): AgentTool<EditFileInput, EditFileOutput> {
         throw new Error('edit_file: new_string must differ from old_string');
       }
       const original = await fs.readText(input.file_path);
-      const occurrences = countOccurrences(original, input.old_string);
+      // 模型通常用 LF 生成 old/new_string。目标若是纯 CRLF 文件，直接匹配会找不到，
+      // 即使 old_string 不含换行而侥幸命中，也会把 new_string 的 LF 写进去形成混合换行，
+      // 随后触发 git diff --check 的 trailing-whitespace。只对明确的纯 CRLF 文件适配，
+      // 混合换行文件仍保持精确匹配，避免猜测并改写其既有结构。
+      const usesCrlf = original.includes('\r\n') && !/(^|[^\r])\n/.test(original);
+      const oldString = usesCrlf ? toCrlf(input.old_string) : input.old_string;
+      const newString = usesCrlf ? toCrlf(input.new_string) : input.new_string;
+      if (oldString === newString) {
+        throw new Error('edit_file: new_string must differ from old_string after normalizing line endings');
+      }
+      const occurrences = countOccurrences(original, oldString);
       if (occurrences === 0) {
         throw new Error(
           `edit_file: old_string not found in ${input.file_path}`,
@@ -383,8 +393,8 @@ export function editFileTool(): AgentTool<EditFileInput, EditFileOutput> {
       }
       const replacements = input.replace_all ? occurrences : 1;
       const updated = input.replace_all
-        ? original.split(input.old_string).join(input.new_string)
-        : replaceFirst(original, input.old_string, input.new_string);
+        ? original.split(oldString).join(newString)
+        : replaceFirst(original, oldString, newString);
       await fs.writeText(input.file_path, updated);
       return { data: { file_path: input.file_path, replacements } };
     },
@@ -403,6 +413,11 @@ export function editFileTool(): AgentTool<EditFileInput, EditFileOutput> {
 
 function byteLength(s: string): number {
   return new TextEncoder().encode(s).length;
+}
+
+/** 把调用方文本的任意换行统一为 CRLF；仅在目标文件已确认是纯 CRLF 时使用。 */
+function toCrlf(s: string): string {
+  return s.replace(/\r\n|\r|\n/g, '\r\n');
 }
 
 function countOccurrences(haystack: string, needle: string): number {

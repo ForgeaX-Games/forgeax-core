@@ -48,6 +48,7 @@ class MemFs implements SandboxFs {
   readdirSync(): string[] | DirEnt[] {
     return [];
   }
+  async *readDir(): AsyncIterable<DirEnt> {}
   async readText(path: string): Promise<string> {
     return this.readTextSync(path);
   }

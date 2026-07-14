@@ -134,6 +134,31 @@ describe('esc 语义:busy 单击打断 vs 空闲双击清空(回归:发送后按
     expect(routeKey(base({ busy: true, prompt: { value: 'draft', cursor: 5 } }), k('esc'))).toEqual({ kind: 'interrupt' });
   });
 
+  test.each(['command-menu', 'model-picker', 'resume-picker', 'rewind', 'remote-control'] as const)(
+    'busy + %s 时 esc 穿透普通菜单/浮层 → interrupt',
+    (mode) => {
+      expect(routeKey(base({ mode, busy: true, overlayLength: 3 }), k('esc'))).toEqual({ kind: 'interrupt' });
+    },
+  );
+
+  test('permission/question 保留 esc 的 deny/cancel 语义', () => {
+    expect(routeKey(base({ mode: 'permission', busy: true, overlayLength: 3 }), k('esc'))).toEqual({
+      kind: 'overlay-close',
+    });
+    expect(routeKey(base({ mode: 'question', busy: true, overlayLength: 3 }), k('esc'))).toEqual({
+      kind: 'overlay-close',
+    });
+  });
+
+  test('空闲时普通菜单/浮层的 esc 仍只关闭浮层', () => {
+    expect(routeKey(base({ mode: 'model-picker', overlayLength: 3 }), k('esc'))).toEqual({
+      kind: 'overlay-close',
+    });
+    expect(routeKey(base({ mode: 'command-menu', overlayLength: 3 }), k('esc'))).toEqual({
+      kind: 'overlay-close',
+    });
+  });
+
   test('空闲时首次 esc 仅 arm,第二次才清空/开 rewind(双击手势保留)', () => {
     expect(routeKey(base(), k('esc'))).toEqual({ kind: 'prompt-esc-arm' });
     expect(routeKey(base({ escArmed: true }), k('esc'))).toEqual({ kind: 'open-rewind' });
@@ -199,4 +224,41 @@ describe('question 模式(导航 + 多选勾选 + 自填编辑混合态)', () =>
     expect(routeKey(qctx({ overlayLength: 0 }), k('down'))).toEqual({ kind: 'none' });
     expect(routeKey(qctx({ overlayLength: 0 }), k('enter'))).toEqual({ kind: 'none' });
   });
+});
+
+describe('shift+tab 权限模式循环路由(P1 只在 prompt 生效)', () => {
+  const base = (over: Partial<RouterCtx> = {}): RouterCtx => ({
+    mode: 'prompt',
+    prompt: { value: '', cursor: 0 },
+    overlayIndex: 0,
+    overlayLength: 0,
+    escArmed: false,
+    busy: false,
+    ...over,
+  });
+
+  test('prompt:shift-tab → cycle-permission-mode(空闲/busy/有草稿均可切)', () => {
+    expect(routeKey(base(), k('shift-tab'))).toEqual({ kind: 'cycle-permission-mode' });
+    expect(routeKey(base({ busy: true }), k('shift-tab'))).toEqual({ kind: 'cycle-permission-mode' });
+    expect(routeKey(base({ prompt: { value: 'draft', cursor: 5 } }), k('shift-tab'))).toEqual({
+      kind: 'cycle-permission-mode',
+    });
+  });
+
+  test('prompt:普通 tab 仍是 no-op(回归)', () => {
+    expect(routeKey(base(), k('tab'))).toEqual({ kind: 'none' });
+  });
+
+  test('command-menu:shift-tab 吞掉,普通 tab 补全语义保留(回归)', () => {
+    const menu = base({ mode: 'command-menu', prompt: { value: '/s', cursor: 2 }, overlayLength: 3 });
+    expect(routeKey(menu, k('shift-tab'))).toEqual({ kind: 'none' });
+    expect(routeKey(menu, k('tab'))).toEqual({ kind: 'overlay-complete', index: 0 });
+  });
+
+  test.each(['permission', 'question', 'model-picker', 'resume-picker', 'rewind', 'remote-control', 'scroll'] as const)(
+    '%s:shift-tab 吞掉(审批卡内切换留 P3)',
+    (mode) => {
+      expect(routeKey(base({ mode, overlayLength: 3 }), k('shift-tab'))).toEqual({ kind: 'none' });
+    },
+  );
 });

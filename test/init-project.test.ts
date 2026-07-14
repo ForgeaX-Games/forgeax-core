@@ -69,6 +69,7 @@ function memFs(seed: Record<string, string> = {}): SandboxFs & { files: Record<s
     renameSync: () => {},
     statSync: () => ({ isDirectory: () => false, isFile: () => true, size: 0, mtimeMs: 0 }) as never,
     readdirSync: () => [],
+    readDir: async function* () {},
     readText: async (p: string) => files[p] ?? '',
     writeText: async (p: string, c: string) => {
       files[p] = c;

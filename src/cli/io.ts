@@ -19,7 +19,7 @@ import {
   createReadStream,
   createWriteStream,
 } from 'node:fs';
-import { readFile, writeFile } from 'node:fs/promises';
+import { opendir, readFile, writeFile } from 'node:fs/promises';
 import { Readable, Writable } from 'node:stream';
 import type { SandboxFs, DirEnt, StatResult, TerminalManager, RunOpts, RunResult, Chunk, TaskHandle } from '../inject/types';
 import type { BackgroundSpawnFn } from '../capability/builtin-tools/shell-registry';
@@ -57,6 +57,17 @@ export class NodeSandboxFs implements SandboxFs {
       }));
     }
     return readdirSync(p);
+  }
+  async *readDir(p: string): AsyncIterable<DirEnt> {
+    const dir = await opendir(p);
+    for await (const d of dir) {
+      yield {
+        name: d.name,
+        isFile: d.isFile(),
+        isDir: d.isDirectory(),
+        isSymlink: d.isSymbolicLink(),
+      };
+    }
   }
   async readText(p: string): Promise<string> {
     return readFile(p, 'utf8');

@@ -19,11 +19,61 @@ const MID_STREAM_IDLE_MAX_RETRIES = 2;
 
 export interface StreamRetryConfig {
   maxRetries?: number;
-  /** 测试可注入(默认 setTimeout)。 */
-  sleep?: (ms: number) => Promise<void>;
+  /** 测试可注入；signal 参数可选以兼容既有单参数注入。 */
+  sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
 }
 
-const defaultSleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+const defaultSleep = (ms: number, signal?: AbortSignal): Promise<void> =>
+  new Promise<void>((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(abortError(signal));
+      return;
+    }
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(abortError(signal!));
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+
+function abortError(signal: AbortSignal): Error {
+  if (signal.reason instanceof Error) return signal.reason;
+  const error = new Error(typeof signal.reason === 'string' ? signal.reason : 'aborted');
+  error.name = 'AbortError';
+  return error;
+}
+
+/** 让默认及测试注入的 sleep 都遵守同一取消合同，并移除 listener。 */
+function abortableSleep(
+  sleep: (ms: number, signal?: AbortSignal) => Promise<void>,
+  ms: number,
+  signal: AbortSignal,
+): Promise<void> {
+  if (signal.aborted) return Promise.reject(abortError(signal));
+  return new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      reject(abortError(signal));
+    };
+    const settle = (fn: () => void) => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener('abort', onAbort);
+      fn();
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+    sleep(ms, signal).then(
+      () => settle(resolve),
+      (error: unknown) => settle(() => reject(error)),
+    );
+  });
+}
 
 function retryAfterHeader(err: unknown): string | null {
   const e = err as { retryAfterMs?: number };
@@ -68,13 +118,13 @@ export async function* streamWithRetry(
         if (idleRetries >= MID_STREAM_IDLE_MAX_RETRIES || opts.signal.aborted) throw err;
         idleRetries++;
         opts.onRetry?.({ attempt: idleRetries, reason: 'stream_idle' });
-        await sleep(getRetryDelay(idleRetries));
+        await abortableSleep(sleep, getRetryDelay(idleRetries), opts.signal);
         continue;
       }
       // 已吐事件 / 不可重试 / 次数耗尽 → 抛给上层。
       if (started || !shouldRetry(err) || attempt > maxRetries || opts.signal.aborted) throw err;
       opts.onRetry?.({ attempt, reason: retryReason(err), retryAfterMs: getRetryAfterMs(err) });
-      await sleep(getRetryDelay(attempt, retryAfterHeader(err)));
+      await abortableSleep(sleep, getRetryDelay(attempt, retryAfterHeader(err)), opts.signal);
     }
   }
 }

@@ -76,6 +76,9 @@ function ctxTokensOf(u: Partial<Usage>): number {
 export interface DriverOptions extends HostContextArgs {
   /** 测试 / --demo 的 provider override。 */
   providerOverride?: LLMProvider;
+  /** 初始权限模式(--permission-mode / settings.permissions.defaultMode 解析结果;缺省 default)。
+   *  bypass 值的 root/killswitch 护栏由 CLI 启动 boundary 把关,这里只消费已解析终值。 */
+  initialMode?: PermissionMode;
 }
 
 /**
@@ -92,7 +95,7 @@ export function createAgentDriver(opts: DriverOptions, initial: HostContext): Ag
     ask: [...(initial.rules?.ask ?? [])],
     allow: [...(initial.rules?.allow ?? []), ...loadAllowRules(process.cwd())],
   };
-  let mode: PermissionMode = 'default';
+  let mode: PermissionMode = opts.initialMode ?? 'default';
   let askUser: AskUserFn | undefined;
   // 008 结构化提问:host 注入的回调。区别于 askUser(布尔闸),AskUserQuestion 工具经
   //   toolContext.askQuestion 取用(agent dispatch 读 this.o.context.toolContext)。
@@ -123,6 +126,9 @@ export function createAgentDriver(opts: DriverOptions, initial: HostContext): Ag
   //   /clear 重键:旧 checkpoints 已随历史清空而失效,重建 manager 反而丢进程内索引,得不偿失。
   let sessionId = opts.sessionId;
   let agent: CoreAgent | null = null;
+  // setModel 会异步清掉 `agent` 以便下一轮用新 context 重建；在飞轮必须另持引用，
+  // 否则重建完成后 abort 会错过仍在旧 provider 上运行的真实 agent。
+  let inFlightAgent: CoreAgent | null = null;
   /** 回退点 reseed:下一轮 driveTurn 用这份历史播种一次,然后清空。 */
   let pendingHistory: ProviderMessage[] | null = null;
 
@@ -241,6 +247,8 @@ export function createAgentDriver(opts: DriverOptions, initial: HostContext): Ag
       //   input.history 重建),故续接由 driver 维护的 convo 每轮 thread 进去(§T2 硬化)。
       //   rules 引用不变是前提(§0-B),故复用安全。
       if (!agent) agent = makeAgent(host.context, host.bus);
+      const runAgent = agent;
+      inFlightAgent = runAgent;
       // 回退点 reseed 优先于常规 convo:rewind/resume 选中后用重建历史替换本轮历史并对齐 convo。
       // ⚠️ seed = **本轮之前**的历史快照(slice,不能引用 convo 本体——下面要往 convo 追加本轮)。
       //   CoreAgent.run 把 messages 拼成 [..seed(=input.history), {user: 本轮 prompt}],故 seed 不含本轮。
@@ -248,13 +256,14 @@ export function createAgentDriver(opts: DriverOptions, initial: HostContext): Ag
       pendingHistory = null;
       const seed = convo.slice();
       let assistantText = '';
-      for await (const ev of agent.run({
-        input: { type: 'user', payload: userContent, ts: 0 },
-        ...(seed.length ? { history: seed } : {}),
-        // H-02:把回退锚点 msgId 透传进 loop → 写入 WAL 的 user_prompt.submit,
-        //   使 /resume 重建历史时能还原 msgId 供文件回退。
-        ...(msgId ? { msgId } : {}),
-      })) {
+      try {
+        for await (const ev of runAgent.run({
+          input: { type: 'user', payload: userContent, ts: 0 },
+          ...(seed.length ? { history: seed } : {}),
+          // H-02:把回退锚点 msgId 透传进 loop → 写入 WAL 的 user_prompt.submit,
+          //   使 /resume 重建历史时能还原 msgId 供文件回退。
+          ...(msgId ? { msgId } : {}),
+        })) {
         // 累计 usage:stream 透传的 provider assistant 事件带真 usage(types.ts:115)。
         //   ⚠️ 用「逐项相加」而非 mergeUsage——后者语义是同一消息内 input/cache **覆盖**取最新
         //   (防 message_delta 的 0 冲掉真值),用于轮内合并;跨轮/跨请求的计费总额须累加,
@@ -298,20 +307,27 @@ export function createAgentDriver(opts: DriverOptions, initial: HostContext): Ag
               .join('');
           }
         }
-        onEvent(ev);
+          onEvent(ev);
+        }
+        // turn 收尾:把本轮 user + assistant 文本并入 convo,供下一轮续接(本轮 user 此刻才入,
+        //   避免与上面 input.payload 重复)。
+        convo.push({ role: 'user', content: userContent });
+        if (assistantText) convo.push({ role: 'assistant', content: assistantText });
+        // ⚠️ 不在此 await drainAutoMemory:答案流式结束 = turn 在用户眼里就完成了,driveTurn
+        //   立即 resolve → 上层 busy 立刻翻 false,不让后台记忆抽取(真模型下又一次数秒 LLM
+        //   调用)把 UI 锁在 busy、再延迟触发一次重绘(矮终端/CJK 下易残影)。抽取已由
+        //   agent.run 内 fire-and-forget 启动并在跑;落盘由 dispose() 退出前统一 await。
+      } finally {
+        // 权限模式回读:ExitPlanMode 在轮内经人类闸恢复 prePlanMode 时只改活 agent,
+        //   driver 的 mode 若不回读会漂移停在 plan(/status、指示条、setModel 重建全跟着错)。
+        //   从本轮捕获的 runAgent 读(异步 setModel 重建可能已把可变 agent 置空/换新)。
+        mode = runAgent.getMode();
+        if (inFlightAgent === runAgent) inFlightAgent = null;
       }
-      // turn 收尾:把本轮 user + assistant 文本并入 convo,供下一轮续接(本轮 user 此刻才入,
-      //   避免与上面 input.payload 重复)。
-      convo.push({ role: 'user', content: userContent });
-      if (assistantText) convo.push({ role: 'assistant', content: assistantText });
-      // ⚠️ 不在此 await drainAutoMemory:答案流式结束 = turn 在用户眼里就完成了,driveTurn
-      //   立即 resolve → 上层 busy 立刻翻 false,不让后台记忆抽取(真模型下又一次数秒 LLM
-      //   调用)把 UI 锁在 busy、再延迟触发一次重绘(矮终端/CJK 下易残影)。抽取已由
-      //   agent.run 内 fire-and-forget 启动并在跑;落盘由 dispose() 退出前统一 await。
     },
 
     abort(reason?: string): void {
-      agent?.abort(reason);
+      (inFlightAgent ?? agent)?.abort(reason);
     },
 
     toolMeta(name: string): { canonical: string; displayName: string; isReadOnly: boolean; isMcp: boolean } {
@@ -407,6 +423,11 @@ export function createAgentDriver(opts: DriverOptions, initial: HostContext): Ag
       agent?.setMode(m);
     },
 
+    getMode(): PermissionMode {
+      // 有活 agent 时以它为准(执行语义真相;吸收 ExitPlanMode 轮内恢复),否则回 driver 保存值。
+      return agent?.getMode() ?? mode;
+    },
+
     // ── 命令补齐批次(025)能力实现 ──────────────────────────────────────────────
     getUsage() {
       // 会话累计计费(/cost):纯 usageAcc(逐 assistant 收尾累加,各 token 类型分项,各按单价计)。
@@ -431,7 +452,7 @@ export function createAgentDriver(opts: DriverOptions, initial: HostContext): Ag
     },
 
     getPermissionRules() {
-      return getPermissionRules(rules, mode);
+      return getPermissionRules(rules, agent?.getMode() ?? mode);
     },
 
     listSessions() {
@@ -503,7 +524,7 @@ export function createAgentDriver(opts: DriverOptions, initial: HostContext): Ag
         model,
         cwd: String(host.context.toolContext.cwd ?? process.cwd()),
         sessionId,
-        permissionMode: mode,
+        permissionMode: agent?.getMode() ?? mode,
         usage: usageAcc,
       });
     },
@@ -708,7 +729,7 @@ export function createAgentDriver(opts: DriverOptions, initial: HostContext): Ag
     async rewind(input): Promise<RewindOutcome> {
       // 回退前先打断在飞轮(对齐 cc),给事件一拍 flush。
       try {
-        agent?.abort('rewind');
+        (inFlightAgent ?? agent)?.abort('rewind');
       } catch {
         /* ignore */
       }

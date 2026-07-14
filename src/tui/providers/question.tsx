@@ -136,9 +136,38 @@ export function QuestionProvider(props: { children: React.ReactNode }): React.Re
     [finish],
   );
 
+  /** 一次性回答当前题(远端中转用):原子写选择 + 推进/收尾。
+   *  与 confirm(键盘路径:toggle/editOther 先行、confirm 只收口)不同,远端回复一条消息
+   *  就带全部选择,须在同一次调用里落 selections/others 并推进,避免跨 setState 竞态。 */
+  const answer = useCallback(
+    (id: string, a: { options?: number[]; other?: string }) => {
+      const p = pendingRef.current.find((x) => x.id === id);
+      if (!p) return;
+      const item = p.items[p.cursor];
+      if (!item) return;
+      // 序号越界的丢弃;单选题只取首个合法项。
+      let idxs = (a.options ?? []).filter((i) => i >= 0 && i < item.options.length);
+      if (!item.multiSelect) idxs = idxs.slice(0, 1);
+      const otherText = (a.other ?? '').trim();
+      const selections = p.selections.map((s, i) => (i === p.cursor ? idxs : s));
+      const others = p.others.map((o, i) =>
+        i === p.cursor ? { value: otherText, cursor: otherText.length } : o,
+      );
+      const nextCursor = p.cursor + 1;
+      if (nextCursor < p.items.length) {
+        setPending((prev) =>
+          prev.map((x) => (x.id === id ? { ...x, cursor: nextCursor, selections, others } : x)),
+        );
+        return;
+      }
+      finish(id, buildAnswers(p.items, selections, others));
+    },
+    [finish],
+  );
+
   const value = useMemo<QuestionQueue>(
-    () => ({ pending, ask, toggle, editOther, confirm, cancel }),
-    [pending, ask, toggle, editOther, confirm, cancel],
+    () => ({ pending, ask, toggle, editOther, confirm, cancel, answer }),
+    [pending, ask, toggle, editOther, confirm, cancel, answer],
   );
   return <QuestionContext.Provider value={value}>{props.children}</QuestionContext.Provider>;
 }

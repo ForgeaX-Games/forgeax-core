@@ -153,42 +153,58 @@ export function providerStreamIdleMs(): number {
   return Math.min(Math.max(v, STREAM_IDLE_MIN_MS), STREAM_IDLE_MAX_MS);
 }
 
-/** `reader.read()` 加空闲超时:超时则 cancel reader 并抛 StreamIdleError(让上层把本轮干净 error
- *  封口,而非无限 await)。任何到达的字节(含 ping)都会让下一次调用重置计时器。SSE 系经 parseSSE、
- *  Bedrock 经 decodeBedrockEventStream 共用本函数(SSOT:idle 包裹只此一份)。 */
+/** `reader.read()` 加空闲超时与取消:任一命中都立即 settle，并 best-effort cancel 底层 reader。
+ *  任何到达的字节(含 ping)都会让下一次调用重置计时器。SSE 系经 parseSSE、Bedrock 经
+ *  decodeBedrockEventStream 共用本函数(SSOT:阻塞 read 包裹只此一份)。 */
 export async function readWithIdleTimeout(
   reader: { read(): Promise<{ done: boolean; value?: Uint8Array }>; cancel(reason?: unknown): Promise<void> },
   idleMs: number,
+  signal?: AbortSignal,
 ): Promise<{ done: boolean; value?: Uint8Array }> {
+  if (signal?.aborted) throw abortError(signal);
   let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new StreamIdleError(idleMs)), idleMs);
+  let onAbort: (() => void) | undefined;
+  const interrupted = new Promise<never>((_, reject) => {
+    if (idleMs > 0) timer = setTimeout(() => reject(new StreamIdleError(idleMs)), idleMs);
+    if (signal) {
+      onAbort = () => reject(abortError(signal));
+      signal.addEventListener('abort', onAbort, { once: true });
+    }
   });
   try {
-    return await Promise.race([reader.read(), timeout]);
+    return await Promise.race([reader.read(), interrupted]);
   } catch (e) {
     try {
-      await reader.cancel();
+      await reader.cancel(e);
     } catch {
-      /* ignore */
+      /* ignore cleanup failure; preserve abort/idle error */
     }
     throw e;
   } finally {
     if (timer) clearTimeout(timer);
+    if (signal && onAbort) signal.removeEventListener('abort', onAbort);
   }
+}
+
+function abortError(signal: AbortSignal): Error {
+  if (signal.reason instanceof Error) return signal.reason;
+  const error = new Error(typeof signal.reason === 'string' ? signal.reason : 'aborted');
+  error.name = 'AbortError';
+  return error;
 }
 
 /** 解析 SSE 字节流为 { event?, data } 帧。CRLF 规范化 + `\n\n` 分块。 */
 export async function* parseSSE(
   body: ReadableStream<Uint8Array>,
   idleMs: number = providerStreamIdleMs(),
+  signal?: AbortSignal,
 ): AsyncGenerator<{ event?: string; data: string }> {
   const reader = body.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
   try {
     while (true) {
-      const { done, value } = idleMs > 0 ? await readWithIdleTimeout(reader, idleMs) : await reader.read();
+      const { done, value } = await readWithIdleTimeout(reader, idleMs, signal);
       if (done) break;
       buffer += decoder
         .decode(value, { stream: true })
@@ -480,7 +496,7 @@ export const createAnthropicProvider: ProviderFactory = (
         throwHttpError(res, text, req.model);
       }
       const requestId = res.headers.get('request-id') ?? res.headers.get('x-request-id') ?? undefined;
-      yield* normalizeAnthropicStream(parseSSE(res.body), {
+      yield* normalizeAnthropicStream(parseSSE(res.body, providerStreamIdleMs(), callOpts.signal), {
         requestId,
         signal: callOpts.signal,
       });
