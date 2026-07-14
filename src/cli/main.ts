@@ -57,7 +57,7 @@ import { renderEvent } from './render';
 import type { AutoMemoryHook } from '../agent/agent';
 import type { PermissionRuleSet } from '../permission/rules';
 import { demoProvider } from './demo-provider';
-import { buildHostContext, resolveHostProvider, pickApi, DEFAULT_MODEL, DEFAULT_LEADING, DEFAULT_MAIN_MAX_TURNS } from './host-context';
+import { buildHostContext, resolveHostProvider, DEFAULT_MODEL, DEFAULT_LEADING, DEFAULT_MAIN_MAX_TURNS } from './host-context';
 import { getMergedSettings } from './settings';
 import { coercePermissionMode, PERMISSION_MODES } from '../permission/inspect';
 import type { PermissionMode } from '../permission/engine';

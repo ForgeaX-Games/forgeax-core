@@ -15,7 +15,7 @@ import { resolve as resolvePath } from 'node:path';
 import { homedir } from 'node:os';
 import type { AgentContext } from '../agent/types';
 import type { LLMProvider, ProviderMessage } from '../provider/types';
-import { resolveProvider } from '../provider/register';
+import { resolveProviderEnv, resolveProviderFromEnv } from './provider-env';
 import { makeProviderCompactSummarize } from '../context/compaction-llm';
 import { contextWindowForModel } from '../context/model-window';
 import { NodeSandboxFs, NodeTerminal, makeNodeBackgroundSpawn } from './io';
@@ -112,24 +112,15 @@ export interface HostContext {
   taskNotifications: TaskNotificationHub;
 }
 
-/** map model → provider api family(anthropic↔openai-compat↔...)。 */
-export function pickApi(model: string): string {
-  if (model.startsWith('gpt') || model.startsWith('o1') || model.startsWith('o3')) return 'openai-compat';
-  if (model.startsWith('gemini')) return 'gemini';
-  if (model.startsWith('deepseek')) return 'deepseek-v4';
-  return 'anthropic-messages';
-}
-
-/** 解析 provider(env/--demo/override 三态)。 */
+/** 解析 provider(env/--demo/override 三态)。env 语义见 provider-env(家族可被 FORGEAX_PROVIDER_API 覆盖)。 */
 export function resolveHostProvider(args: { model: string; demo?: boolean }, providerOverride?: LLMProvider): LLMProvider {
   if (args.demo || providerOverride) return providerOverride ?? demoProvider();
-  const apiKey = process.env.ANTHROPIC_API_KEY ?? '';
-  if (!apiKey) throw new Error('ANTHROPIC_API_KEY 未设置。设置后重试,或用 --demo 演示 CLI 形态。');
-  return resolveProvider(pickApi(args.model), {
-    apiKey,
-    baseUrl: process.env.ANTHROPIC_BASE_URL,
-    headers: { 'anthropic-version': '2023-06-01' },
-  });
+  const cfg = resolveProviderEnv(args.model);
+  if (!cfg.apiKey) {
+    const keyName = cfg.api === 'openai-compat' ? 'OPENAI_API_KEY' : 'ANTHROPIC_API_KEY';
+    throw new Error(`${keyName} 未设置(api 家族 ${cfg.api})。设置后重试,或用 --demo 演示 CLI 形态。`);
+  }
+  return resolveProviderFromEnv(args.model);
 }
 
 /** 读 hooks 配置文件:支持顶层即 settings,或 `{hooks:{...}}` 包裹。 */

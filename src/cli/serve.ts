@@ -31,7 +31,7 @@ import { InProcessTeammateExecutor } from '../inject/in-process-teammate-executo
 import { EventBus } from '../events/event-bus';
 import { buildChildSpawnFn } from './peer';
 import { listenRpc, type RpcConnection } from './rpc';
-import { resolveProvider } from '../provider/register';
+import { resolveProviderFromEnv } from './provider-env';
 import type { LLMProvider, ProviderRequest } from '../provider/types';
 import type { AgentTool } from '../capability/types';
 import { builtinToolsPack } from '../capability/builtin-tools/index';
@@ -62,13 +62,8 @@ function resolveThinkingConfig(): ProviderRequest['thinking'] | undefined {
 }
 
 function buildProvider(model: string): LLMProvider {
-  // 与 forgeax-core-adapter 同源:从 env 造 anthropic provider(scoped token 经 env 注入)。
-  void model;
-  return resolveProvider('anthropic-messages', {
-    apiKey: process.env.ANTHROPIC_API_KEY ?? '',
-    baseUrl: process.env.ANTHROPIC_BASE_URL,
-    headers: { 'anthropic-version': '2023-06-01' },
-  });
+  // env 统一解析(provider-env):LiteLLM 代理优先,否则直连(scoped token 经 env 注入)。
+  return resolveProviderFromEnv(model);
 }
 
 /** 起 serve:在 sockPath 上 listen,每条连接绑定一个 forgeax-core facade。返回 net.Server。 */
