@@ -12,11 +12,15 @@
  *       (`makeNodeBackgroundSpawn()`)的 chunk 流里 —— 看到 `exit` chunk 即入队。
  *       `BackgroundShellRegistry` 本身没有完成回调,所以观察点在 spawn 接缝,不在注册表。
  *    ② 后台子 agent 走 `BackgroundTasks.onDone` —— settle 时入队。
- *  - **注入侧(唯一零 core 改入口)**:宿主在 `UserPromptSubmit` 事件上订阅一个
+ *  - **注入侧(T4,被动兜底)**:宿主在 `UserPromptSubmit` 事件上订阅一个
  *    subscriber,把 pending 队列组装成 `<task_notification>` 文本经 `ctl.modify` 挂到
  *    事件回执的 `additionalContext` 上 → loop 现成收进 `hookContextReminders`
  *    (agent.ts:705-706),渲染成下一轮 dynamic system-reminder(cacheScope=null,不 bust
  *    prompt cache),与 auto-memory / hook additionalContext 同机制。
+ *  - **唤醒侧(T4.5,主动)**:`setWakeListener` + `drain` —— TUI(Repl)注册回调,
+ *    enqueue 时收到信号,若轮串行器 idle(无在飞轮/无排队/无浮层/用户没打字)则 drain
+ *    合成一轮自动续接;忙/让位时通知留 pending,仍由 T4 注入兜底。两路共享同一 pending,
+ *    互不双投。idle 判定与递归护栏全在宿主侧,hub 保持纯队列。
  *
  * 去重/节流:每个后台任务只入队一次(bash 靠 spawn 包装里的 `done` 位;subagent 靠
  * settle 只发一次);并发完成合并成一条 `<task_notification>` 按序注入,入队即出队
@@ -60,15 +64,50 @@ function errMsg(e: unknown): string {
  */
 export class TaskNotificationHub {
   private readonly pending: PendingTaskNotification[] = [];
+  /** T4.5 活动接缝:enqueue(带完成项)与后台 shell 起/停(不带)时通知宿主——
+   *  TUI 据此即时上屏完成 notice、刷新「后台运行中」计数、并在 idle 时合成唤醒轮。 */
+  private activityListener?: (completed?: PendingTaskNotification) => void;
+  /** 运行中的后台 shell 数(spawn 起 +1,首个 exit chunk -1;状态栏「后台 N」用)。 */
+  private running = 0;
 
   /** 当前 pending 数(测试/observability 用)。 */
   get size(): number {
     return this.pending.length;
   }
 
-  /** 入队一条完成通知。 */
+  /** 运行中的后台 shell 数(TUI 状态栏常驻指示用)。 */
+  get runningShells(): number {
+    return this.running;
+  }
+
+  /** 入队一条完成通知。入队后携该项回调活动接缝(fail-soft:listener 异常不影响入队)。 */
   enqueue(n: PendingTaskNotification): void {
-    this.pending.push({ ...n, label: truncate(n.label, LABEL_MAX) });
+    const item = { ...n, label: truncate(n.label, LABEL_MAX) };
+    this.pending.push(item);
+    this.notify(item);
+  }
+
+  /**
+   * T4.5:注册/注销活动回调(undefined 注销)。带 completed = 一条任务刚完成入队;
+   * 不带 = 后台 shell 起/停(计数变化)。hub 只报事实,不判宿主闲忙——idle 判定、
+   * 让位、递归护栏全在宿主(Repl)侧,hub 保持纯队列。
+   */
+  setActivityListener(fn?: (completed?: PendingTaskNotification) => void): void {
+    this.activityListener = fn;
+  }
+
+  /** T4.5:一次取空 pending(唤醒路径消费)。与 subscribe 的 UserPromptSubmit drain 共享
+   *  同一 pending —— 任一路取走后另一路自然为空,不双投。 */
+  drain(): PendingTaskNotification[] {
+    return this.pending.splice(0, this.pending.length);
+  }
+
+  private notify(completed?: PendingTaskNotification): void {
+    try {
+      this.activityListener?.(completed);
+    } catch {
+      /* ignore:活动上报是加固,失败不影响队列本身与 T4 被动注入兜底 */
+    }
   }
 
   /**
@@ -83,11 +122,15 @@ export class TaskNotificationHub {
       const command = cmd === 'sh' && args.length >= 2 ? args[args.length - 1] : [cmd, ...args].join(' ');
       let done = false;
       let tail = '';
+      // 运行计数 +1 并上报(状态栏「后台 N」即时可见,不等完成)。
+      this.running += 1;
+      this.notify();
       return inner(cmd, args, opts, (chunk) => {
         if (chunk.stream === 'stdout' || chunk.stream === 'stderr') {
           tail = (tail + chunk.data).slice(-TAIL_MAX);
         } else if (chunk.stream === 'exit' && !done) {
           done = true;
+          this.running = Math.max(0, this.running - 1);
           const t = tail.trim();
           this.enqueue({
             label: command,
@@ -131,7 +174,7 @@ export class TaskNotificationHub {
   subscribe(bus: EventBusAPI): Unsubscribe {
     return bus.subscribe(CoreEventType.UserPromptSubmit, (event, ctl) => {
       if (this.pending.length === 0) return;
-      const drained = this.pending.splice(0, this.pending.length);
+      const drained = this.drain();
       const block = renderTaskNotification(drained);
       const prev = (event as { additionalContext?: string }).additionalContext;
       // additionalContext 不是 CoreEvent 的静态字段(与 from-settings.ts 的 hook 决议同路),

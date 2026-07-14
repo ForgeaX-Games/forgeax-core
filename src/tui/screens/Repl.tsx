@@ -74,6 +74,7 @@ import { ThinkingIndicator } from '../components/ThinkingIndicator';
 import { Queue } from '../components/Queue';
 import { Banner } from '../components/Banner';
 import { FORGEAX_CORE_VERSION } from '../../version';
+import { renderTaskNotification } from '../../cli/task-notification';
 
 /** 一条待跑的轮:本地输入(origin 省略)或远端来源(带回复定址)。msgId=回退锚点(H-02)。 */
 type QueuedTurn = { prompt: string; origin?: RemoteOrigin; images?: ImageAttachment[]; msgId?: string };
@@ -111,6 +112,16 @@ function noticeMsg(text: string): UiMessage {
     event: { type: 'assistant', message: { type: 'message', ts: 0, payload: { content: [{ type: 'text', text }] } } } as AgentEvent,
   };
 }
+
+// ── T4.5 idle 自动唤醒护栏 ──
+/** 连续自动唤醒轮上限:唤醒轮里再起的后台任务完成后仍可链式唤醒,但一条链最多这么多轮,
+ *  防「唤醒轮又派后台任务」无限自转;达到上限后通知留在 pending,由 T4 的 UserPromptSubmit
+ *  注入兜底(下次用户说话时可见)。任一**用户**输入(本地/远端)重置计数。 */
+const MAX_WAKE_CHAIN = 5;
+/** 唤醒轮喂给模型的收尾指令(通知块之后):告诉模型这是自动续接,避免它当成用户新话题。 */
+const WAKE_PROMPT_SUFFIX =
+  '\n(Automated wake-up: the background task(s) above completed while the user was idle. ' +
+  'Review the results and continue or briefly report the outcome. The user did not type this message.)';
 
 export function Repl(): React.ReactElement {
   const theme = useTheme();
@@ -156,6 +167,10 @@ export function Repl(): React.ReactElement {
   // ── 队列 / 取消 / esc 计时 ──
   const [queued, setQueued] = useState<QueuedTurn[]>([]);
   const busyRef = useRef(false);
+  // ── T4.5 idle 唤醒:notifyTick 由 hub 的 enqueue 回调自增(触发唤醒 effect 重评估);
+  //   wakeChainRef 数连续自动唤醒轮(护栏,用户输入时归零)。
+  const [notifyTick, setNotifyTick] = useState(0);
+  const wakeChainRef = useRef(0);
   const tokenTickRef = useRef(0); // 上次刷 tokens 的时刻(节流,见 runTurn;耗时已收口到 status-line provider 墙钟)
   const escArmedRef = useRef(false);
   const escTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -504,6 +519,7 @@ export function Repl(): React.ReactElement {
         //   transcript 显示用户敲的 `/name args`(非庞大的展开正文);展开正文喂给模型行动。
         if (cmd.source === 'file' && cmd.expand) {
           setPendingView(null);
+          wakeChainRef.current = 0; // T4.5:用户输入重置自动唤醒链深
           const msgId = agent.checkpointTurn() ?? undefined;
           session.push({ kind: 'user', text, msgId });
           const expanded = cmd.expand(arg);
@@ -535,6 +551,7 @@ export function Repl(): React.ReactElement {
       //   ⚠️ busy 排队路径下,快照时刻早于该消息真正入轮,锚点轻微偏早(可接受,见 plan 非目标)。
       agent.finalizeRewind();
       setPendingView(null);
+      wakeChainRef.current = 0; // T4.5:用户输入重置自动唤醒链深
       const msgId = agent.checkpointTurn() ?? undefined;
       history.add(text);
       session.push({ kind: 'user', text, msgId, images, pastes });
@@ -617,6 +634,7 @@ export function Repl(): React.ReactElement {
       const display = `[微信:${m.peer.name}] ${m.text}`;
       agent.finalizeRewind();
       setPendingView(null);
+      wakeChainRef.current = 0; // T4.5:远端用户输入同样重置自动唤醒链深
       const msgId = agent.checkpointTurn() ?? undefined;
       session.push({ kind: 'user', text: display, msgId });
       // turn 在飞 → 排队(带 origin);否则即跑。跑的是原文 m.text,显示用标注 display。
@@ -643,6 +661,43 @@ export function Repl(): React.ReactElement {
     setQueued(rest);
     void runTurn(next!.prompt, next!.origin, next!.images, next!.msgId);
   }, [status.busy, queued, runTurn]);
+
+  // ── T4.5:hub 活动信号接线。三件事:① 任务完成 → **即时**上屏一条完成 notice(带命令与
+  //   退出态,不等唤醒轮——busy/打字时用户也第一时间看到);② 刷新状态栏「后台 N」常驻计数
+  //   (spawn 起 +1、退出 -1,后台有活正在跑一眼可见);③ notifyTick 自增让下面的唤醒 effect
+  //   重评估。setState/session.push 从任意异步上下文(spawn chunk 回调)调用安全;卸载时注销。
+  useEffect(() => {
+    agent.setTaskNotificationActivity((completed) => {
+      if (completed) session.push(noticeMsg(`✅ 后台任务 \`${completed.label}\` 完成(${completed.status})`));
+      status.set({ bgShells: agent.backgroundShellCount() });
+      setNotifyTick((n) => n + 1);
+    });
+    return () => agent.setTaskNotificationActivity(undefined);
+  }, [agent, session, status]);
+
+  // ── T4.5:idle 自动唤醒 —— 判定:无在飞轮 + 无排队用户消息 + 无阻塞浮层(权限卡/
+  //   提问卡/面板)+ 用户没在打字 → drain pending 合成一轮自动续接。
+  //   竞态闩:runTurn 顶部同步置 busyRef=true(首个 await 前),effect 单线程重入安全
+  //   (与队列消费 effect 同一套路)。排队用户消息优先:queued 非空即让位——该轮起跑时
+  //   T4 的 UserPromptSubmit 注入会把通知带进去,不丢。
+  //   护栏:① 多任务合并(drain 一次取空,一条链一轮);② 递归深度 MAX_WAKE_CHAIN
+  //   (唤醒轮里再完成的任务链式唤醒,链长封顶,用户输入归零);③ 打字让位(prompt 非空
+  //   → 等输入清空/提交,提交路径由 T4 注入兜底);④ 达上限/让位时通知留 pending,永不丢。
+  useEffect(() => {
+    if (busyRef.current || status.busy) return;
+    if (queued.length > 0) return;
+    if (mode !== 'prompt') return; // 权限卡/提问卡/浮层挂起 → 让位
+    if (prompt.value !== '') return; // 用户正在输入 → 让位(清空或提交后重评估)
+    if (wakeChainRef.current >= MAX_WAKE_CHAIN) return; // 链深达上限 → 留给 T4 注入兜底
+    const items = agent.drainTaskNotifications();
+    if (items.length === 0) return;
+    wakeChainRef.current += 1;
+    // 完成明细已由活动回调即时上屏(每任务一条 notice);此处只标注「接下来这轮是自动的」。
+    session.push(noticeMsg('⏰ 自动续接后台任务结果...'));
+    // 不 history.add(↑ 翻不出)、不 checkpointTurn(非用户轮,不设回退锚点)、不推 user 条目
+    //   (transcript 显示上面的 notice,payload 只喂模型)—— 通知不进用户输入缓冲、不可编辑。
+    void runTurn(renderTaskNotification(items) + WAKE_PROMPT_SUFFIX);
+  }, [notifyTick, status.busy, queued.length, mode, prompt.value, agent, session, runTurn]);
 
   // turn 结束后复位 interrupt 标记,允许下一轮再 abort。
   useEffect(() => {
@@ -1082,7 +1137,7 @@ export function Repl(): React.ReactElement {
 
       {/* 状态栏(边框外,缩进对齐):只显示 token | 耗时 | 模型,其余提示一律不渲染(用户要求极简)。 */}
       <Box flexDirection="column" paddingX={1}>
-        <ThinkingIndicator busy={status.busy} />
+        <ThinkingIndicator busy={status.busy} bgShells={status.bgShells} />
         <StatusLine />
       </Box>
     </Box>

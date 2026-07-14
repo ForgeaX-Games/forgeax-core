@@ -44,6 +44,7 @@ import { lookupModelContext } from '../context/model-context-table';
 import type { ProviderMessage } from '../provider/types';
 import { NodeSandboxFs, NodeTerminal, makeNodeBackgroundSpawn } from './io';
 import { withSandbox } from './sandbox-terminal';
+import { makeImageDownscaler } from './image-scale';
 import { BackgroundShellRegistry } from '../capability/builtin-tools/shell-registry';
 import { EventBus } from '../events/event-bus';
 import type { AskUserFn } from '../agent/dispatch';
@@ -114,12 +115,14 @@ function appendList(prev: string[] | undefined, v: string): string[] {
 export function parseArgs(argv: string[]): CliArgs {
   const a: CliArgs = {
     // 模型优先级:`--model` flag(下方循环覆盖)> FORGEAX_MODEL env >
-    //   ANTHROPIC_MODEL env > 合并后的 settings.model(user<project<local,
-    //   上轮 /model 选择)> DEFAULT_MODEL。
+    //   合并后的 settings.model(user<project<local,含上轮 /model 选择)>
+    //   ANTHROPIC_MODEL env > DEFAULT_MODEL。
+    // ANTHROPIC_MODEL 只是上游 provider 的兼容默认值；若把它放在 settings 前，/model
+    // 虽然已成功落盘，重启后仍会被常见的 shell 环境变量盖掉，表现为选择“失效”。
     model:
       process.env.FORGEAX_MODEL ??
-      process.env.ANTHROPIC_MODEL ??
       getMergedSettings().model ??
+      process.env.ANTHROPIC_MODEL ??
       DEFAULT_MODEL,
     demo: false,
     help: false,
@@ -187,7 +190,14 @@ export function buildContext(args: CliArgs, providerOverride?: LLMProvider): Age
   const shellRegistry = new BackgroundShellRegistry(makeNodeBackgroundSpawn());
   // E-03:OS 沙箱(可用且开启时套 SandboxedTerminal;要求但不可用 → loud 降级)。
   const { terminal } = withSandbox(new NodeTerminal(), args.sandbox);
-  const toolContext = { sandboxFs, terminal, cwd: process.cwd(), shellRegistry };
+  const downscaleImage = makeImageDownscaler();
+  const toolContext = {
+    sandboxFs,
+    terminal,
+    cwd: process.cwd(),
+    shellRegistry,
+    ...(downscaleImage ? { downscaleImage } : {}),
+  };
   const searchBackend = args.searchUrl ? makeHttpSearchBackend(args.searchUrl) : makeDefaultSearchBackend();
 
   // 同步可构造的能力包(builtin + web/todo/notebook + memory + skill)。mcp/plugin/hooks

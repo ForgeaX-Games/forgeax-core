@@ -38,6 +38,7 @@ import type { MemoryListing } from '../capability/memory/inspect';
 import type { ExtensionRow } from '../capability/extensions-inspect';
 import type { StatusSnapshot } from '../cli/status-aggregate';
 import type { DoctorReport } from '../cli/doctor';
+import type { PendingTaskNotification } from '../cli/task-notification';
 import type { InitProjectResult } from '../cli/init-project';
 // ── 回退点(checkpoint)类型:文件快照 diff + 锚点列表 ──
 import type { DiffStats, FileDiffStat } from '../cli/checkpoint-store';
@@ -290,6 +291,8 @@ export interface StatusState {
   tokens?: number;
   elapsedMs?: number;
   busy: boolean;
+  /** 运行中的后台 shell 数(>0 时正文区 ThinkingIndicator 常驻提示「后台任务 N 运行中」;T4.5 感知)。 */
+  bgShells?: number;
   set(p: Partial<StatusState>): void;
 }
 export interface InputHistory {
@@ -374,6 +377,15 @@ export interface AgentDriver {
   /** 注入结构化提问回调(AskUserQuestion 工具用);未注入时工具优雅降级(unsupported)。
    *  driver 把它挂到 toolContext.askQuestion(agent dispatch 经 ctx 取用),setModel 重建后自动重挂。 */
   setAskQuestion(fn: AskQuestionFn): void;
+  /** T4.5 注入活动回调:后台任务完成入队时携完成项回调;后台 shell 起/停(计数变化)时
+   *  不带参回调。undefined 注销。回调只报事实 —— idle 判定 / 用户输入让位 / 递归深度
+   *  护栏全在 Repl 侧。setModel 重建 host 后 driver 自动重挂到新 hub(与 setAskQuestion 同套路)。 */
+  setTaskNotificationActivity(fn: ((completed?: PendingTaskNotification) => void) | undefined): void;
+  /** T4.5 唤醒路径消费:一次取空 pending 通知(空 → [])。与 T4 的 UserPromptSubmit 注入
+   *  共享同一队列,任一路取走后另一路自然为空,不双投。 */
+  drainTaskNotifications(): PendingTaskNotification[];
+  /** 运行中的后台 shell 数(正文区常驻提示「后台任务 N 运行中」用)。 */
+  backgroundShellCount(): number;
   /** allow-always(T7.5):就地把一条整工具 allow 规则推进 driver 持有的**可变 rules 对象**
    *  (同一引用、in-place,绝不重新赋值;见 PRD §0-B)。下一次派发引擎 ⑦ 即判 allow。
    *  ⚠️ 受保护路径(.git/ .forgeax/ shell rc)因 safetyCheck bypass 免疫,仍会弹卡(§0-E)。 */

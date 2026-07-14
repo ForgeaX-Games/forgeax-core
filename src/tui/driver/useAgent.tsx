@@ -30,6 +30,7 @@ import { makeRehydrateInjection } from '../../context/post-compact-rehydrate';
 import { microCompact } from '../../context/micro-compaction';
 import { contextWindowForModel } from '../../context/model-window';
 import { buildHostContext, type HostContext, type HostContextArgs } from '../../cli/host-context';
+import type { PendingTaskNotification } from '../../cli/task-notification';
 import { effectiveSkillDirs } from '../../cli/locations';
 import { updateUserSettings } from '../../cli/settings';
 import type { AgentDriver, UiMessage, PendingRewindView, RewindOutcome, DiffStats, ImageAttachment } from '../contracts';
@@ -96,6 +97,8 @@ export function createAgentDriver(opts: DriverOptions, initial: HostContext): Ag
   // 008 结构化提问:host 注入的回调。区别于 askUser(布尔闸),AskUserQuestion 工具经
   //   toolContext.askQuestion 取用(agent dispatch 读 this.o.context.toolContext)。
   let askQuestion: AskQuestionFn | undefined;
+  // T4.5:Repl 注入的后台任务活动回调(完成入队携完成项 / shell 起停不带参;idle 判定在 Repl 侧)。
+  let taskActivity: ((completed?: PendingTaskNotification) => void) | undefined;
 
   // 把「稳定委托」挂到 toolContext.askQuestion:始终读 driver 持有的可变 askQuestion 变量,
   //   故 setAskQuestion 在 render 时晚到也无碍;setModel 重建 toolContext 后须重挂(见下)。
@@ -105,8 +108,15 @@ export function createAgentDriver(opts: DriverOptions, initial: HostContext): Ag
       askQuestion ? askQuestion(questions, signal) : Promise.resolve([]);
   };
 
+  // T4.5:同一「稳定委托」套路挂活动接缝——hub enqueue/shell 起停时调 taskActivity
+  //   (晚注入/未注入都无碍);setModel 重建出**新 hub** 后须对新 hub 重挂(旧 hub 随旧装配废弃)。
+  const installTaskWake = (h: HostContext): void => {
+    h.taskNotifications.setActivityListener((completed) => taskActivity?.(completed));
+  };
+
   let host = initial;
   installAskQuestion(host);
+  installTaskWake(host);
   let model = opts.model;
   // 会话身份(sessionId):可变——/clear 视作「开一条新会话」时换新 id(F1)。getter / getStatus /
   //   setModel 重建都读这份,故换新后全链一致。CheckpointManager 构造时快照旧 id(见下),不随
@@ -339,6 +349,7 @@ export function createAgentDriver(opts: DriverOptions, initial: HostContext): Ag
       void buildHostContext({ ...toHostArgs(opts, id, sessionId) }, opts.providerOverride).then(async (next) => {
         host = next;
         installAskQuestion(host); // 新 toolContext 须重挂提问接缝(否则切模型后 AskUserQuestion 失联)
+        installTaskWake(host); // T4.5:新 hub 须重挂唤醒接缝(否则切模型后后台完成不再唤醒)
         agent = null; // 下一轮 driveTurn 用新 context 重建
         // dispose 旧装配的子进程(mcp/plugin/hooks)。
         for (const d of prev.disposers) {
@@ -357,6 +368,19 @@ export function createAgentDriver(opts: DriverOptions, initial: HostContext): Ag
 
     setAskQuestion(fn: AskQuestionFn): void {
       askQuestion = fn;
+    },
+
+    setTaskNotificationActivity(fn: ((completed?: PendingTaskNotification) => void) | undefined): void {
+      taskActivity = fn;
+    },
+
+    drainTaskNotifications() {
+      // 惰性读当前 host(setModel 重建后自动指向新 hub),与 toolMeta 读 host.context 同口径。
+      return host.taskNotifications.drain();
+    },
+
+    backgroundShellCount() {
+      return host.taskNotifications.runningShells;
     },
 
     allowAlways(toolName: string): void {

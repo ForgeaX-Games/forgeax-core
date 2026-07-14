@@ -23,7 +23,7 @@ import { connect } from 'node:net';
 import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { RpcConnection } from '../src/cli/rpc';
-import type { TurnRequest, KernelEvent } from '@forgeax/agent-runtime/contract';
+import type { TurnRequest, KernelEvent, ToolSpec } from '@forgeax/agent-runtime/contract';
 
 const CORE_SERVE = resolve(import.meta.dir, '..', 'src', 'cli', 'main.ts');
 const MODEL = process.env.FORGEAX_E2E_MODEL || process.env.FORGEAX_MODEL || 'claude-opus-4-8';
@@ -59,7 +59,7 @@ async function connectRetry(sock: string, deadlineMs = 10000): Promise<RpcConnec
   }
 }
 
-function turnReq(callId: string, prompt: string, tools: Array<Record<string, unknown>> = []): TurnRequest {
+function turnReq(callId: string, prompt: string, tools: ToolSpec[] = []): TurnRequest {
   return {
     session: { threadId: callId, agentId: 'forge' },
     callId,
@@ -140,7 +140,7 @@ async function main(): Promise<void> {
     console.log('\nE2E · 007 出口人类闸:askUser RPC 获批 → 退出 plan → 写落盘');
     askUserGrant = true;
     const exitTarget = join(workdir, 'exit_test.txt');
-    const writeSpec = {
+    const writeSpec: ToolSpec = {
       name: 'write_file',
       delivery: 'local', // serve 的 builtin 本地实现直跑(写落在 cwd=workdir)
       inputSchema: {

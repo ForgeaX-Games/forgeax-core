@@ -64,23 +64,31 @@ describe.each(listReducers)('%s nav', (_name, reducer) => {
 });
 
 describe('ModelPicker.modelList', () => {
-  test('current already known → unchanged known list', () => {
+  test('current already first → unchanged known list', () => {
     expect(modelList(KNOWN_MODELS[0]!)).toEqual(KNOWN_MODELS);
+  });
+  test('known current elsewhere → moved to first without duplication', () => {
+    const current = KNOWN_MODELS[2]!;
+    const out = modelList(current);
+    expect(out[0]).toBe(current);
+    expect(out.filter((model) => model === current)).toHaveLength(1);
+    expect(out).toHaveLength(KNOWN_MODELS.length);
   });
   test('unknown current → prepended', () => {
     const out = modelList('my-custom-model');
     expect(out[0]).toBe('my-custom-model');
     expect(out).toContain(KNOWN_MODELS[0]);
   });
-  test('remote list wins over KNOWN_MODELS', () => {
+  test('remote list wins over KNOWN_MODELS and puts current first', () => {
     const out = modelList('r-b', ['r-a', 'r-b']);
-    expect(out).toEqual(['r-a', 'r-b']);
+    expect(out).toEqual(['r-b', 'r-a']);
   });
   test('current not in remote → prepended to remote', () => {
     expect(modelList('mine', ['r-a'])).toEqual(['mine', 'r-a']);
   });
-  test('empty remote → fallback to KNOWN_MODELS', () => {
-    expect(modelList(KNOWN_MODELS[0]!, [])).toEqual(KNOWN_MODELS);
+  test('empty remote → fallback to KNOWN_MODELS with current first', () => {
+    const current = KNOWN_MODELS[1]!;
+    expect(modelList(current, [])[0]).toBe(current);
   });
 });
 

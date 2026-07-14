@@ -126,7 +126,10 @@ describe('TaskNotificationHub', () => {
     const hub = new TaskNotificationHub();
     const bg = new BackgroundTasks<SubagentResult>({ onDone: hub.onSubagentDone });
     // 成功:result 携 text/terminalReason。
-    bg.start('explore', Promise.resolve({ text: 'found it', terminalReason: 'completed', turns: 2, toolCalls: 1 }));
+    bg.start(
+      'explore',
+      Promise.resolve({ agentId: 'explore', text: 'found it', terminalReason: 'completed', turns: 2, toolCalls: 1 }),
+    );
     // 失败:reject。
     bg.start('build', Promise.reject(new Error('boom')));
     return new Promise<void>((resolve) => {
@@ -142,5 +145,63 @@ describe('TaskNotificationHub', () => {
         resolve();
       }, 10);
     });
+  });
+});
+
+// ── T4.5:活动接缝(setActivityListener)+ 主动 drain + 运行计数 ──
+describe('TaskNotificationHub · T4.5 activity seam', () => {
+  test('enqueue fires the activity listener with the completed item; unregister stops it', () => {
+    const hub = new TaskNotificationHub();
+    const completions: string[] = [];
+    hub.setActivityListener((c) => {
+      if (c) completions.push(c.label);
+    });
+    hub.enqueue({ label: 'a', status: 'exit code 0' });
+    hub.enqueue({ label: 'b', status: 'exit code 1' });
+    expect(completions).toEqual(['a', 'b']);
+    hub.setActivityListener(undefined);
+    hub.enqueue({ label: 'c', status: 'exit code 0' });
+    expect(completions).toEqual(['a', 'b']); // 注销后不再回调
+    expect(hub.size).toBe(3); // 但入队不受影响
+  });
+
+  test('a throwing activity listener never breaks enqueue (fail-soft)', () => {
+    const hub = new TaskNotificationHub();
+    hub.setActivityListener(() => {
+      throw new Error('listener boom');
+    });
+    expect(() => hub.enqueue({ label: 'a', status: 'exit code 0' })).not.toThrow();
+    expect(hub.size).toBe(1);
+  });
+
+  test('runningShells counts spawn→exit; count-change notifies without an item', () => {
+    const hub = new TaskNotificationHub();
+    const events: Array<string | undefined> = [];
+    hub.setActivityListener((c) => events.push(c?.label));
+    const { fn, emit } = fakeSpawn();
+    const wrapped = hub.wrapBackgroundSpawn(fn);
+    expect(hub.runningShells).toBe(0);
+    wrapped('sh', ['-c', 'sleep 1'], undefined, () => {});
+    expect(hub.runningShells).toBe(1); // spawn 即 +1
+    expect(events).toEqual([undefined]); // 起跑上报:不带完成项
+    emit({ stream: 'exit', data: '0' });
+    expect(hub.runningShells).toBe(0); // exit 即 -1
+    expect(events).toEqual([undefined, 'sleep 1']); // 完成上报:带完成项
+    emit({ stream: 'exit', data: '0' }); // 重复 exit:去重,不再变化
+    expect(hub.runningShells).toBe(0);
+    expect(events.length).toBe(2);
+  });
+
+  test('drain empties pending; UserPromptSubmit afterwards injects nothing (no double delivery)', () => {
+    const hub = new TaskNotificationHub();
+    hub.enqueue({ label: 'x', status: 'exit code 0', outputTail: 'tail' });
+    hub.enqueue({ label: 'y', status: 'exit code 2' });
+    const items = hub.drain();
+    expect(items.map((i) => i.label)).toEqual(['x', 'y']);
+    expect(hub.size).toBe(0);
+    expect(hub.drain()).toEqual([]); // 幂等:再 drain 得空
+    const bus = new EventBus();
+    hub.subscribe(bus);
+    expect(upsReceipt(bus).additionalContext).toBeUndefined(); // T4 注入侧不双投
   });
 });

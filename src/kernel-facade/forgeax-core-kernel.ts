@@ -51,6 +51,12 @@ import { NOOP_OBS, parentContextFromTraceparent } from '../observability/contrac
 import { cacheHitRate, promptTokens } from '../observability/usage';
 import { readFileSync } from 'node:fs';
 import { imageBlockFromAttachment as buildImageBlockFromAttachment } from '../capability/image-block';
+import {
+  needsDownscale,
+  base64LengthOfRaw,
+  IMAGE_MAX_B64_BYTES,
+  type DownscaleImage,
+} from '../capability/image-scale-policy';
 
 /** 把 `TurnRequest.input.attachments` 里的图片项组成 Anthropic image content block。
  *  逻辑下沉到共享 helper(`capability/image-block.ts`),read_file(011)与此处共用。
@@ -61,16 +67,44 @@ function imageBlockFromAttachment(att: Record<string, unknown>): Record<string, 
   return block as Record<string, unknown> | null;
 }
 
-/** 组 user 消息 payload:无图 → 纯文本字符串(零回归);有图 → content 数组 [text, image…]。 */
-function buildUserPayload(
+/** 组 user 消息 payload:无图 → 纯文本字符串(零回归);有图 → content 数组 [text, image…]。
+ *  ★ 进 context 前缩图(对齐 CC):超 2000×2000 / raw 3.75MB 经注入的 downscale 缩;
+ *  缩不动且 base64 超 5MB → 换成占位文本块(loud degrade —— 原样送出必被 API 拒)。 */
+async function buildUserPayload(
   text: string,
   attachments: TurnRequest['input']['attachments'],
-): string | Array<Record<string, unknown>> {
+  downscale?: DownscaleImage,
+): Promise<string | Array<Record<string, unknown>>> {
   if (!attachments || attachments.length === 0) return text;
   const blocks: Array<Record<string, unknown>> = [];
   for (const att of attachments) {
     const block = imageBlockFromAttachment(att);
-    if (block) blocks.push(block);
+    if (!block) continue;
+    const source = block.source as { media_type: string; data: string };
+    // Buffer 本身即 Uint8Array,直接用,免二次拷贝大附件(needsDownscale/downscale 收 Uint8Array)。
+    const bytes = Buffer.from(source.data, 'base64');
+    if (needsDownscale(bytes)) {
+      const scaled = downscale ? await downscale(bytes, source.media_type) : null;
+      if (scaled) {
+        blocks.push({
+          type: 'image',
+          source: {
+            type: 'base64',
+            media_type: scaled.mediaType,
+            data: Buffer.from(scaled.bytes).toString('base64'),
+          },
+        });
+        continue;
+      }
+      if (base64LengthOfRaw(bytes.length) > IMAGE_MAX_B64_BYTES) {
+        blocks.push({
+          type: 'text',
+          text: `[image attachment dropped: ${bytes.length} bytes exceeds the 5MB API limit and no image downscaler is available]`,
+        });
+        continue;
+      }
+    }
+    blocks.push(block);
   }
   if (blocks.length === 0) return text; // 附件都无法解析 → 退回纯文本
   return [{ type: 'text', text }, ...blocks];
@@ -137,6 +171,13 @@ export interface ForgeaxCoreKernelOptions {
    * `; full result at <path>`。
    */
   persistToolResult?: (raw: string, meta: { toolUseId: string; toolName: string }) => string | undefined;
+  /**
+   * ★ 图片缩放注入缝(对齐 CC:附件图进 context 前钳到 2000×2000 / raw 3.75MB)。
+   * facade 不碰系统二进制,实现由 HOST 层(serve.ts 用 cli/image-scale.ts 的
+   * `makeImageDownscaler()`)装配后注入;缺省不注入 → 超 5MB 附件换占位文本(loud),
+   * 5MB 内原样透传(旧行为)。
+   */
+  downscaleImage?: DownscaleImage;
   /**
    * MCP server→client 反向请求(elicitation/sampling/roots)的 host handler 集合(M4)。
    *
@@ -606,7 +647,7 @@ export class ForgeaxCoreKernel implements AgentKernel {
     // 多模态:有图片附件时,user 消息 payload 升级为 content 数组([text, image…]),
     //   否则保持纯字符串(零回归)。content 数组经 agent.run(:567 content=payload)
     //   原样落到 provider(anthropic.ts:62 透传)→ 模型收到图。
-    const userPayload = buildUserPayload(userText, req.input.attachments);
+    const userPayload = await buildUserPayload(userText, req.input.attachments, this.o.downscaleImage);
     let usageEmitted = false;
 
     const emitUsage = (): KernelEvent => ({

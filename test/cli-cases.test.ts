@@ -15,6 +15,7 @@ import { join } from 'node:path';
 import { NodeSandboxFs, NodeTerminal } from '../src/cli/io';
 import { parseArgs, buildContext, runTurn, runCli } from '../src/cli/main';
 import { DEFAULT_MAIN_MAX_TURNS } from '../src/cli/host-context';
+import { resetSettingsCache, updateUserSettings } from '../src/cli/settings';
 import type { DirEnt } from '../src/inject/types';
 import type { LLMProvider, ProviderStreamEvent, Usage } from '../src/provider/types';
 import { EMPTY_USAGE } from '../src/provider/types';
@@ -276,6 +277,33 @@ describe('parseArgs — all flags & positional', () => {
   });
   test('--model overrides model', () => {
     expect(parseArgs(['--model', 'gemini-x']).model).toBe('gemini-x');
+  });
+  test('persisted /model selection overrides provider compatibility env on restart', () => {
+    const configDir = join(ROOT, 'model-settings');
+    const savedConfigDir = process.env.FORGEAX_CONFIG_DIR;
+    const savedForgeaxModel = process.env.FORGEAX_MODEL;
+    const savedAnthropicModel = process.env.ANTHROPIC_MODEL;
+    process.env.FORGEAX_CONFIG_DIR = configDir;
+    delete process.env.FORGEAX_MODEL;
+    process.env.ANTHROPIC_MODEL = 'provider-env-model';
+    resetSettingsCache();
+    try {
+      expect(updateUserSettings({ model: 'picker-model' }).error).toBeNull();
+      // 模拟退出后再次启动：清掉进程内 settings cache，再走 CLI 初始模型解析。
+      resetSettingsCache();
+      expect(parseArgs([]).model).toBe('picker-model');
+      // 显式 ForgeaX override 仍应是最高优先级。
+      process.env.FORGEAX_MODEL = 'explicit-forgeax-model';
+      expect(parseArgs([]).model).toBe('explicit-forgeax-model');
+    } finally {
+      if (savedConfigDir == null) delete process.env.FORGEAX_CONFIG_DIR;
+      else process.env.FORGEAX_CONFIG_DIR = savedConfigDir;
+      if (savedForgeaxModel == null) delete process.env.FORGEAX_MODEL;
+      else process.env.FORGEAX_MODEL = savedForgeaxModel;
+      if (savedAnthropicModel == null) delete process.env.ANTHROPIC_MODEL;
+      else process.env.ANTHROPIC_MODEL = savedAnthropicModel;
+      resetSettingsCache();
+    }
   });
   test('--demo sets demo true', () => {
     expect(parseArgs(['--demo']).demo).toBe(true);

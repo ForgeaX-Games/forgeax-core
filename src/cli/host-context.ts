@@ -20,6 +20,7 @@ import { makeProviderCompactSummarize } from '../context/compaction-llm';
 import { contextWindowForModel } from '../context/model-window';
 import { NodeSandboxFs, NodeTerminal, makeNodeBackgroundSpawn } from './io';
 import { withSandbox } from './sandbox-terminal';
+import { makeImageDownscaler } from './image-scale';
 import { EventBus } from '../events/event-bus';
 import { assembleCapabilities } from '../runtime/assemble';
 import { makeSpawnSyncHookRunner, makeHttpSearchBackend, makeDefaultSearchBackend } from './host-bits';
@@ -106,6 +107,9 @@ export interface HostContext {
   /** team 模式(FORGEAX_TEAM=1):coordinator 的 inbox 闭包——挂到 CoreAgent.inbox 收 peer 回报。
    *  非 team → undefined(CoreAgent 不挂 inbox,零变化)。 */
   coordinatorInbox?: () => ProviderMessage[];
+  /** T4/T4.5 后台完成通知中枢:pending 队列 + 唤醒接缝。TUI 经 driver 注册 wake listener
+   *  并在 idle 时 drain 合成一轮;非 TUI 宿主不碰它,T4 的 UserPromptSubmit 注入兜底。 */
+  taskNotifications: TaskNotificationHub;
 }
 
 /** map model → provider api family(anthropic↔openai-compat↔...)。 */
@@ -144,7 +148,14 @@ export async function buildHostContext(args: HostContextArgs, providerOverride?:
   // E-03:OS 沙箱(可用且开启时套 SandboxedTerminal;要求但不可用 → loud 降级)。
   const { terminal } = withSandbox(new NodeTerminal(), args.sandbox);
   // toolContext 开放形状:assemble 建出的后台进程注册表(007)在装配后挂到 shellRegistry。
-  const toolContext: Record<string, unknown> = { sandboxFs, terminal, cwd: process.cwd() };
+  //   downscaleImage:图片进 context 前缩图(对齐 CC;read_file 经 ctx 消费,缺省 degrade)。
+  const downscaleImage = makeImageDownscaler();
+  const toolContext: Record<string, unknown> = {
+    sandboxFs,
+    terminal,
+    cwd: process.cwd(),
+    ...(downscaleImage ? { downscaleImage } : {}),
+  };
   const bus = new EventBus();
   const searchBackend = args.searchUrl ? makeHttpSearchBackend(args.searchUrl) : makeDefaultSearchBackend();
 
@@ -298,5 +309,5 @@ export async function buildHostContext(args: HostContextArgs, providerOverride?:
   const unsubTaskNotifications = taskNotifications.subscribe(bus);
   disposers.push(unsubTaskNotifications);
 
-  return { context, bus, provider, store, disposers, rules, ...(coordinatorInbox ? { coordinatorInbox } : {}) };
+  return { context, bus, provider, store, disposers, rules, taskNotifications, ...(coordinatorInbox ? { coordinatorInbox } : {}) };
 }

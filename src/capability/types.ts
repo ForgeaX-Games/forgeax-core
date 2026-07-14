@@ -38,6 +38,13 @@ export interface ToolContext {
   /** ★ 可观测性(trace+log):工具内部经 ctx.observability 起 child span / 打 log。
    *  host 经 toolContext 注入;缺省时工具不产 telemetry(优雅降级)。见 observability/contract.ts。 */
   observability?: Observability;
+  /** ★ 图片缩放(对齐 CC:进 context 前钳到 2000×2000 / raw 3.75MB)。HOST 经 toolContext
+   *  注入(实现在 cli/image-scale.ts,系统二进制);缺省时消费方 degrade(≤5MB 原样透传,
+   *  超限 loud 拒绝)。签名见 image-scale-policy 的 `DownscaleImage`。 */
+  downscaleImage?: (
+    bytes: Uint8Array,
+    mediaType: string,
+  ) => Promise<{ bytes: Uint8Array; mediaType: string } | null>;
   /** 调用者可挂任意 host 能力（terminal/fs/... 经 inject 提供）。开放形状。 */
   [key: string]: unknown;
 }

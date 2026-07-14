@@ -16,18 +16,19 @@
  * Boundary(HOST 层):仅 node builtins + 相对 import(type-only 引 contracts)。
  */
 import { execFileSync } from 'node:child_process';
-import { readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { readFileSync, statSync, unlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ImageAttachment } from '../contracts';
+import { IMAGE_MAX_B64_BYTES } from '../../capability/image-scale-policy';
+import { downscaleImageSync } from '../../cli/image-scale';
 
 /** 支持的图片扩展名(拖入路径识别 + 扩展名兜底 mediaType)。 */
 const IMAGE_EXT = /\.(png|jpe?g|gif|webp|bmp)$/i;
 
-/** Anthropic 单图上限:base64 载荷 5MB。超限请求会被 provider 直接拒。 */
-export const MAX_IMAGE_B64_BYTES = 5 * 1024 * 1024;
-/** 推荐长边像素(超过 provider 会缩放;主动缩到此可显著降字节且不掉可读性)。 */
-const MAX_IMAGE_EDGE = 1568;
+/** Anthropic 单图上限:base64 载荷 5MB。超限请求会被 provider 直接拒。
+ *  (SSOT 收编到 capability/image-scale-policy;此处保留原导出名供既有消费方。) */
+export const MAX_IMAGE_B64_BYTES = IMAGE_MAX_B64_BYTES;
 
 /** 图片 base64 的字节数(= 载荷大小,用于 5MB 判定)。 */
 export function imageB64Bytes(img: ImageAttachment): number {
@@ -40,35 +41,13 @@ export function isWithinImageLimit(img: ImageAttachment): boolean {
 }
 
 /**
- * macOS 内建 `sips` 就地把图片长边缩到 MAX_IMAGE_EDGE(小于则不动)。零依赖。
- * 失败(无 sips / 非图片)静默跳过——上层还有 5MB 硬闸兜底。
- */
-function downscaleFileMac(path: string): void {
-  try {
-    execFileSync('sips', ['-Z', String(MAX_IMAGE_EDGE), path], { timeout: 5000, stdio: 'ignore' });
-  } catch {
-    /* noop:sips 不可用/失败 → 保持原图,交给 5MB 硬闸 */
-  }
-}
-
-/**
- * 把一段图片 buffer 收进 API 上限内:
- *   - macOS:写临时文件 → sips 缩长边 → 读回(始终尝试,顺带压字节)。
- *   - 其它平台:无零依赖缩放工具 → 原样返回(由调用方的 5MB 硬闸决定收/弃)。
+ * 把一段图片 buffer 收进 API 上限内 —— 委托共享缩图器(`cli/image-scale.ts`,
+ * 策略对齐 CC:2000×2000 / raw 3.75MB;darwin sips / linux ImageMagick)。
+ * 缩图器不可用/失败 → 原样返回(由调用方的 5MB 硬闸决定收/弃)。
  */
 function fitImageBuffer(buf: Buffer): Buffer {
-  if (process.platform !== 'darwin') return buf;
-  const tmp = join(tmpdir(), `forgeax-fit-${process.pid}-${Date.now()}.png`);
-  try {
-    writeFileSync(tmp, buf);
-    downscaleFileMac(tmp);
-    const out = readFileSync(tmp);
-    return out.length > 0 ? out : buf;
-  } catch {
-    return buf;
-  } finally {
-    safeUnlink(tmp);
-  }
+  const scaled = downscaleImageSync(buf, mediaTypeFromMagic(buf) ?? 'image/png');
+  return scaled && scaled.bytes.length > 0 ? Buffer.from(scaled.bytes) : buf;
 }
 
 /**
@@ -137,8 +116,8 @@ export function readImageFile(raw: string): ImageAttachment | null {
     if (orig.length === 0) return null;
     const mediaType = mediaTypeFromMagic(orig) ?? mediaTypeFromExt(raw);
     if (!mediaType) return null;
-    // 统一缩长边到 1568(macOS sips 只在更大时缩;其它平台原样),与剪贴板路径一致,顺带压字节。
-    //   缩放后按 magic 重判类型(sips 可能把 WEBP/GIF 等改写为 PNG)。
+    // 超限才缩(共享缩图器,长边钳到 IMAGE_MAX_EDGE / raw 目标;策略见 image-scale-policy),
+    //   与剪贴板路径一致。缩放后按 magic 重判类型(缩图器可能把 WEBP/GIF 等改写为 PNG/JPEG)。
     const buf = fitImageBuffer(orig);
     return { data: buf.toString('base64'), mediaType: mediaTypeFromMagic(buf) ?? mediaType };
   } catch {
@@ -185,10 +164,9 @@ function readClipboardImageMac(): ImageAttachment | null {
     safeUnlink(tmp);
     return null;
   }
-  // 大图就地缩到 API 上限内(sips 已在本机,零额外依赖)。
-  downscaleFileMac(tmp);
+  // 大图收进 API 上限内(共享缩图器;失败原样,交调用方 5MB 硬闸)。
   try {
-    const buf = readFileSync(tmp);
+    const buf = fitImageBuffer(readFileSync(tmp));
     if (buf.length === 0) return null;
     return { data: buf.toString('base64'), mediaType: mediaTypeFromMagic(buf) ?? 'image/png' };
   } catch {

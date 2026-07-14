@@ -31,10 +31,10 @@ export const KNOWN_MODELS = [
   'deepseek-v4',
 ];
 
-/** 把 current 并入候选表(优先远端列表,空则退 KNOWN_MODELS;current 不在表里则置首)。 */
+/** 把 current 置于候选表首位(优先远端列表,空则退 KNOWN_MODELS),并去掉其原位置。 */
 export function modelList(current: string, remote?: string[]): string[] {
   const base = remote && remote.length > 0 ? remote : KNOWN_MODELS;
-  return base.includes(current) ? base : [current, ...base];
+  return [current, ...base.filter((model) => model !== current)];
 }
 
 /** id 切成「非数字 / 数字(含点号版本,如 2.5)」交替 token,供 compareModelId 逐段比较。 */

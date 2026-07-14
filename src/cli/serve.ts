@@ -37,6 +37,7 @@ import type { AgentTool } from '../capability/types';
 import { builtinToolsPack } from '../capability/builtin-tools/index';
 import { notebookToolsPack } from '../capability/builtin-tools/notebook-tools';
 import { NodeSandboxFs, NodeTerminal } from './io';
+import { makeImageDownscaler } from './image-scale';
 import { makeNodeObservability } from './observability';
 import { loadPermissionRulesFromSettings } from './permission-settings';
 import { isExitPlanTool } from '../permission/engine';
@@ -87,10 +88,13 @@ export async function startServe(sockPath: string): Promise<Server> {
     ...(builtinToolsPack().tools ?? []),
     ...(notebookToolsPack().tools ?? []),
   ];
+  const downscaleImage = makeImageDownscaler();
   const localToolContext: Record<string, unknown> = {
     sandboxFs: new NodeSandboxFs(),
     terminal: new NodeTerminal(),
     cwd: process.cwd(),
+    // 图片进 context 前缩图(对齐 CC):local 直跑的 read_file 经 ctx 消费。
+    ...(downscaleImage ? { downscaleImage } : {}),
   };
 
   // 扩展思考:默认 adaptive,对齐重构前 working 配置(旧 working 请求即 thinking:adaptive)。
@@ -137,6 +141,8 @@ export async function startServe(sockPath: string): Promise<Server> {
       //   其余仍走上面的 executeTool 桥(host 把闸)。
       toolContext: localToolContext,
       localToolImpls,
+      // 用户附件图进 context 前缩图(facade buildUserPayload 消费;undefined → degrade)。
+      ...(downscaleImage ? { downscaleImage } : {}),
       // 权限规则(楔子1 · 046):settings.permissions.{deny,ask,allow} 载出的规则集。
       //   engine ① deny 在 dispatch 派发前就闸(先于本地/回宿主的执行路由),故 deny 对
       //   local-delivery 与 host-bridged 工具一律生效;'ask' 由下方 askUser defer 交 host。

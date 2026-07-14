@@ -19,11 +19,19 @@ import type { CoreEvent } from '../../events/types';
 import { CoreEventType } from '../../events/events';
 import { buildTool, type AgentTool, type ToolContext } from '../types';
 import {
-  imageBlockFromBytes,
+  imageBlockFromBase64,
+  bytesToBase64,
+  mediaTypeFromExt,
   imageMediaTypeFromMagic,
   isImageExt,
   type ImageContentBlock,
 } from '../image-block';
+import {
+  needsDownscale,
+  base64LengthOfRaw,
+  IMAGE_MAX_B64_BYTES,
+  type DownscaleImage,
+} from '../image-scale-policy';
 
 // ─── 集成者约定：ctx 上的注入句柄 ────────────────────────────────────────────
 //
@@ -154,7 +162,7 @@ export function readFileTool(): AgentTool<ReadFileInput, ReadFileOutput> {
         throw new Error('read_file: file_path must be a non-empty string');
       }
       // ── 多模态分支:先判图片(扩展名命中,或无扩展名时读前 12 字节验魔数)──
-      const imageOut = await tryReadImage(fs, input.file_path);
+      const imageOut = await tryReadImage(fs, input.file_path, ctx);
       if (imageOut) return { data: imageOut };
       // ── 文本路径 ──
       const raw = await fs.readText(input.file_path);
@@ -194,8 +202,12 @@ export function readFileTool(): AgentTool<ReadFileInput, ReadFileOutput> {
 
 /** 尝试把文件读成 image block;非图片返回 null(→ read_file 回落文本路径)。
  *  判定:扩展名命中常见图片格式 → 直接读全字节;扩展名不可信(无/非图)时,读前 12
- *  字节验魔数,命中才整文件读出。这样文本文件最多多一次小读,不回归。 */
-async function tryReadImage(fs: SandboxFs, path: string): Promise<ReadFileOutput | null> {
+ *  字节验魔数,命中才整文件读出。这样文本文件最多多一次小读,不回归。
+ *
+ *  ★ 进 context 前缩图(对齐 CC):超 2000×2000 / raw 3.75MB 时经 ctx.downscaleImage
+ *  (host 注入,缺省无)缩放;缩放不可用/失败 → base64 ≤5MB 原样透传(现状),
+ *  超 5MB 则**不带图**返回显式说明(loud degrade —— 原样送出必被 API 拒)。 */
+async function tryReadImage(fs: SandboxFs, path: string, ctx: ToolContext): Promise<ReadFileOutput | null> {
   let isImage = isImageExt(path);
   if (!isImage) {
     // 无可信扩展名 → 偷看文件头魔数。读盘失败(如目录/不存在)交给文本路径报原错。
@@ -207,8 +219,26 @@ async function tryReadImage(fs: SandboxFs, path: string): Promise<ReadFileOutput
     }
   }
   if (!isImage) return null;
-  const bytes = await fs.readBytes(path);
-  const block = imageBlockFromBytes(bytes, path);
+  let bytes = await fs.readBytes(path);
+  let mediaType = imageMediaTypeFromMagic(bytes) ?? mediaTypeFromExt(path);
+  if (needsDownscale(bytes)) {
+    const downscale = ctx.downscaleImage as DownscaleImage | undefined;
+    const scaled = downscale ? await downscale(bytes, mediaType) : null;
+    if (scaled) {
+      bytes = scaled.bytes;
+      mediaType = scaled.mediaType;
+    } else if (base64LengthOfRaw(bytes.length) > IMAGE_MAX_B64_BYTES) {
+      return {
+        file_path: path,
+        content:
+          `[image too large: ${bytes.length} bytes (base64 exceeds the 5MB API limit) and no image ` +
+          `downscaler is available on this platform — image not attached]`,
+        numLines: 0,
+        totalLines: 0,
+      };
+    }
+  }
+  const block = imageBlockFromBase64(bytesToBase64(bytes), mediaType);
   return {
     file_path: path,
     content: `[image ${block.source.media_type}, ${bytes.length} bytes — returned as image content block]`,
